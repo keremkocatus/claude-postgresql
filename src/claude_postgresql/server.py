@@ -1,10 +1,8 @@
 """Claude PostgreSQL MCP Server — main entry point.
 
-Registers all tools, manages the database lifecycle, and starts the stdio
+Registers all tools, manages the database lifecycle, and starts the
 transport so Claude Desktop (or any MCP client) can connect.
 """
-
-from __future__ import annotations
 
 import logging
 import os
@@ -12,7 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from claude_postgresql.config import ServerConfig
@@ -68,7 +66,7 @@ mcp = FastMCP(
 )
 
 
-def _ctx(ctx) -> AppContext:
+def _ctx(ctx: Context) -> AppContext:
     """Extract the AppContext from a tool's Context."""
     return ctx.request_context.lifespan_context
 
@@ -78,7 +76,7 @@ def _ctx(ctx) -> AppContext:
 # ══════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def list_schemas(ctx) -> str:
+async def list_schemas(ctx: Context) -> str:
     """List all non-system schemas in the connected database."""
     from claude_postgresql.tools.schema import list_schemas as _fn
     app = _ctx(ctx)
@@ -86,7 +84,7 @@ async def list_schemas(ctx) -> str:
 
 
 @mcp.tool()
-async def list_tables(ctx, schema: str = "public") -> str:
+async def list_tables(ctx: Context, schema: str = "public") -> str:
     """List all tables and views in a schema with estimated row counts.
 
     Args:
@@ -98,7 +96,7 @@ async def list_tables(ctx, schema: str = "public") -> str:
 
 
 @mcp.tool()
-async def describe_table(ctx, table: str, schema: str = "public") -> str:
+async def describe_table(ctx: Context, table: str, schema: str = "public") -> str:
     """Get full structural information for a table: columns, primary key, foreign keys, indexes, and constraints.
 
     Args:
@@ -111,7 +109,7 @@ async def describe_table(ctx, table: str, schema: str = "public") -> str:
 
 
 @mcp.tool()
-async def get_table_columns(ctx, table: str, schema: str = "public") -> str:
+async def get_table_columns(ctx: Context, table: str, schema: str = "public") -> str:
     """Get a lightweight column listing for a table (name, type, nullable, default).
 
     Args:
@@ -124,7 +122,7 @@ async def get_table_columns(ctx, table: str, schema: str = "public") -> str:
 
 
 @mcp.tool()
-async def get_indexes(ctx, table: str, schema: str = "public") -> str:
+async def get_indexes(ctx: Context, table: str, schema: str = "public") -> str:
     """List all indexes on a table (name, type, columns, uniqueness).
 
     Args:
@@ -137,7 +135,7 @@ async def get_indexes(ctx, table: str, schema: str = "public") -> str:
 
 
 @mcp.tool()
-async def get_foreign_keys(ctx, table: str, schema: str = "public") -> str:
+async def get_foreign_keys(ctx: Context, table: str, schema: str = "public") -> str:
     """List foreign key relationships for a table.
 
     Args:
@@ -150,7 +148,7 @@ async def get_foreign_keys(ctx, table: str, schema: str = "public") -> str:
 
 
 @mcp.tool()
-async def get_constraints(ctx, table: str, schema: str = "public") -> str:
+async def get_constraints(ctx: Context, table: str, schema: str = "public") -> str:
     """List all constraints (PK, FK, UNIQUE, CHECK) on a table.
 
     Args:
@@ -167,7 +165,7 @@ async def get_constraints(ctx, table: str, schema: str = "public") -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def execute_select(ctx, query: str, params: list | None = None) -> str:
+async def execute_select(ctx: Context, query: str, params: list | None = None) -> str:
     """Execute a SELECT query against PostgreSQL and return formatted results.
 
     Results are automatically capped at the configured maximum row limit.
@@ -183,7 +181,7 @@ async def execute_select(ctx, query: str, params: list | None = None) -> str:
 
 
 @mcp.tool()
-async def execute_dml(ctx, query: str, params: list | None = None) -> str:
+async def execute_dml(ctx: Context, query: str, params: list | None = None) -> str:
     """Execute an INSERT, UPDATE, or DELETE statement.
 
     Blocked when the server is in read-only mode. The query is validated for safety.
@@ -198,7 +196,7 @@ async def execute_dml(ctx, query: str, params: list | None = None) -> str:
 
 
 @mcp.tool()
-async def execute_transaction(ctx, queries: list[dict]) -> str:
+async def execute_transaction(ctx: Context, queries: list[dict]) -> str:
     """Execute multiple SQL statements inside a single atomic transaction.
 
     If any statement fails, the entire transaction is rolled back.
@@ -217,28 +215,28 @@ async def execute_transaction(ctx, queries: list[dict]) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def connection_status(ctx) -> str:
+async def connection_status(ctx: Context) -> str:
     """Show connection pool status, PostgreSQL server version, and health check result."""
     from claude_postgresql.tools.database_info import connection_status as _fn
     return await _fn(_ctx(ctx).db)
 
 
 @mcp.tool()
-async def list_databases(ctx) -> str:
+async def list_databases(ctx: Context) -> str:
     """List all databases on the PostgreSQL server with owner, encoding, and size."""
     from claude_postgresql.tools.database_info import list_databases as _fn
     return await _fn(_ctx(ctx).db)
 
 
 @mcp.tool()
-async def get_database_size(ctx) -> str:
+async def get_database_size(ctx: Context) -> str:
     """Return the total size of the currently connected database."""
     from claude_postgresql.tools.database_info import get_database_size as _fn
     return await _fn(_ctx(ctx).db)
 
 
 @mcp.tool()
-async def get_table_sizes(ctx, schema: str = "public") -> str:
+async def get_table_sizes(ctx: Context, schema: str = "public") -> str:
     """List tables in a schema ordered by total size (data + indexes).
 
     Args:
@@ -253,7 +251,7 @@ async def get_table_sizes(ctx, schema: str = "public") -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def explain_query(ctx, query: str) -> str:
+async def explain_query(ctx: Context, query: str) -> str:
     """Run EXPLAIN ANALYZE on a query and return the execution plan.
 
     Args:
@@ -265,21 +263,21 @@ async def explain_query(ctx, query: str) -> str:
 
 
 @mcp.tool()
-async def get_running_queries(ctx) -> str:
+async def get_running_queries(ctx: Context) -> str:
     """List currently running queries from pg_stat_activity (excludes idle connections)."""
     from claude_postgresql.tools.admin import get_running_queries as _fn
     return await _fn(_ctx(ctx).db)
 
 
 @mcp.tool()
-async def get_locks(ctx) -> str:
+async def get_locks(ctx: Context) -> str:
     """Show current lock information from pg_locks with query details."""
     from claude_postgresql.tools.admin import get_locks as _fn
     return await _fn(_ctx(ctx).db)
 
 
 @mcp.tool()
-async def get_table_stats(ctx, table: str, schema: str = "public") -> str:
+async def get_table_stats(ctx: Context, table: str, schema: str = "public") -> str:
     """Return usage statistics for a table (scans, tuple operations, vacuum info).
 
     Args:
