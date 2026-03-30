@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from claude_postgresql.config import ServerConfig
 from claude_postgresql.database import DatabaseManager
@@ -304,6 +305,11 @@ def main() -> None:
         port = int(os.environ.get("PORT", config.port))
         mcp.settings.host = config.host
         mcp.settings.port = port
+        # Disable DNS rebinding protection for remote deployments —
+        # Railway handles TLS termination at the edge.
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
 
     mcp.run(transport=transport)
 
