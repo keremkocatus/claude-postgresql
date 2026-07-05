@@ -67,7 +67,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     validator = QueryValidator(config)
 
     history = QueryHistoryManager(config)
-    await history.initialize()
+    await history.initialize(db.pool)
 
     logger.info("Server ready")
 

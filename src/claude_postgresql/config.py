@@ -55,9 +55,11 @@ class ServerConfig(BaseSettings):
     query_history_db: str | None = Field(
         default=None,
         description=(
-            "PostgreSQL DSN for storing query history. "
-            "If None, defaults to the main database_url. "
-            "Set both query_history_db and query_history_table to None to disable persistence."
+            "PostgreSQL DSN for storing query history in a SEPARATE database. "
+            "If None (default), history is written through the main connection pool — no extra "
+            "connections are opened, so the main database's connection budget stays capped at "
+            "PG_MCP_POOL_MAX_SIZE. Only set this to route history to a different database "
+            "(which then uses its own small pool)."
         ),
     )
     query_history_table: str | None = Field(

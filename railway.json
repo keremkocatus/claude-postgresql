@@ -6,6 +6,7 @@
   },
   "deploy": {
     "startCommand": "claude-postgresql",
+    "numReplicas": 1,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 5
   }
