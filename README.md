@@ -6,7 +6,7 @@ High-performance PostgreSQL connector for Claude via the **Model Context Protoco
 
 - **18 MCP tools** — schema browsing, query execution, database info, admin & performance
 - **Connection pooling** — async `asyncpg` with configurable pool sizing
-- **Security** — read-only mode, dangerous operation blocking, query length limits, schema/table whitelists
+- **Security** — read-only mode, dangerous operation blocking, query length limits, schema/table whitelists, OAuth login for remote deployments
 - **Query history** — optional persistence to a PostgreSQL table (configurable DB + table name)
 - **SSL/TLS** — optional client certificate authentication
 - **Structured logging** — JSON logs to stderr with query timing and row counts
@@ -150,6 +150,32 @@ When `QUERY_HISTORY_TABLE` is set, the server auto-creates the table on startup 
 | `PG_MCP_LOG_QUERIES` | `true` | Log every executed query |
 | `PG_MCP_LOG_LEVEL` | `INFO` | Logging level |
 
+### Authentication (remote deployments)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PG_MCP_ADMIN_PASSWORD` | `None` | Shared secret gating access. **Required for any `sse`/`streamable-http` deployment** — see below. |
+| `PG_MCP_PUBLIC_URL` | `None` | Public HTTPS URL of the deployment (e.g. `https://your-app.up.railway.app`). Required alongside `PG_MCP_ADMIN_PASSWORD`. |
+
+---
+
+## Securing a remote deployment
+
+When `PG_MCP_TRANSPORT` is `sse` or `streamable-http` (i.e. you're running this on Railway or anywhere else reachable over HTTP), **the URL alone is not a secret**. Anyone who obtains it can call every tool — including `execute_dml` — against your database. Set `PG_MCP_ADMIN_PASSWORD` to require login before any tool call is accepted:
+
+```bash
+PG_MCP_ADMIN_PASSWORD=$(python -c "import secrets; print(secrets.token_urlsafe(24))")
+PG_MCP_PUBLIC_URL=https://your-app.up.railway.app
+```
+
+With both set, the server acts as a minimal single-user OAuth 2.1 provider: MCP clients (Claude.ai's "Add custom connector", Claude Desktop, etc.) register themselves automatically and redirect the user to a `/login` page gated by `PG_MCP_ADMIN_PASSWORD` before issuing an access token. There is no need to fill in the "OAuth Client ID/Secret" fields in Claude's connector dialog — dynamic client registration handles that.
+
+Notes:
+- This protects **one deployment for one operator** — every login shares a single identity. It is not meant for multiple distinct users on the same deployment.
+- Login attempts are not rate-limited, so use a long random value for `PG_MCP_ADMIN_PASSWORD`, not a memorable password.
+- Tokens are kept in memory and are lost on restart/redeploy (clients will silently re-authenticate).
+- If `PG_MCP_ADMIN_PASSWORD` is left unset on a remote transport, the server logs a startup warning and runs with no authentication at all.
+
 ---
 
 ## Available Tools
@@ -204,6 +230,7 @@ When `QUERY_HISTORY_TABLE` is set, the server auto-creates the table on startup 
 6. **Schema/table whitelists** — restrict which schemas and tables are visible/accessible
 7. **Identifier sanitization** — dynamic SQL identifiers are validated against strict patterns
 8. **Query logging** — full audit trail of all executed queries with timing
+9. **Transport authentication** — remote deployments (`sse`/`streamable-http`) require an OAuth login gated by `PG_MCP_ADMIN_PASSWORD` (see [Securing a remote deployment](#securing-a-remote-deployment)); without it, the URL itself is the only thing standing between anyone and the database
 
 ---
 

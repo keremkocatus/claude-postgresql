@@ -10,9 +10,13 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
 
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import Response
 
+from claude_postgresql.auth import SimplePasswordOAuthProvider, handle_login_route
 from claude_postgresql.config import ServerConfig
 from claude_postgresql.database import DatabaseManager
 from claude_postgresql.logging_config import setup_logging
@@ -20,6 +24,25 @@ from claude_postgresql.query_history import QueryHistoryManager
 from claude_postgresql.security import QueryValidator
 
 logger = logging.getLogger("claude_postgresql.server")
+
+config = ServerConfig()  # type: ignore[call-arg]
+
+auth_provider: SimplePasswordOAuthProvider | None = None
+auth_settings: AuthSettings | None = None
+if config.admin_password and config.public_url:
+    auth_provider = SimplePasswordOAuthProvider(config.admin_password)
+    auth_settings = AuthSettings(
+        issuer_url=config.public_url,
+        resource_server_url=config.public_url,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+        revocation_options=RevocationOptions(enabled=True),
+    )
+elif config.transport in ("sse", "streamable-http") and not config.admin_password:
+    logger.warning(
+        "SECURITY WARNING: PG_MCP_ADMIN_PASSWORD is not set — this server accepts requests from "
+        "anyone who knows its URL, with full database access. Set PG_MCP_ADMIN_PASSWORD (and "
+        "PG_MCP_PUBLIC_URL) to require login."
+    )
 
 
 # ── Lifespan context ─────────────────────────────────────────────────────
@@ -35,7 +58,6 @@ class AppContext:
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     """Initialise database pool & friends on startup; tear down on shutdown."""
-    config = ServerConfig()  # type: ignore[call-arg]
     setup_logging(config.log_level)
     logger.info("Starting Claude PostgreSQL MCP server v0.1.0")
 
@@ -63,7 +85,15 @@ mcp = FastMCP(
     "claude-postgresql",
     instructions="High-performance PostgreSQL connector for Claude — schema discovery, query execution, monitoring & admin.",
     lifespan=app_lifespan,
+    auth_server_provider=auth_provider,
+    auth=auth_settings,
 )
+
+if auth_provider is not None:
+
+    @mcp.custom_route("/login", methods=["GET", "POST"])
+    async def login(request: Request) -> Response:
+        return await handle_login_route(request, auth_provider)
 
 
 def _ctx(ctx: Context) -> AppContext:
@@ -295,7 +325,6 @@ async def get_table_stats(ctx: Context, table: str, schema: str = "public") -> s
 
 def main() -> None:
     """CLI entry point — run the MCP server."""
-    config = ServerConfig()
     transport = config.transport
 
     if transport in ("sse", "streamable-http"):

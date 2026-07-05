@@ -118,6 +118,24 @@ class ServerConfig(BaseSettings):
         description="Bind port for HTTP transports. Railway sets PORT env var.",
     )
 
+    # ── Authentication (remote transports) ────────────────────────────────
+    admin_password: str | None = Field(
+        default=None,
+        description=(
+            "Shared secret gating the OAuth login page for remote (sse/streamable-http) deployments. "
+            "Generate one with `python -c \"import secrets; print(secrets.token_urlsafe(24))\"` — use a long "
+            "random value, not a memorable password, since login attempts are not rate-limited. "
+            "If unset, the HTTP endpoint has NO authentication: anyone with the URL has full database access."
+        ),
+    )
+    public_url: str | None = Field(
+        default=None,
+        description=(
+            "Public HTTPS URL of this deployment, e.g. 'https://your-app.up.railway.app'. "
+            "Required when admin_password is set, so OAuth clients can discover the login/token endpoints."
+        ),
+    )
+
     # ── Validators ────────────────────────────────────────────────────────
     @model_validator(mode="after")
     def _validate_pool_sizes(self) -> ServerConfig:
@@ -134,4 +152,13 @@ class ServerConfig(BaseSettings):
                 value = getattr(self, attr)
                 if value is not None and not Path(value).exists():
                     raise ValueError(f"SSL file not found: {attr}={value}")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_auth_config(self) -> ServerConfig:
+        if self.admin_password and self.transport in ("sse", "streamable-http") and not self.public_url:
+            raise ValueError(
+                "PG_MCP_PUBLIC_URL must be set to this deployment's public HTTPS URL "
+                "when PG_MCP_ADMIN_PASSWORD is configured."
+            )
         return self
