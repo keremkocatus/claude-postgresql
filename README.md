@@ -6,7 +6,7 @@ High-performance PostgreSQL connector for Claude via the **Model Context Protoco
 
 - **18 MCP tools** — schema browsing, query execution, database info, admin & performance
 - **Connection pooling** — async `asyncpg` with configurable pool sizing
-- **Security** — read-only mode, dangerous operation blocking, query length limits, schema/table whitelists
+- **Security** — read-only mode, dangerous operation blocking, query length limits, schema/table whitelists, OAuth login for remote deployments
 - **Query history** — optional persistence to a PostgreSQL table (configurable DB + table name)
 - **SSL/TLS** — optional client certificate authentication
 - **Structured logging** — JSON logs to stderr with query timing and row counts
@@ -80,6 +80,44 @@ Or if using `uv`:
 
 ---
 
+## Remote Deployment (Railway + Claude.ai)
+
+Besides running locally over stdio (above), this server also runs as a remote HTTP service — deploy your own instance on Railway and connect to it from **claude.ai** as a custom connector (no local process, works from any device).
+
+### 1. Deploy to Railway
+
+1. Fork this repo.
+2. In Railway: **New Project → Deploy from GitHub repo** → select your fork. Railway builds it with the included [Dockerfile](Dockerfile), which already sets `PG_MCP_TRANSPORT=streamable-http`.
+3. Go to **Settings → Networking → Generate Domain** to get a public URL like `https://your-app.up.railway.app`.
+
+### 2. Set environment variables
+
+In Railway's **Variables** tab:
+
+| Variable | Value |
+|----------|-------|
+| `PG_MCP_DATABASE_URL` | Your PostgreSQL connection string |
+| `PG_MCP_ADMIN_PASSWORD` | A long random secret — generate with `python -c "import secrets; print(secrets.token_urlsafe(24))"` |
+| `PG_MCP_PUBLIC_URL` | The domain from step 1, e.g. `https://your-app.up.railway.app` |
+
+`PG_MCP_ADMIN_PASSWORD` and `PG_MCP_PUBLIC_URL` are **not optional** for a public deployment — see [Securing a remote deployment](#securing-a-remote-deployment) below for why. Save and let Railway redeploy.
+
+### 3. Connect from Claude
+
+In claude.ai: **Settings → Connectors → Add custom connector**.
+
+| Field | Value |
+|-------|-------|
+| Name | anything, e.g. `PostgreSQL` |
+| Remote MCP server URL | `https://your-app.up.railway.app/mcp` |
+| OAuth Client ID / Secret (Advanced settings) | leave blank |
+
+Click **Add**, then **Connect**. Claude registers itself automatically and opens a login page in your browser — enter `PG_MCP_ADMIN_PASSWORD` there. Once authorized, the connector is ready to use in any chat.
+
+The same URL also works from Claude Desktop or any other MCP client that supports remote/HTTP servers with OAuth.
+
+---
+
 ## Configuration
 
 All settings use the `PG_MCP_` prefix and can be set via environment variables or `.env` file.
@@ -150,6 +188,25 @@ When `QUERY_HISTORY_TABLE` is set, the server auto-creates the table on startup 
 | `PG_MCP_LOG_QUERIES` | `true` | Log every executed query |
 | `PG_MCP_LOG_LEVEL` | `INFO` | Logging level |
 
+### Authentication (remote deployments)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PG_MCP_ADMIN_PASSWORD` | `None` | Shared secret gating access. **Required for any `sse`/`streamable-http` deployment** — see below. |
+| `PG_MCP_PUBLIC_URL` | `None` | Public HTTPS URL of the deployment (e.g. `https://your-app.up.railway.app`). Required alongside `PG_MCP_ADMIN_PASSWORD`. |
+
+---
+
+## Securing a remote deployment
+
+When `PG_MCP_TRANSPORT` is `sse` or `streamable-http` (i.e. you're running this on Railway or anywhere else reachable over HTTP), **the URL alone is not a secret**. Anyone who obtains it can call every tool — including `execute_dml` — against your database. Setting `PG_MCP_ADMIN_PASSWORD` (see [Remote Deployment](#remote-deployment-railway--claudeai) above) closes that gap: the server becomes a minimal single-user OAuth 2.1 provider, and MCP clients must complete a browser login gated by that password before any tool call is accepted. There is no need to fill in the "OAuth Client ID/Secret" fields in Claude's connector dialog — dynamic client registration handles that automatically.
+
+Notes:
+- This protects **one deployment for one operator** — every login shares a single identity. It is not meant for multiple distinct users on the same deployment.
+- Login attempts are not rate-limited, so use a long random value for `PG_MCP_ADMIN_PASSWORD`, not a memorable password.
+- Tokens are kept in memory and are lost on restart/redeploy (clients will silently re-authenticate).
+- If `PG_MCP_ADMIN_PASSWORD` is left unset on a remote transport, the server logs a startup warning and runs with no authentication at all.
+
 ---
 
 ## Available Tools
@@ -204,6 +261,7 @@ When `QUERY_HISTORY_TABLE` is set, the server auto-creates the table on startup 
 6. **Schema/table whitelists** — restrict which schemas and tables are visible/accessible
 7. **Identifier sanitization** — dynamic SQL identifiers are validated against strict patterns
 8. **Query logging** — full audit trail of all executed queries with timing
+9. **Transport authentication** — remote deployments (`sse`/`streamable-http`) require an OAuth login gated by `PG_MCP_ADMIN_PASSWORD` (see [Securing a remote deployment](#securing-a-remote-deployment)); without it, the URL itself is the only thing standing between anyone and the database
 
 ---
 
