@@ -116,6 +116,13 @@ def _check_state_path(path: Path) -> None:
         existing = existing.parent
     if not existing.is_dir():
         raise ConfigError(f"server.state_path: directory {directory} cannot be created ({existing} is not a directory)")
+    if existing != directory and not os.access(existing, os.W_OK | os.X_OK):
+        # Typically a container config checked on a host (no /data there): the advice is to check in the right place.
+        raise ConfigError(
+            f"server.state_path: directory {directory} does not exist and {_user()} cannot create it in {existing};"
+            " the path is checked on this machine, so run check-config where `serve` runs"
+            " (for the image: docker run ... ratatoskr check-config)"
+        )
     if not os.access(existing, os.W_OK | os.X_OK) or (path.exists() and not os.access(path, os.R_OK | os.W_OK)):
         where = path if path.exists() and existing == directory else existing
         raise ConfigError(

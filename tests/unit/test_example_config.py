@@ -60,9 +60,13 @@ def _uncomment_http(lines: list[str], *, oidc: bool) -> list[str]:
 
 
 @pytest.mark.parametrize("oidc", [False, True], ids=["local", "oidc"])
-def test_commented_http_example_is_valid(tmp_path: Path, oidc: bool) -> None:
+def test_commented_http_example_is_valid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, oidc: bool) -> None:
+    import ratatoskr.transport.preconditions as preconditions
     from ratatoskr.auth.identity.local import hash_password
     from ratatoskr.transport.preconditions import check_http_preconditions
+
+    # The example's /data/state.db is the container path; whether this host can write there is not under test.
+    monkeypatch.setattr(preconditions, "_check_state_path", lambda path: None)
 
     path = tmp_path / "config.yaml"
     path.write_text("\n".join(_uncomment_http(EXAMPLE.read_text(encoding="utf-8").splitlines(), oidc=oidc)) + "\n")

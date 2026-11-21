@@ -405,6 +405,18 @@ def test_unwritable_state_directory_is_a_config_error_naming_the_fix(make_config
     assert "not writable" in str(info.value) and "chown" in str(info.value)
 
 
+def test_missing_state_dir_under_unwritable_parent_says_where_to_check(make_config, tmp_path, monkeypatch) -> None:
+    """A container config checked on a host (/data absent, / not writable): no chown advice for the wrong place."""
+    import ratatoskr.transport.preconditions as preconditions
+
+    monkeypatch.setattr(preconditions.os, "access", lambda path, mode: False)
+    config = with_server(make_config(), state_path=tmp_path / "data" / "state.db")
+    with pytest.raises(ConfigError, match=r"server\.state_path") as info:
+        check_http_preconditions(config, insecure_dev=False)
+    message = str(info.value)
+    assert "does not exist" in message and "where `serve` runs" in message and "chown" not in message
+
+
 def test_metrics_port_warns_that_it_is_not_implemented(make_config) -> None:
     settings = check_http_preconditions(with_server(make_config(), metrics_port=9100), insecure_dev=False)
     assert any("server.metrics_port" in w and "not implemented" in w for w in settings.warnings)

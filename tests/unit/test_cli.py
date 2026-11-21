@@ -95,6 +95,10 @@ def test_check_config_ok_prints_summary_without_secrets(
 def test_check_config_never_prints_secrets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], break_config: bool
 ) -> None:
+    import ratatoskr.transport.preconditions as preconditions
+
+    # The config keeps the default /data/state.db (container path); host writability is not under test here.
+    monkeypatch.setattr(preconditions, "_check_state_path", lambda path: None)
     monkeypatch.setenv("MAIN_DSN", "postgresql://dbuser:dsn-pass-7731@db.internal:5432/app?password=qs-pass-7731")
     monkeypatch.setenv("SECRET", "secret-key-7731-" + "k" * 32)
     monkeypatch.setenv("CLIENT_SECRET", "client-secret-7731")
