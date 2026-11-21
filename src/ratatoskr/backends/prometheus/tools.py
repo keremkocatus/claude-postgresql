@@ -45,7 +45,9 @@ def _read_only(title: str) -> ToolAnnotations:
 def register_prometheus_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
     async def run(tool: str, connection: str, call: Call, query_text: str | None = None) -> CallToolResult:
         async def wrapped(backend: Backend, access: Access) -> ToolOutput:
-            return await call(_prometheus(backend))
+            prometheus = _prometheus(backend)
+            async with prometheus.deadline():  # one deadline for all requests of the call
+                return await call(prometheus)
 
         result = await runtime.run(
             tool=tool,

@@ -6,15 +6,17 @@ user-safe "unavailable" error rather than at startup.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from typing import Any, ClassVar
 
 from ratatoskr.backends.base import ConnectionInfo, HealthResult
-from ratatoskr.backends.errors import BackendError
-from ratatoskr.backends.http.client import EndpointNotFoundError, HttpClient
+from ratatoskr.backends.errors import BackendError, BackendTimeoutError
+from ratatoskr.backends.http.client import TIMEOUT_GRACE_SECONDS, EndpointNotFoundError, HttpClient
 from ratatoskr.backends.prometheus.api import PrometheusApi
 from ratatoskr.backends.timeparse import unix_seconds, utc_now
 from ratatoskr.config.prometheus_models import PrometheusConnection, PrometheusLimits
@@ -54,6 +56,17 @@ class PrometheusBackend:
 
     async def open(self) -> None:
         await self._client.open()
+
+    @contextlib.asynccontextmanager
+    async def deadline(self) -> AsyncIterator[None]:
+        """One deadline for a whole tool call, which may send several requests (names, then metadata): the
+        connection's timeout plus the same grace a single request gets."""
+        seconds = self._client.timeout
+        try:
+            async with asyncio.timeout(seconds + TIMEOUT_GRACE_SECONDS):
+                yield
+        except TimeoutError:
+            raise BackendTimeoutError(f"Connection '{self.name}' did not answer within {seconds:.0f}s.") from None
 
     async def close(self) -> None:
         await self._client.aclose()

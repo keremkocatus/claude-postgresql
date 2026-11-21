@@ -2,8 +2,11 @@ import pytest
 
 from ratatoskr.backends.errors import BackendQueryError
 from ratatoskr.backends.prometheus.formatting import (
+    SIDE_NOTE_BYTES,
     BlockWriter,
     cell,
+    clip_bytes,
+    error_note,
     format_instant,
     response_budget,
     short_time,
@@ -58,7 +61,7 @@ def test_truncation_note_reasons() -> None:
 
 
 def test_helpers() -> None:
-    assert response_budget(65536) == 64512
+    assert response_budget(65536) == 65536 - 2048
     assert response_budget(1024) == 512
     assert with_notes("x", []) == "x"
     assert with_notes("x", ["warning: a"]) == "x\n\nNotes from Prometheus:\n- warning: a"
@@ -108,3 +111,22 @@ def test_instant_native_histogram() -> None:
     }
     text, _ = format_instant(parse_result(data), at=NOW, max_series=100, budget=1000)
     assert text.endswith("h histogram(count=3, sum=1.5)")
+
+
+def test_parse_builds_only_the_series_it_will_show_and_counts_the_rest() -> None:
+    data = vector(*(({"i": str(i)}, "1") for i in range(3)))
+    data["result"] += ["never read", {"metric": None}]
+    parsed = parse_result(data, max_series=2)
+    assert [series.labels for series in parsed.series] == [{"i": "0"}, {"i": "1"}]
+    assert parsed.total == 5
+    text, shown = format_instant(parsed, at=NOW, max_series=2, budget=10_000)
+    assert text.startswith("vector: 5 series at")
+    assert (shown, "[Showing 2 of 5 series: the limit is 2." in text) == (2, True)
+
+
+def test_clip_bytes_and_error_notes() -> None:
+    assert clip_bytes("é" * 10, 7) == "éé…"
+    assert clip_bytes("short", 7) == "short"
+    note = error_note("Part is unavailable", RuntimeError("token=abc " + "x" * 5000))
+    assert note.startswith("Part is unavailable: token=*** xxx")
+    assert len(note.encode()) <= SIDE_NOTE_BYTES

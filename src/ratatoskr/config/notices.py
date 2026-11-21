@@ -19,7 +19,7 @@ def config_warnings(config: RatatoskrConfig) -> list[str]:
             isinstance(connection, PrometheusConnection)
             and connection.auth.type != "none"
             and connection.url.scheme == "http"
-            and connection.url.host not in LOOPBACK_HOSTS
+            and (connection.url.host or "").strip("[]") not in LOOPBACK_HOSTS  # pydantic keeps IPv6 brackets
         ):
             warnings.append(f"connections.{name}: credentials are sent over plain http; use an https url")
     return warnings

@@ -22,23 +22,32 @@ class Series:
 @dataclass(frozen=True)
 class QueryResult:
     result_type: str  # vector | matrix | scalar | string
-    series: list[Series]
+    series: list[Series]  # the first ones only, as many as can be shown
     scalar: Sample | None = None
+    omitted: int = 0  # series in the answer that were counted but not built
+
+    @property
+    def total(self) -> int:
+        return len(self.series) + self.omitted
 
 
-def parse_result(data: Any) -> QueryResult:
+def parse_result(data: Any, *, max_series: int | None = None) -> QueryResult:
+    """Build the first *max_series* series (all when None); the others are only counted, since they are never
+    shown. CPU-bound on large answers: callers run it off the event loop."""
     try:
-        return _parse(data)
+        return _parse(data, max_series)
     except (KeyError, IndexError, TypeError, ValueError):
         raise _unreadable() from None
 
 
-def _parse(data: Any) -> QueryResult:
+def _parse(data: Any, max_series: int | None) -> QueryResult:
     result_type, raw = data["resultType"], data["result"]
     if result_type in ("scalar", "string"):
         return QueryResult(result_type=result_type, series=[], scalar=_sample(raw))
     if result_type in ("vector", "matrix") and isinstance(raw, list):
-        return QueryResult(result_type=result_type, series=[_series(item, result_type) for item in raw])
+        kept = raw if max_series is None else raw[:max_series]
+        series = [_series(item, result_type) for item in kept]
+        return QueryResult(result_type=result_type, series=series, omitted=len(raw) - len(kept))
     raise _unreadable()
 
 

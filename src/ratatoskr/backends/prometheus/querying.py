@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from ratatoskr.backends.errors import BackendQueryError, InvalidRequestError
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
 from ratatoskr.backends.prometheus.formatting import format_instant, response_budget, with_notes
@@ -40,16 +42,16 @@ async def instant_query(backend: PrometheusBackend, promql: str, time: str | Non
     now = backend.now()
     at = now if time is None else parse_time(time, now=now, argument="time")
     result = await backend.api.query(query, unix_seconds(at))
-    parsed = parse_result(result.data)
+    parsed = await asyncio.to_thread(parse_result, result.data, max_series=limits.max_series)
     budget = response_budget(limits.max_response_bytes)
     if parsed.result_type == "matrix":  # a range vector selector such as up[5m]: raw samples
-        header = f"matrix: {len(parsed.series)} series of raw samples up to {format_time(at)} (times are UTC)"
+        header = f"matrix: {parsed.total} series of raw samples up to {format_time(at)} (times are UTC)"
         text, shown = format_matrix(
             parsed, header=header, expected=None, same_day=False, max_series=limits.max_series, budget=budget
         )
     else:
         text, shown = format_instant(parsed, at=at, max_series=limits.max_series, budget=budget)
-    return ToolOutput(text=with_notes(text, result.notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)
 
 
 async def range_query(
@@ -62,12 +64,12 @@ async def range_query(
     result = await backend.api.query_range(
         query, unix_seconds(window.start), unix_seconds(window.end), step_seconds(chosen)
     )
-    parsed = parse_result(result.data)
+    parsed = await asyncio.to_thread(parse_result, result.data, max_series=limits.max_series)
     if parsed.result_type != "matrix":
         raise BackendQueryError(f"Prometheus answered a range query with a {parsed.result_type} result.")
     expected = point_count(window.span, chosen)
     header = (
-        f"matrix: {len(parsed.series)} series from {format_time(window.start)} to {format_time(window.end)}, "
+        f"matrix: {parsed.total} series from {format_time(window.start)} to {format_time(window.end)}, "
         f"step {format_duration(chosen)} (up to {expected} points per series; times are UTC)"
     )
     text, shown = format_matrix(
@@ -78,4 +80,4 @@ async def range_query(
         max_series=limits.max_series,
         budget=response_budget(limits.max_response_bytes),
     )
-    return ToolOutput(text=with_notes(text, result.notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)

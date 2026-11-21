@@ -30,7 +30,7 @@ class PrometheusLimits(BaseModel):
     max_range: timedelta = timedelta(days=31)
     max_query_length: int = Field(default=20_000, ge=1)
     max_response_bytes: int = Field(default=DEFAULT_MAX_RESPONSE_BYTES, ge=1024)
-    max_body_bytes: int = Field(default=16 * 1024 * 1024, ge=64 * 1024)  # read from Prometheus per request
+    max_body_bytes: int = Field(default=8 * 1024 * 1024, ge=64 * 1024)  # read from Prometheus per request
 
     @field_validator("max_range", mode="before")
     @classmethod

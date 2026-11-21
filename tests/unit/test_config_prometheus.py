@@ -31,7 +31,7 @@ def test_defaults() -> None:
     limits = connection.limits
     assert (limits.max_series, limits.max_values, limits.max_points) == (100, 500, 1000)
     assert (limits.max_range, limits.max_response_bytes) == (timedelta(days=31), 65536)
-    assert limits.max_body_bytes == 16 * 1024 * 1024
+    assert limits.max_body_bytes == 8 * 1024 * 1024
 
 
 def test_full_connection() -> None:

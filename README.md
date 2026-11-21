@@ -222,15 +222,18 @@ connections:
 | `mode` | `read` | Always `read`: every Prometheus tool is a read, and `mode: write` is rejected. |
 | `auth` | `{type: none}` | `none`, `basic` (`username`, `password`) or `bearer` (`token`); secrets via `${VAR}` / `${file:...}`, never empty. |
 | `headers` | `{}` | Extra request headers, e.g. `X-Scope-OrgID` for a Mimir/Cortex tenant. Values are treated as secrets. `Authorization`, `Proxy-Authorization`, `Host`, `Content-Length`, `Content-Type`, `Transfer-Encoding` and `Connection` are refused. |
-| `timeout` | `30s` | Per request (1s to 10m); also sent to Prometheus as the query evaluation timeout. |
+| `timeout` | `30s` | Per request (1s to 10m); also sent to Prometheus as the query evaluation timeout. Each tool call has one deadline for all its requests, `timeout` + 5s (`prom_list_metrics` and `prom_alerts` send two). |
 | `tls` | `verify: true` | `verify: false` turns verification off; `ca_file` (must exist, needs `verify: true`) trusts only that CA. Default trust: certifi, or `SSL_CERT_FILE` / `SSL_CERT_DIR`. No client certificates. |
-| `limits.max_series` | `100` | Series (and alerts) shown per response (1 to 10000). |
+| `limits.max_series` | `100` | Series (and alerts) shown per response (1 to 10000); only these series are parsed, the others are counted. |
 | `limits.max_values` | `500` | Metric names and label values shown per response. |
 | `limits.max_points` | `1000` | Points per series in `prom_query_range` (10 to 11000); a step that needs more is refused with the smallest step that fits. |
 | `limits.max_range` | `31d` | Longest window for range queries and for name/value listings (at least `1m`). |
 | `limits.max_query_length` | `20000` | Characters of PromQL or of a `match` selector. |
 | `limits.max_response_bytes` | `65536` | Text returned to Claude (at least 1024). |
-| `limits.max_body_bytes` | `16777216` | Bytes read from Prometheus per request (at least 65536); a larger answer is refused with a hint to narrow the query. |
+| `limits.max_body_bytes` | `8388608` | Bytes read from Prometheus per request (8 MiB; at least 65536); a larger answer is refused with a hint to narrow the query. Memory: while an answer is decoded the call holds about 10 times this (about 80 MiB at the default, for each call running at the same time); decoding runs off the event loop. Lower it on small hosts. |
+
+Requests ask for an uncompressed answer (`Accept-Encoding: identity`) so `max_body_bytes` counts what is decoded. A
+server that compresses anyway (`gzip`, `deflate`) is decoded step by step within the cap; other encodings are refused.
 
 Outgoing HTTP (OIDC issuer, Prometheus) honours `HTTPS_PROXY` / `HTTP_PROXY`; put in-cluster hosts in `NO_PROXY`.
 `check-config` shows each Prometheus connection's auth type and number of extra headers, never the URL, token or
@@ -266,9 +269,10 @@ there.
 
 Prometheus tools take `connection` from `list_connections` and refuse a PostgreSQL connection (and the `pg_*` tools a
 Prometheus one). Times accept RFC3339 (`2026-11-22T10:00:00Z`), unix seconds, or `now`, `now-15m`, `now-2h`; windows
-(`start`/`end` of `prom_query_range`, `prom_list_metrics` and `prom_label_values`) default to the last hour. Without
-`step`, `prom_query_range` picks a round one that gives up to about 120 points. Label names for `prom_label_values`
-are plain Prometheus names (`^[A-Za-z_][A-Za-z0-9_]*$`).
+(`start`/`end` of `prom_query_range`, `prom_list_metrics` and `prom_label_values`) default to the last hour. Time and
+`step` arguments longer than 64 characters are refused. A `step` must be at least `1ms` and is rounded to whole
+milliseconds; without `step`, `prom_query_range` picks a round one that gives up to about 120 points. Label names
+for `prom_label_values` are plain Prometheus names (`^[A-Za-z_][A-Za-z0-9_]*$`).
 
 ## Security model
 
@@ -319,10 +323,14 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
   `timeout` to Prometheus and enforces its own deadline, caps what it reads (`max_body_bytes`) and what it returns.
   Keep Prometheus' own `--query.timeout`, `--query.max-samples` and `--query.max-concurrency` (or the Mimir/Thanos
   per-tenant limits) in place, and give each connection a credential or tenant that only sees what its users may see.
-- Credentials (`auth`, header values) never appear in errors, logs or `check-config` output. Error texts and warnings
-  from the server are passed on with URLs, IP addresses, `host:port` pairs and internal host names removed (best
-  effort); query results are returned unchanged. Answers that are not the Prometheus API (401/403, 404, 429,
-  redirects, 5xx, HTML login pages) get fixed wording; details go to the log. `serve` and `check-config` warn when
+- Credentials (`auth`, header values) never appear in errors, logs or `check-config` output. Error texts, warnings and
+  rule errors from the server are passed on with URLs, IP addresses (IPv4, IPv6 with or without brackets),
+  `host:port` pairs (also single-label hosts such as `prometheus-0:10901`), names under `svc`, `cluster.local`,
+  `internal`, `local`, `lan` or `corp`, and other names of three or more labels (`ingester-7.ingester.mimir`; a
+  dotted name on its own in double quotes, such as a UTF-8 metric name, is kept) removed (best effort), and with
+  secrets masked like any error text; each is cut to 1000 characters. At most 5 warnings and infos are shown per
+  answer (the rest are counted). Query results are returned unchanged. Answers that are not the Prometheus API
+  (401/403, 404, 429, redirects, 5xx, HTML login pages) get fixed wording; details go to the log. `serve` and `check-config` warn when
   `auth` credentials would go over plain `http` to a host other than loopback.
 - At `log_level: INFO` httpx's request lines (which carry internal hosts and label matchers) are not logged.
 

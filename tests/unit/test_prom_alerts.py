@@ -4,7 +4,8 @@ import respx
 
 from ratatoskr.backends.prometheus import alerts
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
-from tests.unit.prom_helpers import api_error, success
+from ratatoskr.backends.prometheus.formatting import NOTE_RESERVE_BYTES
+from tests.unit.prom_helpers import api_error, make_backend, success
 
 ALERTS = {
     "alerts": [
@@ -85,8 +86,56 @@ async def test_rules_endpoint_failure_keeps_the_alerts(prom_api: respx.Router, p
 
 def test_alerts_are_capped() -> None:
     many = [{"labels": {"alertname": f"A{i:02}"}, "state": "firing"} for i in range(5)]
-    text = alerts.format_alerts(many, max_items=2, budget=10_000)
+    text, shown = alerts.format_alerts(many, max_items=2, budget=10_000)
+    assert shown == 2
     assert text.count("| firing |") == 2
     assert text.endswith(
         '[Showing 2 of 5 alerts: the limit is 2. Query ALERTS{alertstate="firing"} with prom_query to filter them.]'
     )
+
+
+async def test_rule_errors_shown_in_the_output_are_redacted(
+    prom_api: respx.Router, prom_backend: PrometheusBackend
+) -> None:
+    prom_api.get("/api/v1/alerts").mock(return_value=success(ALERTS))
+    prom_api.get("/api/v1/rules").mock(
+        return_value=api_error(400, "bad_data", "proxy at 10.0.0.9:8880 refused token=s3cr3t-VALUE")
+    )
+    output = await alerts.alerts_overview(prom_backend)
+    assert output.text.endswith(
+        "Rule groups are unavailable: Prometheus error (bad_data): proxy at <address> refused token=***"
+    )
+
+
+async def test_last_errors_of_unhealthy_rules_are_redacted(
+    prom_api: respx.Router, prom_backend: PrometheusBackend
+) -> None:
+    rules = {"groups": [{"name": "g", "rules": [{"name": "r", "health": "err", "lastError": "password=hunter2 bad"}]}]}
+    prom_api.get("/api/v1/alerts").mock(return_value=success({"alerts": []}))
+    prom_api.get("/api/v1/rules").mock(return_value=success(rules))
+    output = await alerts.alerts_overview(prom_backend)
+    assert "hunter2" not in output.text
+    assert output.text.endswith("- g / r: password=*** bad")
+
+
+async def test_audit_rows_count_the_alerts_shown(prom_api: respx.Router) -> None:
+    backend = make_backend(limits={"max_series": 1})
+    await backend.open()
+    prom_api.get("/api/v1/alerts").mock(return_value=success(ALERTS))
+    prom_api.get("/api/v1/rules").mock(return_value=success(RULES))
+    output = await alerts.alerts_overview(backend)
+    await backend.close()
+    assert "[Showing 1 of 2 alerts: the limit is 1." in output.text
+    assert output.rows == 1
+
+
+async def test_many_unhealthy_rules_stay_within_the_response_budget(prom_api: respx.Router) -> None:
+    backend = make_backend(limits={"max_response_bytes": 4096})
+    await backend.open()
+    rules = [{"name": f"r{i}", "health": "err", "lastError": "é" * 300} for i in range(40)]
+    prom_api.get("/api/v1/alerts").mock(return_value=success({"alerts": []}))
+    prom_api.get("/api/v1/rules").mock(return_value=success({"groups": [{"name": "g", "rules": rules}]}))
+    output = await alerts.alerts_overview(backend)
+    await backend.close()
+    assert len(output.text.encode()) <= 4096 - NOTE_RESERVE_BYTES
+    assert output.text.endswith("more")

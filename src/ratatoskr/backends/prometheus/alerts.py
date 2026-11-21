@@ -12,6 +12,7 @@ from ratatoskr.backends.prometheus.backend import PrometheusBackend
 from ratatoskr.backends.prometheus.formatting import (
     BlockWriter,
     cell,
+    error_note,
     response_budget,
     short_time,
     truncation_note,
@@ -32,22 +33,26 @@ async def alerts_overview(backend: PrometheusBackend) -> ToolOutput:
     half = response_budget(limits.max_response_bytes) // 2
     alerts_result = await backend.api.alerts()
     alerts = _dicts(alerts_result.data, "alerts")
-    sections = [format_alerts(alerts, max_items=limits.max_series, budget=half)]
-    notes = list(alerts_result.notes)
+    alerts_text, shown = format_alerts(alerts, max_items=limits.max_series, budget=half)
+    sections = [alerts_text]
+    notes, omitted = list(alerts_result.notes), alerts_result.omitted_notes
     try:
         rules_result = await backend.api.rules()
     except BackendError as exc:  # e.g. VictoriaMetrics without a vmalert proxy
-        sections.append(f"Rule groups are unavailable: {exc}")
+        sections.append(error_note("Rule groups are unavailable", exc))
     else:
         groups = _dicts(rules_result.data, "groups")
         sections.append(format_rule_groups(groups, budget=half, scrub=backend.api.scrub))
         notes += rules_result.notes
-    return ToolOutput(text=with_notes("\n\n".join(sections), notes), rows=len(alerts))
+        omitted += rules_result.omitted_notes
+    # rows: the alerts shown, as the PostgreSQL tools count the rows they show
+    return ToolOutput(text=with_notes("\n\n".join(sections), notes, omitted=omitted), rows=shown)
 
 
-def format_alerts(alerts: list[dict[str, Any]], *, max_items: int, budget: int) -> str:
+def format_alerts(alerts: list[dict[str, Any]], *, max_items: int, budget: int) -> tuple[str, int]:
+    """Text and number of alerts shown."""
     if not alerts:
-        return "Alerts: none firing or pending."
+        return "Alerts: none firing or pending.", 0
     firing = sum(1 for alert in alerts if alert.get("state") == "firing")
     pending = sum(1 for alert in alerts if alert.get("state") == "pending")
     ordered = sorted(
@@ -65,7 +70,7 @@ def format_alerts(alerts: list[dict[str, Any]], *, max_items: int, budget: int) 
         if not writer.add(_alert_row(alert)):
             break
     shown = writer.kept - 2
-    return writer.text() + truncation_note(shown, len(alerts), max_items, unit="alerts", hint=ALERTS_HINT)
+    return writer.text() + truncation_note(shown, len(alerts), max_items, unit="alerts", hint=ALERTS_HINT), shown
 
 
 def _alert_row(alert: dict[str, Any]) -> str:
@@ -104,14 +109,23 @@ def format_rule_groups(groups: list[dict[str, Any]], *, budget: int, scrub: Call
         shown, len(groups), len(groups), unit="rule groups", hint="Narrow with prom_query on ALERTS."
     )
     if unhealthy:
-        lines = ["", "Unhealthy rules:"]
-        for group, rule in unhealthy[:MAX_UNHEALTHY]:
-            error = scrub(str(rule.get("lastError") or "no error text"))
-            lines.append(f"- {group.get('name', '?')} / {rule.get('name', '?')}: {cell(error, ERROR_CHARS)}")
-        if len(unhealthy) > MAX_UNHEALTHY:
-            lines.append(f"- ... and {len(unhealthy) - MAX_UNHEALTHY} more")
-        text += "\n" + "\n".join(lines)
+        text += "\n\n" + _unhealthy_rules(unhealthy, budget=writer.remaining, scrub=scrub)
     return text
+
+
+def _unhealthy_rules(
+    unhealthy: list[tuple[dict[str, Any], dict[str, Any]]], *, budget: int, scrub: Callable[[str], str]
+) -> str:
+    """Up to MAX_UNHEALTHY rules with their last error, in what is left of the rule groups' budget."""
+    writer = BlockWriter(budget)
+    writer.add("Unhealthy rules:")
+    for group, rule in unhealthy[:MAX_UNHEALTHY]:
+        error = cell(scrub(str(rule.get("lastError") or "no error text")), ERROR_CHARS)
+        if not writer.add(f"- {cell(group.get('name', '?'))} / {cell(rule.get('name', '?'))}: {error}"):
+            break
+    shown = writer.kept - 1
+    more = f"\n- ... and {len(unhealthy) - shown} more" if shown < len(unhealthy) else ""
+    return writer.text() + more
 
 
 def _group_row(group: dict[str, Any]) -> str:

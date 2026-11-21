@@ -56,8 +56,9 @@ Prometheus image from Docker Hub); never connect to a remote or production datab
 - `backends/postgres/` pools and execution (`backend.py`), guard pre-checks (`guard.py`), TLS (`tls.py`), catalog
   SQL (`introspection.py`), query/execute/explain (`querying.py`), tool registration (`tools.py`) and tool texts
   (`descriptions.py`).
-- `backends/http/` shared by HTTP backends: `client.py` (lazy httpx client, deadline, capped read, safe errors),
-  `options.py` (auth headers, TLS trust), `scrub.py` (addresses out of server messages).
+- `backends/http/` shared by HTTP backends: `client.py` (lazy httpx client, deadline, safe errors), `body.py`
+  (capped body read, bounded gzip/deflate decoding), `options.py` (auth headers, TLS trust), `scrub.py` (addresses
+  out of server messages).
 - `backends/prometheus/` endpoints and error envelope (`api.py`), backend (`backend.py`), result parsing (`series.py`),
   text (`formatting.py`, `summarize.py`), tool logic (`querying.py`, `discovery.py`, `alerts.py`), registration
   (`tools.py`) and tool texts (`descriptions.py`).
@@ -106,8 +107,14 @@ Prometheus image from Docker Hub); never connect to a remote or production datab
   boundary: the DB role's GRANTs are.
 - Prometheus: only the read endpoints in `backends/prometheus/api.py` (query, query_range, label values, metadata,
   alerts, rules, buildinfo); never admin or write APIs; `mode` is always `read`. Server messages (errors, warnings,
-  rule errors) go through `scrub_upstream_text`; successful output is not scrubbed. Never put the URL, a header value
-  or a credential into a message. Prometheus tools pass `kind=` and `truncation_hint=` to `ToolRuntime.run`.
+  rule errors) go through `PrometheusApi.scrub` (`scrub_upstream_text` + `redact`); successful output is not
+  scrubbed. Never put the URL, a header value or a credential into a message. Prometheus tools pass `kind=` and
+  `truncation_hint=` to `ToolRuntime.run`, and every call runs under one `PrometheusBackend.deadline()`.
+- Server text can echo user input of any length: every pattern in `scrub.py` must stay linear (match only at the
+  start of a run of its characters, possessive quantifiers) and keep its timing test in `test_http_scrub.py`.
+  Decoding (`json.loads`) and result parsing of up to `max_body_bytes` run in `asyncio.to_thread`; parse only the
+  series that can be shown (`parse_result(..., max_series=)`). Server notes go through `with_notes` (bounded) and
+  errors shown inside a successful answer through `error_note` (redacted, bounded).
 - Time arguments are parsed only by `backends/timeparse.py` (errors are `InvalidRequestError`); HTTP backends talk to
   their servers only through `backends/http/client.py`.
 - Minimum supported PostgreSQL is 12; catalog SQL must work there.

@@ -57,6 +57,9 @@ def test_check_config_prints_no_secrets(
         ("http://prometheus.example.com:9090", {"type": "bearer", "token": "t"}, True),
         ("https://prometheus.example.com", {"type": "bearer", "token": "t"}, False),
         ("http://127.0.0.1:9090", {"type": "basic", "username": "u", "password": "p"}, False),
+        ("http://[::1]:9090", {"type": "bearer", "token": "t"}, False),
+        ("http://localhost:9090", {"type": "bearer", "token": "t"}, False),
+        ("http://[fd00::7]:9090", {"type": "bearer", "token": "t"}, True),
         ("http://prometheus.example.com:9090", {"type": "none"}, False),
     ],
 )

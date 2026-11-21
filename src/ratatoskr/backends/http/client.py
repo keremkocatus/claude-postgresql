@@ -19,6 +19,7 @@ from pydantic import SecretStr
 
 from ratatoskr import __version__
 from ratatoskr.backends.errors import BackendError, BackendQueryError, BackendTimeoutError, BackendUnavailableError
+from ratatoskr.backends.http.body import UnreadableBodyError, read_capped
 from ratatoskr.backends.http.options import build_auth, build_verify
 from ratatoskr.config.http_models import HttpAuth, HttpTlsSettings
 
@@ -82,7 +83,12 @@ class HttpClient:
             headers, auth = build_auth(self._auth, self._headers)
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
-                headers={"User-Agent": f"ratatoskr/{__version__}", "Accept": "application/json", **headers},
+                headers={
+                    "User-Agent": f"ratatoskr/{__version__}",
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",  # an uncompressed body is what max_body_bytes counts
+                    **headers,
+                },
                 auth=auth,
                 verify=build_verify(self._tls),
                 timeout=httpx.Timeout(self.timeout, connect=min(CONNECT_TIMEOUT_SECONDS, self.timeout)),
@@ -119,6 +125,12 @@ class HttpClient:
                 return HttpReply(status=response.status_code, body=body)
         except BackendError:
             raise
+        except UnreadableBodyError as exc:
+            logger.warning("connection %s sent a body that cannot be read: %s", self._connection, exc)
+            raise BackendUnavailableError(
+                f"Connection '{self._connection}' answered with a compressed body Ratatoskr cannot read; details "
+                "are in the server log."
+            ) from None
         except (TimeoutError, httpx.TimeoutException):
             raise BackendTimeoutError(
                 f"Connection '{self._connection}' did not answer within {self.timeout:.0f}s."
@@ -130,14 +142,7 @@ class HttpClient:
         declared = response.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > self._max_body_bytes:
             raise self._too_large(hint)
-        chunks: list[bytes] = []
-        size = 0
-        async for chunk in response.aiter_bytes():
-            size += len(chunk)
-            if size > self._max_body_bytes:
-                raise self._too_large(hint)
-            chunks.append(chunk)
-        return b"".join(chunks)
+        return await read_capped(response, self._max_body_bytes, lambda: self._too_large(hint))
 
     def _too_large(self, hint: str) -> ResponseTooLargeError:
         limit = self._max_body_bytes

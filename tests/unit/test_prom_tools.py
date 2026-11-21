@@ -1,5 +1,8 @@
+import asyncio
+import time
 from typing import Any
 
+import httpx
 import pytest
 import respx
 from mcp.server.fastmcp import FastMCP
@@ -8,10 +11,12 @@ from mcp.types import CallToolResult, TextContent
 from ratatoskr.auth.policy import Policy
 from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.backends.base import Backend
+from ratatoskr.backends.http import client as http_client
+from ratatoskr.backends.prometheus import backend as prometheus_backend
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
 from ratatoskr.backends.prometheus.tools import register_prometheus_tools
 from ratatoskr.backends.registry import BackendRegistry
-from ratatoskr.config.models import ConnectionConfig
+from ratatoskr.config.models import ConnectionConfig, RatatoskrConfig
 from ratatoskr.config.prometheus_models import PrometheusConnection
 from ratatoskr.tools.common import register_common_tools
 from ratatoskr.tools.runtime import ToolRuntime
@@ -36,11 +41,11 @@ def _factory(name: str, config: ConnectionConfig) -> Backend:
 
 
 class _Harness:
-    def __init__(self) -> None:
+    def __init__(self, config: RatatoskrConfig = CONFIG) -> None:
         self.sink = RecordingSink()
         self.backends: dict[str, Backend] = {}
-        self.registry = BackendRegistry(CONFIG, factory=self._create)
-        runtime = ToolRuntime(Policy(CONFIG), self.registry, StdioPrincipalResolver("team"), self.sink)
+        self.registry = BackendRegistry(config, factory=self._create)
+        runtime = ToolRuntime(Policy(config), self.registry, StdioPrincipalResolver("team"), self.sink)
         self.mcp: FastMCP[Any] = FastMCP("test")
         register_common_tools(self.mcp, runtime)
         register_prometheus_tools(self.mcp, runtime)
@@ -155,3 +160,35 @@ async def test_list_connections_and_health_show_prometheus(prom_api: respx.Route
     health = _text(await harness.call("connection_health", connection="prom"))
     assert "| prom | prometheus | ok |" in health
     assert "Prometheus 3.5.0" in health
+
+
+@pytest.mark.parametrize(
+    ("tool", "first", "second"),
+    [
+        ("prom_list_metrics", "/api/v1/label/__name__/values", "/api/v1/metadata"),
+        ("prom_alerts", "/api/v1/alerts", "/api/v1/rules"),
+    ],
+)
+async def test_a_call_of_two_requests_has_one_deadline(
+    prom_api: respx.Router, monkeypatch: pytest.MonkeyPatch, tool: str, first: str, second: str
+) -> None:
+    """Each request answers within the 1s timeout, but the call as a whole does not."""
+    monkeypatch.setattr(prometheus_backend, "TIMEOUT_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(http_client, "TIMEOUT_GRACE_SECONDS", 0.0)
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.7)
+        return success(["up"] if "label" in request.url.path else {})
+
+    prom_api.get(first).mock(side_effect=slow)
+    prom_api.get(second).mock(side_effect=slow)
+    connections = {"prom": {"kind": "prometheus", "url": PROM_URL, "timeout": "1s"}}
+    harness = _Harness(make_config(connections=connections, roles={"team": {"prom": "read"}}))
+    await harness.registry.get("prom")  # opening (the CA bundle is loaded once) is not part of the call's deadline
+    started = time.perf_counter()
+    result = await harness.call(tool, connection="prom")
+    elapsed = time.perf_counter() - started
+    await harness.registry.close_all()
+    assert (result.isError, _text(result)) == (True, "Error: Connection 'prom' did not answer within 1s.")
+    assert 0.9 < elapsed < 1.3
+    assert harness.sink.events[0].result == "timeout"

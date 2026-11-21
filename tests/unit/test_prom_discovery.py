@@ -7,7 +7,7 @@ import respx
 from ratatoskr.backends.errors import InvalidRequestError
 from ratatoskr.backends.prometheus import discovery
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
-from tests.unit.prom_helpers import make_backend, success
+from tests.unit.prom_helpers import api_error, make_backend, success
 
 NAMES = ["go_goroutines", "http_requests_total", "process_cpu_seconds_total", "up"]
 METADATA = {
@@ -112,3 +112,13 @@ async def test_label_name_is_checked_before_any_request(
     with pytest.raises(InvalidRequestError, match="Invalid label name"):
         await discovery.label_values(prom_backend, label=label, match=None, start=None, end=None)
     assert prom_api.calls.call_count == 0
+
+
+async def test_metadata_errors_shown_in_the_output_are_redacted(
+    prom_api: respx.Router, prom_backend: PrometheusBackend
+) -> None:
+    prom_api.get("/api/v1/label/__name__/values").mock(return_value=success(["up"]))
+    prom_api.get("/api/v1/metadata").mock(return_value=api_error(422, "execution", "upstream api_key=k3y-VALUE x"))
+    output = await discovery.list_metrics(prom_backend, match=None, name_contains=None, start=None, end=None)
+    assert "k3y-VALUE" not in output.text
+    assert output.text.endswith("Type and help are unavailable: Prometheus error (execution): upstream api_key=*** x")

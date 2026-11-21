@@ -11,6 +11,7 @@ from ratatoskr.backends.prometheus.backend import PrometheusBackend
 from ratatoskr.backends.prometheus.formatting import (
     BlockWriter,
     cell,
+    error_note,
     response_budget,
     truncation_note,
     with_notes,
@@ -62,7 +63,7 @@ async def list_metrics(
     text = writer.text() + truncation_note(shown, len(names), limits.max_values, unit="metrics", hint=METRICS_HINT)
     if metadata_note:
         text += f"\n\n{metadata_note}"
-    return ToolOutput(text=with_notes(text, result.notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)
 
 
 async def label_values(
@@ -94,7 +95,7 @@ async def label_values(
             break
     shown = writer.kept - 1
     text = writer.text() + truncation_note(shown, len(values), limits.max_values, unit="values", hint=VALUES_HINT)
-    return ToolOutput(text=with_notes(text, result.notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)
 
 
 def _strings(data: Any) -> list[str]:
@@ -118,7 +119,7 @@ async def _metadata(backend: PrometheusBackend) -> tuple[dict[str, dict[str, str
     try:
         result = await backend.api.metadata()
     except BackendError as exc:
-        return {}, f"Type and help are unavailable: {exc}"
+        return {}, error_note("Type and help are unavailable", exc)
     found: dict[str, dict[str, str]] = {}
     if isinstance(result.data, dict):
         for name, entries in result.data.items():

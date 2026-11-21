@@ -104,3 +104,11 @@ async def test_non_api_answers(
         await prom_backend.api.alerts()
     assert text in str(caught.value)
     assert "prometheus.internal" not in str(caught.value)
+
+
+async def test_error_type_is_scrubbed_and_short(prom_api: respx.Router, prom_backend: PrometheusBackend) -> None:
+    prom_api.post("/api/v1/query").mock(return_value=api_error(422, "store 10.0.0.7:10901 " + "x" * 500, "failed"))
+    with pytest.raises(BackendQueryError) as caught:
+        await prom_backend.api.query("up", "1")
+    assert str(caught.value).startswith("Prometheus error (store <address> xxx")
+    assert len(str(caught.value)) < 120

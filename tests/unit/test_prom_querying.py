@@ -1,11 +1,15 @@
+import threading
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import parse_qs
 
 import pytest
 import respx
 
 from ratatoskr.backends.errors import InvalidRequestError
-from ratatoskr.backends.prometheus import querying
+from ratatoskr.backends.prometheus import api, querying
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
+from ratatoskr.backends.prometheus.formatting import MAX_NOTES
 from tests.unit.prom_helpers import TS, make_backend, matrix, success, vector
 
 
@@ -107,3 +111,67 @@ async def test_range_query_refuses_a_range_over_the_limit(prom_api: respx.Router
     with pytest.raises(InvalidRequestError, match="The range is 2d; this connection allows at most 1d"):
         await querying.range_query(backend, "up", "now-2d", None, None)
     await backend.close()
+
+
+async def test_range_query_counts_series_it_does_not_build(prom_api: respx.Router) -> None:
+    backend = make_backend(limits={"max_series": 2})
+    await backend.open()
+    prom_api.post("/api/v1/query_range").mock(
+        return_value=success(matrix(*(({"i": str(i)}, [(TS, "1")]) for i in range(5))))
+    )
+    output = await querying.range_query(backend, "up", None, None, None)
+    await backend.close()
+    assert output.text.startswith("matrix: 5 series from")
+    assert "[Showing 2 of 5 series: the limit is 2." in output.text
+    assert output.rows == 2
+
+
+async def test_decoding_and_parsing_run_off_the_event_loop(
+    prom_api: respx.Router, prom_backend: PrometheusBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    threads: dict[str, int] = {}
+
+    def recorded(name: str, function: Callable[..., Any]) -> Callable[..., Any]:
+        def run(*args: Any, **kwargs: Any) -> Any:
+            threads[name] = threading.get_ident()
+            return function(*args, **kwargs)
+
+        return run
+
+    monkeypatch.setattr(api, "parse_json", recorded("json", api.parse_json))
+    monkeypatch.setattr(querying, "parse_result", recorded("parse", querying.parse_result))
+    prom_api.post("/api/v1/query").mock(return_value=success(vector(({"job": "a"}, "1"))))
+    prom_api.post("/api/v1/query_range").mock(return_value=success(matrix(({"job": "a"}, [(TS, "1")]))))
+    for call in (
+        querying.instant_query(prom_backend, "up", None),
+        querying.range_query(prom_backend, "up", None, None, None),
+    ):
+        threads.clear()
+        await call
+        assert set(threads) == {"json", "parse"}
+        assert threading.get_ident() not in threads.values()
+
+
+async def test_many_long_server_notes_fit_the_note_reserve(prom_api: respx.Router) -> None:
+    """Series fill the budget and 50 long warnings arrive: the notes are bounded, so the clamp never cuts them."""
+    backend = make_backend(limits={"max_response_bytes": 8192})
+    await backend.open()
+    many = vector(*(({"name": "n" * 200, "i": str(i)}, "1") for i in range(100)))
+    warnings = [f"warning {i} " + "é" * 2000 for i in range(30)]
+    infos = [f"info {i} " + "x" * 3000 for i in range(20)]
+    prom_api.post("/api/v1/query").mock(return_value=success(many, warnings=warnings, infos=infos))
+    output = await querying.instant_query(backend, "up", None)
+    await backend.close()
+    assert len(output.text.encode()) <= 8192
+    assert "the response size limit was reached" in output.text
+    notes = output.text.split("Notes from Prometheus:\n")[1].splitlines()
+    assert len(notes) == MAX_NOTES + 1
+    assert notes[0].startswith("- warning: warning 0 éé")
+    assert notes[-1] == f"- ... and {50 - MAX_NOTES} more"
+
+
+async def test_query_results_are_never_scrubbed(prom_api: respx.Router, prom_backend: PrometheusBackend) -> None:
+    labels = {"instance": "prometheus-0:10901", "pod": "ingester-7.ingester.mimir", "ip": "2001:db8::1"}
+    prom_api.post("/api/v1/query").mock(return_value=success(vector((labels, "1"))))
+    output = await querying.instant_query(prom_backend, "up", None)
+    assert output.text.endswith('{instance="prometheus-0:10901", pod="ingester-7.ingester.mimir", ip="2001:db8::1"} 1')

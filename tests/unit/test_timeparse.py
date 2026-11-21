@@ -128,3 +128,43 @@ def test_api_formats() -> None:
     assert step_seconds(timedelta(milliseconds=250)) == "0.25"
     assert format_duration(timedelta(seconds=5400)) == "1h30m"
     assert format_duration(timedelta(0)) == "0s"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("0001-01-01T00:00:00+14:00", r"Invalid time '0001-01-01T00:00:00\+14:00': the time is out of range"),
+        ("9999-12-31T23:59:59-14:00", "Invalid time '9999-12-31T23:59:59-14:00': the time is out of range"),
+        ("now-" + "9" * 50 + "s", "use now-<duration> such as now-15m"),
+        ("now+999999999d", "use now-<duration> such as now-15m"),
+        ("now-" + "9" * 5000 + "s", "Invalid time 'now-9999.*': it is 5005 characters long; use RFC3339"),
+        ("1" * 100, "it is 100 characters long"),
+    ],
+)
+def test_every_bad_time_is_an_invalid_request(text: str, expected: str) -> None:
+    with pytest.raises(InvalidRequestError, match=expected):
+        parse_time(text, now=NOW, argument="time")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("9" * 5000 + "s", "it is 5001 characters long"),
+        ("9" * 30 + "w", "the duration is too large"),
+        ("9" * 60, "the duration is too large"),
+    ],
+)
+def test_every_bad_duration_is_an_invalid_request(text: str, expected: str) -> None:
+    with pytest.raises(InvalidRequestError, match=expected):
+        parse_duration_text(text, argument="step")
+
+
+@pytest.mark.parametrize("step", ["0.0001", "0.0009"])
+def test_step_below_one_millisecond_is_refused(step: str) -> None:
+    with pytest.raises(InvalidRequestError, match=rf"Invalid step '{step}': the step must be at least 1ms"):
+        resolve_step(step, timedelta(milliseconds=10), max_points=1000)
+
+
+def test_step_is_whole_milliseconds() -> None:
+    assert resolve_step("0.0015", timedelta(seconds=1), max_points=1000) == timedelta(milliseconds=2)
+    assert step_seconds(resolve_step("1ms", timedelta(seconds=1), max_points=1001)) == "0.001"

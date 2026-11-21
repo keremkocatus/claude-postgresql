@@ -116,7 +116,7 @@ def format_matrix(
     result: QueryResult, *, header: str, expected: int | None, same_day: bool, max_series: int, budget: int
 ) -> tuple[str, int]:
     """Text and number of series shown. *expected* is the number of steps in the range (None: raw samples)."""
-    total = len(result.series)
+    total = result.total
     if total == 0:
         no_data = "No series had data in this window: check metric and label names with prom_list_metrics."
         return f"{header}\n{no_data}", 0

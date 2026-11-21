@@ -19,6 +19,8 @@ from ratatoskr.backends.limits import clip_input
 DEFAULT_SPAN = timedelta(hours=1)
 TARGET_POINTS = 120
 TIME_FORMATS = "RFC3339 (2026-11-22T10:00:00Z), unix seconds (1732270000) or relative (now, now-15m)"
+MAX_INPUT_CHARS = 64  # longer than any valid time or duration (RFC3339 with nanoseconds and offset is 35)
+MIN_STEP = timedelta(milliseconds=1)  # the API takes steps in milliseconds
 
 _UNITS = {
     "ms": timedelta(milliseconds=1),
@@ -56,6 +58,7 @@ def utc_now() -> datetime:
 
 def parse_duration_text(text: str, *, argument: str) -> timedelta:
     """A positive duration: ``250ms``, ``30s``, ``1h30m``, ``2d``, ``1w`` or a plain number of seconds."""
+    _check_length(text, argument, "use a duration such as 30s, 5m, 1h30m or 2d")
     value = text.strip().lower()
     try:
         if _NUMBER_RE.fullmatch(value):
@@ -66,7 +69,7 @@ def parse_duration_text(text: str, *, argument: str) -> timedelta:
             raise InvalidRequestError(
                 f"Invalid {argument} '{clip_input(text)}': use a duration such as 30s, 5m, 1h30m or 2d."
             )
-    except OverflowError:
+    except (OverflowError, ValueError):
         raise InvalidRequestError(f"Invalid {argument} '{clip_input(text)}': the duration is too large.") from None
     if result <= timedelta(0):
         raise InvalidRequestError(f"Invalid {argument} '{clip_input(text)}': the duration must be greater than zero.")
@@ -75,6 +78,7 @@ def parse_duration_text(text: str, *, argument: str) -> timedelta:
 
 def parse_time(text: str, *, now: datetime, argument: str) -> datetime:
     """An absolute UTC time from RFC3339, unix seconds or ``now[+-]<duration>``."""
+    _check_length(text, argument, f"use {TIME_FORMATS}")
     value = text.strip()
     relative = _RELATIVE_RE.fullmatch("".join(value.split()).lower())
     if relative is not None:
@@ -97,7 +101,20 @@ def parse_time(text: str, *, now: datetime, argument: str) -> datetime:
         raise InvalidRequestError(
             f"Invalid {argument} '{clip_input(text)}': add a time zone, e.g. 2026-11-22T10:00:00Z or +02:00."
         )
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError:  # 0001-01-01T00:00:00+14:00 is before year 1 in UTC
+        raise InvalidRequestError(
+            f"Invalid {argument} '{clip_input(text)}': the time is out of range; use a time such as "
+            "2026-11-22T10:00:00Z."
+        ) from None
+
+
+def _check_length(text: str, argument: str, guidance: str) -> None:
+    if len(text) > MAX_INPUT_CHARS:
+        raise InvalidRequestError(
+            f"Invalid {argument} '{clip_input(text)}': it is {len(text)} characters long; {guidance}."
+        )
 
 
 def _from_unix(seconds: float, text: str, argument: str) -> datetime:
@@ -150,6 +167,12 @@ def resolve_step(step: str | None, span: timedelta, *, max_points: int) -> timed
     if step is None:
         return auto_step(span, target_points=min(TARGET_POINTS, max_points - 1))
     chosen = parse_duration_text(step, argument="step")
+    if chosen < MIN_STEP:
+        raise InvalidRequestError(
+            f"Invalid step '{clip_input(step)}': the step must be at least 1ms; use a step such as 15s or 1m, "
+            "or omit step."
+        )
+    chosen = MIN_STEP * round(chosen / MIN_STEP)  # what is sent: whole milliseconds
     points = point_count(span, chosen)
     if points > max_points:
         minimum = timedelta(seconds=max(1, math.ceil(span.total_seconds() / (max_points - 1))))
