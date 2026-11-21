@@ -343,3 +343,6 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   kontrol+kayıt); başarılı girişte `refund(reservation)`. `retry_after()`→verify→`hit()` sırası paralel isteklerle
   limiti aşar, kullanılmaz.
 - Q2 review: rate-limit oku-değiştir-yaz atomikliği süreç içi (RateLimiter kilidi); tek replika için yeterli.
+- Rate limiter API: `reserve(keys) -> Reservation(retry_after, granted)`, `refund(reservation)`, `retry_after`,
+  `hit`, `reset`. Login: reserve → engellendiyse 429 + `Retry-After: int(r.retry_after)+1` + `login_rate_limited`;
+  yanlış parola → kayıt kalır, `login_failed`, 401; doğru parola → `refund(r)`. Kayıt (DCR) `retry_after`+`hit`.
