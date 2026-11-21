@@ -1,294 +1,168 @@
-# Claude PostgreSQL MCP Server
+# Ratatoskr
 
-High-performance PostgreSQL connector for Claude via the **Model Context Protocol (MCP)**. Provides schema discovery, safe query execution, performance monitoring, and admin tools — all accessible as MCP tools from Claude Desktop or any MCP client.
+Ratatoskr is an MCP server that gives Claude (Claude Desktop, Claude Code) controlled access to **several
+PostgreSQL databases at once**, with per-group access levels and an audit trail. Prometheus and Loki backends are
+planned.
+
+> **Status: 1.0.0.dev0.** This release runs over **stdio** (local). The remote HTTP transport (claude.ai
+> connector, OAuth login with local users or OIDC such as Authentik, Docker image) is coming in the next release.
+> Coming from `claude-postgresql` 0.1? The `PG_MCP_*` environment variables are gone; everything lives in one
+> YAML file.
 
 ## Features
 
-- **18 MCP tools** — schema browsing, query execution, database info, admin & performance
-- **Connection pooling** — async `asyncpg` with configurable pool sizing
-- **Security** — read-only mode, dangerous operation blocking, query length limits, schema/table whitelists, OAuth login for remote deployments
-- **Query history** — optional persistence to a PostgreSQL table (configurable DB + table name)
-- **SSL/TLS** — optional client certificate authentication
-- **Structured logging** — JSON logs to stderr with query timing and row counts
+- Any number of named PostgreSQL connections (PostgreSQL 12 or newer) in one server; the tool set stays the same
+  (11 tools).
+- Access per group: `read` or `write`, capped by each connection's `mode`. Unknown and forbidden connections look
+  identical ("Connection 'x' not found.").
+- Read-only enforcement by PostgreSQL itself rather than by SQL pattern matching (see [Security model](#security-model)).
+- Every tool call is audited: one JSON log line with `event: audit` (SQL truncated to 4096 characters, plus its
+  SHA-256).
+- Responses are clamped (rows and bytes) with an explicit note on how to narrow the request.
 
----
+## Quick start (stdio)
 
-## Quick Start
-
-### 1. Install
-
-```bash
-# Using uv (recommended)
-uv pip install -e .
-
-# Or with pip
-pip install -e .
-```
-
-### 2. Configure
-
-Create a `.env` file (or set environment variables):
+Requires Python 3.12+.
 
 ```bash
-cp .env.example .env
-# Edit .env with your PostgreSQL connection string
+pip install -e .                      # or: uv pip install -e .
+cp config.example.yaml config.yaml    # edit connections and roles
+export APP_DB_DSN='postgresql://ratatoskr_read:password@localhost:5432/app'
+ratatoskr check-config --config config.yaml
 ```
 
-### 3. Run
+`check-config` validates the file and prints a summary without any secret (exit code 2 on a config error).
+Secrets are never written in the YAML file: use `${ENV_VAR}` or `${file:/run/secrets/name}`; an undefined
+variable is an error.
 
-```bash
-# Direct
-claude-postgresql
-
-# Or via Python
-python -m claude_postgresql.server
-```
-
-### 4. Add to Claude Desktop
-
-Edit your Claude Desktop config (`claude_desktop_config.json`):
+### Claude Desktop
 
 ```json
 {
   "mcpServers": {
-    "postgresql": {
-      "command": "claude-postgresql",
-      "env": {
-        "PG_MCP_DATABASE_URL": "postgresql://user:password@localhost:5432/mydb"
-      }
+    "ratatoskr": {
+      "command": "ratatoskr",
+      "args": ["serve", "--config", "/absolute/path/to/config.yaml"],
+      "env": { "APP_DB_DSN": "postgresql://ratatoskr_read:password@localhost:5432/app" }
     }
   }
 }
 ```
 
-Or if using `uv`:
+If `ratatoskr` is not on Claude Desktop's `PATH`, use the absolute path of the executable (for a virtualenv:
+`.venv/bin/ratatoskr`, on Windows `.venv\Scripts\ratatoskr.exe`).
 
-```json
-{
-  "mcpServers": {
-    "postgresql": {
-      "command": "uv",
-      "args": ["run", "claude-postgresql"],
-      "cwd": "/path/to/claude-postgresql",
-      "env": {
-        "PG_MCP_DATABASE_URL": "postgresql://user:password@localhost:5432/mydb"
-      }
-    }
-  }
-}
+### Claude Code
+
+```bash
+claude mcp add ratatoskr -e APP_DB_DSN='postgresql://ratatoskr_read:password@localhost:5432/app' \
+  -- ratatoskr serve --config /absolute/path/to/config.yaml
 ```
 
----
-
-## Remote Deployment (Railway + Claude.ai)
-
-Besides running locally over stdio (above), this server also runs as a remote HTTP service — deploy your own instance on Railway and connect to it from **claude.ai** as a custom connector (no local process, works from any device).
-
-### 1. Deploy to Railway
-
-1. Fork this repo.
-2. In Railway: **New Project → Deploy from GitHub repo** → select your fork. Railway builds it with the included [Dockerfile](Dockerfile), which already sets `PG_MCP_TRANSPORT=streamable-http`.
-3. Go to **Settings → Networking → Generate Domain** to get a public URL like `https://your-app.up.railway.app`.
-
-### 2. Set environment variables
-
-In Railway's **Variables** tab:
-
-| Variable | Value |
-|----------|-------|
-| `PG_MCP_DATABASE_URL` | Your PostgreSQL connection string |
-| `PG_MCP_ADMIN_PASSWORD` | A long random secret — generate with `python -c "import secrets; print(secrets.token_urlsafe(24))"` |
-| `PG_MCP_PUBLIC_URL` | The domain from step 1, e.g. `https://your-app.up.railway.app` |
-
-`PG_MCP_ADMIN_PASSWORD` and `PG_MCP_PUBLIC_URL` are **not optional** for a public deployment — see [Securing a remote deployment](#securing-a-remote-deployment) below for why. Save and let Railway redeploy.
-
-### 3. Connect from Claude
-
-In claude.ai: **Settings → Connectors → Add custom connector**.
-
-| Field | Value |
-|-------|-------|
-| Name | anything, e.g. `PostgreSQL` |
-| Remote MCP server URL | `https://your-app.up.railway.app/mcp` |
-| OAuth Client ID / Secret (Advanced settings) | leave blank |
-
-Click **Add**, then **Connect**. Claude registers itself automatically and opens a login page in your browser — enter `PG_MCP_ADMIN_PASSWORD` there. Once authorized, the connector is ready to use in any chat.
-
-The same URL also works from Claude Desktop or any other MCP client that supports remote/HTTP servers with OAuth.
-
----
+The config path can also come from `RATATOSKR_CONFIG` (default `/config/config.yaml`). Logs go to **stderr** as
+JSON with DSNs and passwords masked; stdout is the MCP stdio channel.
 
 ## Configuration
 
-All settings use the `PG_MCP_` prefix and can be set via environment variables or `.env` file.
+One YAML file; [`config.example.yaml`](config.example.yaml) is the annotated reference. Durations accept seconds or
+`30s`, `5m`, `1h`, `30d`.
 
-### Connection
+| Key | Default | Meaning |
+|---|---|---|
+| `server.transport` | `stdio` | Only `stdio` runs in this release. |
+| `server.stdio_role` | unset | Group you act as over stdio. Unset means you see no connection. |
+| `server.log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `roles.<group>` | `{}` | `{ <connection> or "*": read \| write }`. |
+| `connections.<name>.kind` | required | `postgres`. Names: `^[a-z0-9][a-z0-9_-]{0,62}$`. |
+| `connections.<name>.dsn` | required | `postgresql://user:password@host:port/db`, via `${VAR}` / `${file:...}`. |
+| `connections.<name>.mode` | `read` | `write` enables `pg_execute` and write-level `pg_explain(analyze=true)`. |
+| `connections.<name>.description` | `""` | Shown to Claude in `list_connections`. |
+| `connections.<name>.statement_timeout` | `30s` | Server-side timeout of every statement. |
+| `connections.<name>.pool` | `min_size: 1, max_size: 5, write_max_size: 2` | Read pool; the write pool opens lazily. |
+| `connections.<name>.allowed_schemas` | `[]` (all) | Filters the discovery tools only (see below). |
+| `connections.<name>.limits` | `max_rows: 500, max_response_bytes: 65536, max_query_length: 20000` | Response and input limits. |
+| `connections.<name>.tls` | unset | `mode` (`disable`, `require`, `verify-ca`, `verify-full` = default), `ca_file`, `cert_file` + `key_file`. Unset: the DSN's `sslmode`. |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_DATABASE_URL` | *(required)* | PostgreSQL connection DSN |
+TLS notes:
 
-### Pool
+- `tls.mode: require` encrypts without verifying and **ignores `ca_file`** (libpq would treat `require` plus a CA
+  file as `verify-ca`). Use `verify-ca` or `verify-full` to check the certificate.
+- Python 3.13+ enables `VERIFY_X509_STRICT` by default, which rejects internal CA certificates without a
+  `keyUsage` extension (libpq accepts them). Reissue the CA, or run on Python 3.12.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_POOL_MIN_SIZE` | `2` | Minimum pool connections |
-| `PG_MCP_POOL_MAX_SIZE` | `10` | Maximum pool connections |
-| `PG_MCP_COMMAND_TIMEOUT` | `30` | Command timeout (seconds) |
-| `PG_MCP_STATEMENT_TIMEOUT` | `30000` | PostgreSQL statement_timeout (ms) |
+## Tools
 
-### Safety & Limits
+| Tool | Access | What it does |
+|---|---|---|
+| `list_connections` | - | Connections you may use, their kind, description and your access level. Call it first. |
+| `connection_health` | read | Reachability, latency and server version of one or all of your connections. |
+| `pg_list_schemas` | read | Non-system schemas (filtered by `allowed_schemas`). |
+| `pg_list_tables` | read | Tables, views and partitions of a schema with estimated rows and size; `name_like` filter. |
+| `pg_describe_table` | read | Columns, constraints (PK/FK/unique/check), incoming FKs and indexes in one call. |
+| `pg_query` | read | One read-only statement; rows as a Markdown table. |
+| `pg_execute` | write | One or more statements in a single atomic transaction. |
+| `pg_explain` | read / write | Plan; `analyze=true` runs the statement in a transaction that is rolled back. |
+| `pg_activity` | read | Active sessions and waiting locks. |
+| `pg_table_stats` | read | Size, scans, live/dead tuples, vacuum and analyze times. |
+| `pg_server_info` | read | Version, current database and size, uptime, database list. |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_READ_ONLY` | `false` | Block all write operations |
-| `PG_MCP_MAX_RESULT_ROWS` | `500` | Maximum rows returned per query |
-| `PG_MCP_MAX_QUERY_LENGTH` | `10000` | Maximum allowed query length |
+## Security model
 
-### Whitelists
+Effective access is `min(max(grants of your groups), connection.mode)`; no grant means no access. Over stdio you
+act as a member of `server.stdio_role`.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_ALLOWED_SCHEMAS` | `[]` (all) | Schema whitelist (JSON array). Empty = all allowed |
-| `PG_MCP_ALLOWED_TABLES` | `[]` (all) | Table whitelist in `schema.table` format (JSON array). Empty = all allowed |
+Read access is enforced in layers:
 
-**Examples:**
+1. Read-pool sessions start with `default_transaction_read_only=on` and `statement_timeout` as startup parameters.
+2. User SQL is sent only through the extended protocol (prepared statements), which accepts a single statement,
+   so `COMMIT; DELETE ...` cannot escape the transaction.
+3. Every read runs inside `BEGIN READ ONLY` and is always rolled back.
+4. When a connection goes back to the pool, the session is reset: role and session authorization, SQL prepared
+   statements, temporary tables and sequence state, plus `RESET ALL`.
+5. Catalog (discovery) queries pin `search_path` to `pg_catalog`, so user objects cannot shadow catalog functions.
 
-```bash
-# Only allow public and analytics schemas
-PG_MCP_ALLOWED_SCHEMAS='["public", "analytics"]'
+Write connections: `pg_execute` runs all statements in one transaction and rejects `COPY` and transaction
+control (`BEGIN`, `COMMIT`, `SAVEPOINT`, ...); a few dangerous operations (`pg_read_file`, `COPY ... PROGRAM`,
+`ALTER SYSTEM`, ...) are refused early, but that list is a convenience, not a guarantee. Write-level
+`pg_explain(analyze=true)` is rolled back, but **non-transactional effects persist**: sequence increments
+(`nextval`) and anything done through another connection.
 
-# Only allow specific tables
-PG_MCP_ALLOWED_TABLES='["public.users", "public.orders", "analytics.events"]'
+**The database role in each DSN is the real boundary.** The layers above do not stop extensions that open their
+own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges the role already has.
+
+- Give every connection a dedicated role with only the grants it needs. Never use a superuser or the table owner.
+- Do not grant `dblink`, `postgres_fdw` or membership in `pg_read_server_files`, `pg_write_server_files` or
+  `pg_execute_server_program`.
+- Use a **separate role for write connections**. If a read connection and a write connection share one database
+  user, a read-only caller can still end the write sessions with `pg_terminate_backend`.
+- `allowed_schemas` filters the discovery tools only; it does not restrict SQL sent to `pg_query`. Use `GRANT`s.
+- Error messages never contain the DSN, host or password.
+
+A minimal read role:
+
+```sql
+CREATE ROLE ratatoskr_read LOGIN PASSWORD 'change-me'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT CONNECT ON DATABASE app TO ratatoskr_read;
+GRANT USAGE ON SCHEMA public TO ratatoskr_read;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ratatoskr_read;
+-- tables created later by app_owner:
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TABLES TO ratatoskr_read;
+-- optional, lets pg_activity show other users' queries:
+GRANT pg_read_all_stats TO ratatoskr_read;
 ```
-
-### Query History
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_QUERY_HISTORY_TABLE` | `None` | Table name for history (e.g. `public.mcp_query_history`). Set to enable. |
-| `PG_MCP_QUERY_HISTORY_DB` | `None` | Separate DSN for history storage. Falls back to main `DATABASE_URL`. |
-
-When `QUERY_HISTORY_TABLE` is set, the server auto-creates the table on startup and logs every tool invocation with query text, parameters, timing, and success/failure status.
-
-### SSL/TLS
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_SSL_ENABLED` | `false` | Enable SSL/TLS |
-| `PG_MCP_SSL_CA_FILE` | `None` | CA certificate path |
-| `PG_MCP_SSL_CERT_FILE` | `None` | Client certificate path |
-| `PG_MCP_SSL_KEY_FILE` | `None` | Client private key path |
-| `PG_MCP_SSL_REQUIRE` | `true` | Require SSL (vs. prefer) |
-
-### Logging
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_LOG_QUERIES` | `true` | Log every executed query |
-| `PG_MCP_LOG_LEVEL` | `INFO` | Logging level |
-
-### Authentication (remote deployments)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PG_MCP_ADMIN_PASSWORD` | `None` | Shared secret gating access. **Required for any `sse`/`streamable-http` deployment** — see below. |
-| `PG_MCP_PUBLIC_URL` | `None` | Public HTTPS URL of the deployment (e.g. `https://your-app.up.railway.app`). Required alongside `PG_MCP_ADMIN_PASSWORD`. |
-
----
-
-## Securing a remote deployment
-
-When `PG_MCP_TRANSPORT` is `sse` or `streamable-http` (i.e. you're running this on Railway or anywhere else reachable over HTTP), **the URL alone is not a secret**. Anyone who obtains it can call every tool — including `execute_dml` — against your database. Setting `PG_MCP_ADMIN_PASSWORD` (see [Remote Deployment](#remote-deployment-railway--claudeai) above) closes that gap: the server becomes a minimal single-user OAuth 2.1 provider, and MCP clients must complete a browser login gated by that password before any tool call is accepted. There is no need to fill in the "OAuth Client ID/Secret" fields in Claude's connector dialog — dynamic client registration handles that automatically.
-
-Notes:
-- This protects **one deployment for one operator** — every login shares a single identity. It is not meant for multiple distinct users on the same deployment.
-- Login attempts are not rate-limited, so use a long random value for `PG_MCP_ADMIN_PASSWORD`, not a memorable password.
-- Tokens are kept in memory and are lost on restart/redeploy (clients will silently re-authenticate).
-- If `PG_MCP_ADMIN_PASSWORD` is left unset on a remote transport, the server logs a startup warning and runs with no authentication at all.
-
----
-
-## Available Tools
-
-### Schema Discovery
-
-| Tool | Description |
-|------|-------------|
-| `list_schemas` | List all non-system schemas |
-| `list_tables` | List tables/views with row estimates |
-| `describe_table` | Full table structure (columns, PK, FK, indexes) |
-| `get_table_columns` | Lightweight column listing |
-| `get_indexes` | Index details |
-| `get_foreign_keys` | Foreign key relationships |
-| `get_constraints` | All constraints (PK, FK, UNIQUE, CHECK) |
-
-### Query Execution
-
-| Tool | Description |
-|------|-------------|
-| `execute_select` | Run SELECT queries (auto-limited, timed) |
-| `execute_dml` | Run INSERT/UPDATE/DELETE (blocked in read-only) |
-| `execute_transaction` | Atomic multi-statement transaction |
-
-### Database Information
-
-| Tool | Description |
-|------|-------------|
-| `connection_status` | Pool stats + server version + health check |
-| `list_databases` | All databases with owner/size |
-| `get_database_size` | Current database size |
-| `get_table_sizes` | Table sizes (data + index) |
-
-### Admin & Performance
-
-| Tool | Description |
-|------|-------------|
-| `explain_query` | EXPLAIN ANALYZE execution plan |
-| `get_running_queries` | Active queries from pg_stat_activity |
-| `get_locks` | Current locks from pg_locks |
-| `get_table_stats` | Table statistics (scans, tuples, vacuum) |
-
----
-
-## Security Model
-
-1. **Parameterized queries** — asyncpg uses native PostgreSQL protocol-level parameterization (not string interpolation)
-2. **Dangerous operation blocking** — `DROP DATABASE`, `ALTER SYSTEM`, `COPY TO PROGRAM`, `pg_read_file`, `lo_import/export`, `CREATE EXTENSION` are always blocked
-3. **Read-only mode** — when enabled, all DML/DDL statements are rejected
-4. **Statement timeout** — prevents runaway queries (default: 30s)
-5. **Row limiting** — results capped at configurable maximum (default: 500 rows)
-6. **Schema/table whitelists** — restrict which schemas and tables are visible/accessible
-7. **Identifier sanitization** — dynamic SQL identifiers are validated against strict patterns
-8. **Query logging** — full audit trail of all executed queries with timing
-9. **Transport authentication** — remote deployments (`sse`/`streamable-http`) require an OAuth login gated by `PG_MCP_ADMIN_PASSWORD` (see [Securing a remote deployment](#securing-a-remote-deployment)); without it, the URL itself is the only thing standing between anyone and the database
-
----
 
 ## Development
 
 ```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Lint
-ruff check src/ tests/
-
-# Type check
-mypy src/
+pip install --index-url https://pypi.org/simple -e ".[dev]"
+python -m pytest -q                     # unit tests, no network
+python -m pytest -m integration -q      # needs Docker: starts PostgreSQL with testcontainers
+python -m ruff check src tests
+python -m mypy src
 ```
 
-### Local PostgreSQL for testing
-
-```bash
-docker compose up -d    # Start PostgreSQL on port 5432
-docker compose down     # Stop
-```
-
----
+See [`CLAUDE.md`](CLAUDE.md) for project conventions.
 
 ## License
 

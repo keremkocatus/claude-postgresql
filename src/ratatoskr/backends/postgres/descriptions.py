@@ -54,8 +54,8 @@ PG_EXECUTE_STATEMENTS = (
 PG_EXPLAIN = (
     "Show the PostgreSQL execution plan of one statement. analyze=false (default) only plans it and never runs "
     "it. analyze=true runs it to get real timings: with read access inside a READ ONLY transaction (so only "
-    "read statements work), with write access inside a transaction that is always rolled back, so no data "
-    "changes either way. Pass the statement without the EXPLAIN keyword."
+    "read statements work), with write access inside a transaction that is always rolled back (sequence "
+    "increments and other non-transactional effects still persist). Pass the statement without the EXPLAIN keyword."
 )
 PG_EXPLAIN_ANALYZE = "Run the statement to measure real row counts and timings (always rolled back)."
 PG_EXPLAIN_BUFFERS = "Include buffer usage (only with analyze=true)."

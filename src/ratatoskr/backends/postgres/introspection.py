@@ -29,6 +29,7 @@ def _heading(header: str) -> str:
     """End a table heading with a colon unless it already ends a sentence."""
     return header if header.endswith(".") else f"{header}:"
 
+
 # $1: allowed_schemas (empty array = no restriction), applied in SQL so a restricted connection only counts the
 # relations of its own schemas.
 LIST_SCHEMAS_SQL = """
