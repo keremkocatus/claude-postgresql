@@ -285,3 +285,14 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   başlatmalı (ya da bu handler'ları temizlemeli) ve bunu bir testle doğrulamalı.
 - `setup_logging` kök handler'ları değiştirir; `tests/unit/conftest.py` her testten sonra geri yükler. HTTP testleri
   de bu fixture'a güvenir.
+
+## P3 güvenlik review'undan dokümantasyona (Task 22 / aşama 4) taşınanlar
+
+- Write seviyesindeki `EXPLAIN ANALYZE` ROLLBACK edilir, ama `nextval` ve `dblink` ile yapılan yazmalar geri alınmaz;
+  "veri hiç değişmez" denmemeli.
+- Read ve write pool aynı DB kullanıcısını paylaşırsa read principal `pg_terminate_backend` ile write bağlantısını
+  öldürebilir. `docs/postgres-roles.md` write için ayrı rol önermeli. (Kullanıcıya sorulacak: config'e opsiyonel
+  `write_dsn` eklensin mi?)
+- Python 3.13 `ssl.create_default_context` `VERIFY_X509_STRICT` açar; `keyUsage` içermeyen iç CA'lar reddedilir
+  (libpq kabul eder). Docker imajı 3.12. Dokümante edilecek.
+- `tls.mode: require` + `ca_file` CA'yı yok sayar (libpq bunu verify-ca sayar). Dokümante edilecek.
