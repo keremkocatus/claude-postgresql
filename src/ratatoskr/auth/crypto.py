@@ -146,3 +146,4 @@ class Keyring:
         self.client_secrets = Sealer(derive_key(secret_key, "client-secret"))
         self.csrf = Signer(derive_key(secret_key, "csrf"))
         self.oidc_flow = Signer(derive_key(secret_key, "oidc-flow"))
+        self.password_fingerprint = Signer(derive_key(secret_key, "password-fingerprint"))

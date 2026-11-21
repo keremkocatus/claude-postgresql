@@ -17,6 +17,7 @@ from ratatoskr.state.records import (
     RateLimitState,
     RotateOutcome,
     StoredClient,
+    TokenFamily,
     TokenRecord,
 )
 
@@ -47,7 +48,17 @@ class Store(Protocol):
     async def take_code(self, code_hash: str, now: float) -> AuthCodeRecord | None:
         """Atomically delete and return the code (single use); ``None`` if missing or expired."""
 
-    async def create_family(self, access: TokenRecord, refresh: TokenRecord, upstream_blob: bytes | None) -> None: ...
+    async def create_family(
+        self,
+        access: TokenRecord,
+        refresh: TokenRecord,
+        upstream_blob: bytes | None,
+        *,
+        password_fingerprint: str | None = None,
+    ) -> None:
+        """Insert the first token pair and the family row (``created_at`` = the refresh token's)."""
+
+    async def get_family(self, family_id: str) -> TokenFamily | None: ...
 
     async def get_token(self, token_hash: str) -> TokenRecord | None: ...
 
@@ -58,11 +69,17 @@ class Store(Protocol):
         refresh: TokenRecord,
         upstream_blob: bytes | None,
         now: float,
+        *,
+        max_age: float | None = None,
+        grace: float = 0.0,
     ) -> RotateOutcome:
         """Mark ``old_hash`` used and insert the new pair in one transaction.
 
-        ``reused`` means the old refresh token had already been used: the whole family is revoked.
-        ``invalid`` means it is missing, revoked, expired or not a refresh token: nothing changes.
+        ``retry`` means the old refresh token was used less than ``grace`` seconds ago: nothing changes.
+        ``reused`` means it had been used before that: the whole family is revoked.
+        ``invalid`` means it is missing, revoked, expired, not a refresh token, owned by another client than
+        ``refresh.client_id``, or (with ``max_age``) its family is unknown or ``now >= created_at + max_age``:
+        nothing changes.
         """
 
     async def revoke_family(self, family_id: str, now: float) -> int: ...
@@ -77,4 +94,6 @@ class Store(Protocol):
 
     async def insert_audit_events(self, events: Sequence[AuditEvent]) -> None: ...
 
-    async def cleanup(self, now: float, audit_cutoff: float) -> CleanupStats: ...
+    async def cleanup(self, now: float, audit_cutoff: float) -> CleanupStats:
+        """Purge expired rows, families without tokens, idle rate limits, old audit events and clients registered
+        more than 30 days ago that have no live pending authorization, code or token."""

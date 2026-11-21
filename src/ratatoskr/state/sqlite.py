@@ -32,12 +32,14 @@ from ratatoskr.state.records import (
     RateLimitState,
     RotateOutcome,
     StoredClient,
+    TokenFamily,
     TokenRecord,
 )
 
 logger = logging.getLogger("ratatoskr.state.sqlite")
 
 _RATE_LIMIT_IDLE_SECONDS = 86400.0
+_CLIENT_MIN_AGE_SECONDS = 30 * 86400.0
 _AUDIT_DELETE_CHUNK = 5000
 _BUSY_TIMEOUT_SECONDS = 5.0
 _SOURCES: dict[str, Literal["stdio", "local", "oidc"]] = {"stdio": "stdio", "local": "local", "oidc": "oidc"}
@@ -172,6 +174,10 @@ _INSERT_TOKEN = (
     "INSERT INTO tokens (token_hash, kind, family_id, client_id, scopes_json, resource, subject, display_name,"
     " groups_json, auth_source, created_at, expires_at, used_at, revoked_at)"
     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_INSERT_FAMILY = (
+    "INSERT INTO token_families (family_id, client_id, subject, auth_source, created_at, password_fingerprint)"
+    " VALUES (?, ?, ?, ?, ?, ?)"
 )
 _UPSERT_UPSTREAM = (
     "INSERT INTO upstream_sessions (family_id, refresh_blob, updated_at) VALUES (?, ?, ?)"
@@ -390,12 +396,44 @@ class SqliteStore:
 
     # ── tokens ───────────────────────────────────────────────────────────
 
-    async def create_family(self, access: TokenRecord, refresh: TokenRecord, upstream_blob: bytes | None) -> None:
+    async def create_family(
+        self,
+        access: TokenRecord,
+        refresh: TokenRecord,
+        upstream_blob: bytes | None,
+        *,
+        password_fingerprint: str | None = None,
+    ) -> None:
+        p = refresh.principal
         async with self._tx() as db:
+            await db.execute(
+                _INSERT_FAMILY,
+                (
+                    refresh.family_id,
+                    refresh.client_id,
+                    p.subject,
+                    p.auth_source,
+                    refresh.created_at,
+                    password_fingerprint,
+                ),
+            )
             await db.execute(_INSERT_TOKEN, _token_params(access))
             await db.execute(_INSERT_TOKEN, _token_params(refresh))
             if upstream_blob is not None:
                 await db.execute(_UPSERT_UPSTREAM, (refresh.family_id, upstream_blob, refresh.created_at))
+
+    async def get_family(self, family_id: str) -> TokenFamily | None:
+        row = await self._fetchone("SELECT * FROM token_families WHERE family_id = ?", (family_id,))
+        if row is None:
+            return None
+        return TokenFamily(
+            family_id=str(row["family_id"]),
+            client_id=str(row["client_id"]),
+            subject=str(row["subject"]),
+            auth_source=str(row["auth_source"]),
+            created_at=float(row["created_at"]),
+            password_fingerprint=row["password_fingerprint"],
+        )
 
     async def get_token(self, token_hash: str) -> TokenRecord | None:
         row = await self._fetchone("SELECT * FROM tokens WHERE token_hash = ?", (token_hash,))
@@ -408,6 +446,9 @@ class SqliteStore:
         refresh: TokenRecord,
         upstream_blob: bytes | None,
         now: float,
+        *,
+        max_age: float | None = None,
+        grace: float = 0.0,
     ) -> RotateOutcome:
         async with self._tx() as db:
             rows = list(await db.execute_fetchall("SELECT * FROM tokens WHERE token_hash = ?", (old_hash,)))
@@ -416,6 +457,18 @@ class SqliteStore:
             old = _token(rows[0])
             if old.kind != "refresh" or old.revoked_at is not None or old.expires_at <= now:
                 return "invalid"
+            if old.client_id != refresh.client_id:
+                return "invalid"
+            if max_age is not None:
+                family = list(
+                    await db.execute_fetchall(
+                        "SELECT created_at FROM token_families WHERE family_id = ?", (old.family_id,)
+                    )
+                )
+                if not family or now >= float(family[0]["created_at"]) + max_age:
+                    return "invalid"
+            if old.used_at is not None and now - old.used_at < grace:
+                return "retry"
             if old.used_at is not None:
                 await db.execute(
                     "UPDATE tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL", (now, old.family_id)
@@ -509,6 +562,17 @@ class SqliteStore:
             pending = await db.execute("DELETE FROM pending_authorizations WHERE expires_at <= ?", (now,))
             codes = await db.execute("DELETE FROM auth_codes WHERE expires_at <= ?", (now,))
             tokens = await db.execute("DELETE FROM tokens WHERE expires_at <= ?", (now,))
+            families = await db.execute(
+                "DELETE FROM token_families WHERE family_id NOT IN (SELECT family_id FROM tokens)"
+            )
+            clients = await db.execute(
+                "DELETE FROM clients WHERE created_at <= ?"
+                " AND client_id NOT IN (SELECT client_id FROM pending_authorizations WHERE expires_at > ?)"
+                " AND client_id NOT IN (SELECT client_id FROM auth_codes WHERE expires_at > ?)"
+                " AND client_id NOT IN"
+                " (SELECT client_id FROM tokens WHERE revoked_at IS NULL AND expires_at > ?)",
+                (now - _CLIENT_MIN_AGE_SECONDS, now, now, now),
+            )
             upstream = await db.execute(
                 "DELETE FROM upstream_sessions WHERE family_id NOT IN"
                 " (SELECT family_id FROM tokens WHERE revoked_at IS NULL)"
@@ -524,6 +588,8 @@ class SqliteStore:
             upstream_sessions=upstream.rowcount,
             rate_limits=limits.rowcount,
             audit_events=await self._delete_old_audit_events(audit_cutoff),
+            clients=clients.rowcount,
+            families=families.rowcount,
         )
 
     async def _delete_old_audit_events(self, cutoff: float) -> int:

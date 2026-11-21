@@ -12,6 +12,7 @@ AuthEventName = Literal[
     "login_rate_limited",
     "token_reuse_detected",
     "token_revoked",
+    "refresh_retry_within_grace",
     "upstream_refresh_failed",
 ]
 

@@ -19,6 +19,7 @@ from ratatoskr.state.records import (
     PendingAuthorization,
     RateLimitState,
     StoredClient,
+    TokenFamily,
     TokenRecord,
 )
 from ratatoskr.state.sqlite import SqliteStore, StateStoreError
@@ -508,3 +509,120 @@ async def test_loose_file_owned_by_someone_else_is_only_warned_about(
 def test_audit_delete_chunk_must_be_positive(tmp_path: Path, chunk: int) -> None:
     with pytest.raises(ValueError, match="at least 1"):
         SqliteStore(tmp_path / "state.db", audit_delete_chunk=chunk)
+
+
+# ── token families: absolute session lifetime, refresh grace, client cleanup (Q5 review) ──
+
+
+async def test_create_family_records_the_family(store: SqliteStore) -> None:
+    await store.create_family(token("a1", "access"), token("r1"), None, password_fingerprint="fp")
+    family = await store.get_family("fam")
+    assert family == TokenFamily("fam", "client-1", "alice", "oidc", 1000.0, "fp")
+    assert await store.get_family("missing") is None
+
+
+async def test_rotate_refuses_once_the_session_max_age_is_reached(store: SqliteStore) -> None:
+    await store.create_family(token("a1", "access"), token("r1", expires_at=9000.0), None)
+    late = await store.rotate_refresh("r1", token("a2", "access"), token("r2"), None, now=1500.0, max_age=500.0)
+    assert late == "invalid"
+    old = await store.get_token("r1")
+    assert old is not None and old.used_at is None
+    ok = await store.rotate_refresh("r1", token("a2", "access"), token("r2"), None, now=1499.0, max_age=500.0)
+    assert ok == "rotated"
+
+
+async def test_rotate_without_family_row_is_invalid_when_max_age_is_enforced(store: SqliteStore) -> None:
+    await store.create_family(token("a1", "access"), token("r1"), None)
+    with sqlite3.connect(store._path) as raw:
+        raw.execute("DELETE FROM token_families")
+    outcome = await store.rotate_refresh("r1", token("a2", "access"), token("r2"), None, now=1100.0, max_age=500.0)
+    assert outcome == "invalid"
+
+
+async def test_rotate_within_grace_is_a_retry_and_keeps_the_family(store: SqliteStore) -> None:
+    await store.create_family(token("a1", "access"), token("r1"), b"up")
+    assert await store.rotate_refresh("r1", token("a2", "access"), token("r2"), None, now=1500.0, grace=10.0) == (
+        "rotated"
+    )
+    retry = await store.rotate_refresh("r1", token("a3", "access"), token("r3"), None, now=1509.0, grace=10.0)
+    assert retry == "retry"
+    current = await store.get_token("r2")
+    assert current is not None and current.revoked_at is None
+    assert await store.get_token("r3") is None
+    assert await store.get_upstream("fam") == b"up"
+    late = await store.rotate_refresh("r1", token("a4", "access"), token("r4"), None, now=1510.0, grace=10.0)
+    assert late == "reused"
+
+
+async def test_rotate_by_another_client_is_invalid(store: SqliteStore) -> None:
+    await store.create_family(token("a1", "access"), token("r1"), None)
+    other = TokenRecord(**{**token("r2").__dict__, "client_id": "client-2"})
+    assert await store.rotate_refresh("r1", token("a2", "access"), other, None, now=1500.0) == "invalid"
+
+
+async def test_cleanup_drops_stale_unused_clients_and_empty_families(store: SqliteStore) -> None:
+    day = 86400.0
+    now = 40 * day
+    await store.save_client(StoredClient("stale", "{}", None, 1.0))
+    await store.save_client(StoredClient("young", "{}", None, now - day))
+    await store.save_client(StoredClient("pending", "{}", None, 1.0))
+    await store.save_client(StoredClient("coded", "{}", None, 1.0))
+    await store.save_client(StoredClient("tokened", "{}", None, 1.0))
+    await store.save_client(StoredClient("revoked", "{}", None, 1.0))
+    await store.save_pending(PendingAuthorization("p", "pending", "{}", expires_at=now + 60))
+    await store.save_code(AuthCodeRecord("c", "coded", "{}", ALICE, None, expires_at=now + 60))
+
+    def owned(h: str, client: str, family: str, kind: str = "refresh") -> TokenRecord:
+        return TokenRecord(**{**token(h, kind, family, expires_at=now + day).__dict__, "client_id": client})
+
+    await store.create_family(owned("a1", "tokened", "f1", "access"), owned("r1", "tokened", "f1"), None)
+    await store.create_family(owned("a2", "revoked", "f2", "access"), owned("r2", "revoked", "f2"), None)
+    await store.revoke_family("f2", now=now - 1)
+    await store.create_family(
+        token("a9", "access", "gone", expires_at=10.0), token("r9", "refresh", "gone", 10.0), None
+    )
+
+    stats = await store.cleanup(now=now, audit_cutoff=0.0)
+
+    remaining = {c for c in ("stale", "young", "pending", "coded", "tokened", "revoked") if await store.get_client(c)}
+    assert remaining == {"young", "pending", "coded", "tokened"}
+    assert stats.clients == 2
+    assert stats.families == 1
+    assert await store.get_family("gone") is None
+    assert await store.get_family("f1") is not None
+
+
+async def test_migration_two_backfills_families_from_existing_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.db"
+    monkeypatch.setattr("ratatoskr.state.sqlite.MIGRATIONS", MIGRATIONS[:1])
+    store = SqliteStore(path)
+    await store.open()
+    rows = [
+        ("a1", "access", "fam", 1000.0),
+        ("r1", "refresh", "fam", 1000.0),
+        ("a2", "access", "fam", 1500.0),
+        ("r2", "refresh", "fam", 1500.0),
+        ("a3", "access", "other", 700.0),
+    ]
+    with sqlite3.connect(path) as raw:
+        for h, kind, family, created in rows:
+            raw.execute(
+                "INSERT INTO tokens (token_hash, kind, family_id, client_id, scopes_json, resource, subject,"
+                " display_name, groups_json, auth_source, created_at, expires_at)"
+                " VALUES (?, ?, ?, 'client-1', '[\"mcp\"]', NULL, 'alice', 'Alice', '[]', 'oidc', ?, 9999.0)",
+                (h, kind, family, created),
+            )
+    await store.close()
+
+    monkeypatch.setattr("ratatoskr.state.sqlite.MIGRATIONS", MIGRATIONS)
+    store = SqliteStore(path)
+    await store.open()
+    try:
+        assert await store.schema_version() == len(MIGRATIONS)
+        assert await store.get_family("fam") == TokenFamily("fam", "client-1", "alice", "oidc", 1000.0, None)
+        other = await store.get_family("other")
+        assert other is not None and other.created_at == 700.0
+    finally:
+        await store.close()

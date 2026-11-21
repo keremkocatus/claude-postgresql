@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from ratatoskr.config.loader import ConfigError, load_config
-from ratatoskr.config.models import ServerSettings
+from ratatoskr.config.models import AuthSettings, ServerSettings
 
 _BASE = """
 server:
@@ -115,3 +115,51 @@ def test_invalid_allowed_redirect_host_value_is_never_echoed(tmp_path: Path) -> 
     assert "s3cr3t" not in str(info.value)
     assert info.value.__cause__ is None
     assert info.value.__context__ is None
+
+
+# ── auth.session_max_age ────────────────────────────────────────────────────
+
+_AUTH_BASE = """
+auth:
+  mode: oidc
+  oidc:
+    issuer: https://idp.example.com/
+    client_id: ratatoskr
+    client_secret: upstream-secret
+{auth}
+connections:
+  main:
+    kind: postgres
+    dsn: postgresql://u:p@127.0.0.1:1/db
+"""
+
+
+def _load_auth(tmp_path: Path, auth_yaml: str) -> AuthSettings:
+    path = tmp_path / "config.yaml"
+    path.write_text(_AUTH_BASE.format(auth=auth_yaml), encoding="utf-8")
+    config = load_config(path, env={})
+    assert config.auth is not None
+    return config.auth
+
+
+def test_session_max_age_defaults_to_thirty_days(tmp_path: Path) -> None:
+    assert _load_auth(tmp_path, "").session_max_age == timedelta(days=30)
+
+
+def test_session_max_age_accepts_durations(tmp_path: Path) -> None:
+    auth = _load_auth(tmp_path, "  session_max_age: 90d\n  refresh_token_ttl: 7d")
+    assert auth.session_max_age == timedelta(days=90)
+
+
+@pytest.mark.parametrize("value", ["23h", 3600, "0s"])
+def test_session_max_age_below_one_day_is_a_config_error(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ConfigError, match=r"session_max_age.*at least 1 day") as info:
+        _load_auth(tmp_path, f"  session_max_age: {value}\n  refresh_token_ttl: 1h")
+    assert str(value) not in str(info.value)
+
+
+def test_refresh_ttl_longer_than_session_max_age_is_a_config_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"refresh_token_ttl must not be longer than auth\.session_max_age") as info:
+        _load_auth(tmp_path, "  session_max_age: 2d\n  refresh_token_ttl: 3d")
+    assert "2d" not in str(info.value) and "3d" not in str(info.value)
+    assert "172800" not in str(info.value) and "259200" not in str(info.value)

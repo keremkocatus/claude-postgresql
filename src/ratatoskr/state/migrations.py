@@ -84,4 +84,19 @@ MIGRATIONS: tuple[str, ...] = (
         value TEXT NOT NULL
     );
     """,
+    # 2 — token families: absolute session lifetime and local password fingerprints (Q5 review). Existing families
+    # are backfilled from their tokens; their sign-in time is the oldest token's creation time.
+    """
+    CREATE TABLE token_families (
+        family_id            TEXT PRIMARY KEY,
+        client_id            TEXT NOT NULL,
+        subject              TEXT NOT NULL,
+        auth_source          TEXT NOT NULL,
+        created_at           REAL NOT NULL,
+        password_fingerprint TEXT
+    );
+    INSERT INTO token_families (family_id, client_id, subject, auth_source, created_at)
+    SELECT family_id, MIN(client_id), MIN(subject), MIN(auth_source), MIN(created_at) FROM tokens GROUP BY family_id;
+    CREATE INDEX tokens_client ON tokens (client_id);
+    """,
 )

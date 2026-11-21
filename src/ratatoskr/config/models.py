@@ -160,13 +160,28 @@ class AuthSettings(BaseModel):
     mode: Literal["local", "oidc"]
     access_token_ttl: timedelta = timedelta(hours=1)
     refresh_token_ttl: timedelta = timedelta(days=30)
+    # Absolute lifetime of a sign-in: refreshing never extends a token family beyond it.
+    session_max_age: timedelta = timedelta(days=30)
     local: LocalAuthSettings | None = None
     oidc: OidcSettings | None = None
 
-    @field_validator("access_token_ttl", "refresh_token_ttl", mode="before")
+    @field_validator("access_token_ttl", "refresh_token_ttl", "session_max_age", mode="before")
     @classmethod
     def _parse_ttl(cls, value: Any) -> timedelta:
         return _duration(value)
+
+    @field_validator("session_max_age")
+    @classmethod
+    def _check_session_max_age(cls, value: timedelta) -> timedelta:
+        if value < timedelta(days=1):
+            raise ValueError("session_max_age must be at least 1 day")
+        return value
+
+    @model_validator(mode="after")
+    def _check_refresh_within_session(self) -> Self:
+        if self.refresh_token_ttl > self.session_max_age:
+            raise ValueError("auth.refresh_token_ttl must not be longer than auth.session_max_age")
+        return self
 
     @model_validator(mode="after")
     def _check_mode(self) -> Self:

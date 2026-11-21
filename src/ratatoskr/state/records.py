@@ -12,7 +12,7 @@ Clock = Callable[[], float]
 """Returns the current time as epoch seconds (``time.time``); injectable for tests."""
 
 TokenKind = Literal["access", "refresh"]
-RotateOutcome = Literal["rotated", "reused", "invalid"]
+RotateOutcome = Literal["rotated", "reused", "retry", "invalid"]
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,22 @@ class TokenRecord:
 
 
 @dataclass(frozen=True)
+class TokenFamily:
+    """One sign-in: every access/refresh token minted from one authorization code shares it.
+
+    ``created_at`` anchors the absolute session lifetime (``auth.session_max_age``). ``password_fingerprint`` is a
+    keyed fingerprint of a local user's password hash at sign-in (``None`` for OIDC families).
+    """
+
+    family_id: str
+    client_id: str
+    subject: str
+    auth_source: str
+    created_at: float
+    password_fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
 class RateLimitState:
     hits: tuple[float, ...]
     strikes: int
@@ -73,3 +89,5 @@ class CleanupStats:
     upstream_sessions: int
     rate_limits: int
     audit_events: int
+    clients: int = 0
+    families: int = 0
