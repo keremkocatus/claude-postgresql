@@ -331,3 +331,11 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   stderr'de bırakabilir; Docker ikisini de toplar. Bunu "düzeltip" stdio'yu bozmamak için stdout'a geçirme.
 - Desteklenen en düşük PostgreSQL sürümü 12 (`attgenerated` PG 12+, `conparentid` PG 11+). README ve config
   referansında yazılacak.
+
+## 1b review notları (ilgili görevlere taşınacak)
+
+- Task 11 (CSRF): imzalanan girdi `f"{request_id}:{cookie}"` belirsiz kodlama; alanları uzunluk önekiyle ya da
+  `json.dumps([...])` ile imzala veya `request_id` içinde `:` reddet.
+- Task 12 (client_ip / preconditions): `0.0.0.0/0` / `::/0` trusted_proxies için uyarı ver; `::ffff:10.0.0.1`
+  gibi IPv4-mapped peer adreslerini `ipv4_mapped` ile aç; `secret_key_problem()` (crypto) preconditions'ta çağrılsın.
+- Sealed blob'lar sürüm baytı taşır (`\x01`); store bunları opak bytes olarak saklar.
