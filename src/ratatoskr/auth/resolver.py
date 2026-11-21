@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import Protocol
 
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
+from mcp.server.lowlevel.server import request_ctx
+from starlette.requests import HTTPConnection
+
 from ratatoskr.auth.principal import Principal
+from ratatoskr.auth.tokens import RatatoskrAccessToken
 
 
 class PrincipalResolver(Protocol):
@@ -26,3 +35,43 @@ class StdioPrincipalResolver:
 
     def resolve(self) -> Principal:
         return self._principal
+
+
+def _current_access_token() -> AccessToken | None:
+    """Token of the HTTP request that carried this JSON-RPC message.
+
+    ``get_access_token()`` alone is not enough: its context variable is captured when the MCP session task starts,
+    so after a refresh it still returns the session's first token. The request object the SDK attaches to every
+    message always holds the token that was just verified.
+    """
+    try:
+        context = request_ctx.get()
+    except LookupError:
+        return get_access_token()
+    request = context.request
+    if not isinstance(request, HTTPConnection):
+        return get_access_token()
+    user = request.scope.get("user")
+    return user.access_token if isinstance(user, AuthenticatedUser) else None
+
+
+class TokenPrincipalResolver:
+    """streamable-http: the identity carried by the bearer token of the current request."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+
+    def resolve(self) -> Principal:
+        token = _current_access_token()
+        if not isinstance(token, RatatoskrAccessToken):
+            raise PermissionError("Authentication required.")
+        # Same rule as the SDK's bearer middleware (expired when ``expires_at < now``); this also covers the
+        # context-variable fallback, which can hold a session's older token.
+        if token.expires_at is not None and token.expires_at < self._clock():
+            raise PermissionError("Authentication required.")
+        return Principal(
+            subject=token.subject,
+            display_name=token.display_name,
+            groups=frozenset(token.groups),
+            auth_source=token.auth_source,
+        )
