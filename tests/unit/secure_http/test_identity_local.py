@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import io
+import re
+import threading
+import time
 
 import pytest
 from argon2 import PasswordHasher, extract_parameters
+from argon2.exceptions import HashingError
 from argon2.low_level import Type
 from pydantic import SecretStr
 
-from ratatoskr.auth.identity.local import LocalIdentityProvider, hash_password, normalize_username
+from ratatoskr.auth.identity.local import (
+    LocalIdentityProvider,
+    hash_password,
+    normalize_username,
+    password_hash_problem,
+    password_hash_weakness,
+)
 from ratatoskr.auth.password_cli import run_hash_password
 from ratatoskr.config.models import LocalUser
 
@@ -100,6 +111,24 @@ def test_username_normalisation_rule() -> None:
     """The rule the login route also uses for its rate-limit key (``login:user:<normalized>``)."""
     assert normalize_username("  Kerem ") == "kerem"
     assert normalize_username("STRASSE") == normalize_username("straße")
+    assert normalize_username("ｋｅｒｅｍ") == "kerem"  # fullwidth
+    assert normalize_username("Ayşe") == normalize_username("Ayşe")  # NFD vs NFC
+
+
+async def test_fullwidth_and_decomposed_spellings_sign_in_as_the_configured_user(password_hash: str) -> None:
+    local = LocalIdentityProvider([LocalUser(username="Ayşe", password_hash=SecretStr(password_hash))])
+    for typed in ("ayşe", "ＡＹŞＥ"):
+        principal = await local.verify_password(typed, PASSWORD)
+        assert principal is not None and principal.subject == "Ayşe"
+
+
+def test_usernames_that_collide_after_nfkc_are_rejected(password_hash: str) -> None:
+    users = [
+        LocalUser(username="kerem", password_hash=SecretStr(password_hash)),
+        LocalUser(username="ｋｅｒｅｍ", password_hash=SecretStr(password_hash)),
+    ]
+    with pytest.raises(ValueError, match="more than once"):
+        LocalIdentityProvider(users)
 
 
 async def test_username_matching_is_case_insensitive_but_subject_is_configured_name(password_hash: str) -> None:
@@ -149,6 +178,99 @@ async def test_failed_verification_does_not_leak_password_into_logs(
     assert "hunter2-secret" not in caplog.text
 
 
+def _with_parameters(password_hash: str, parameters: str) -> str:
+    """Same salt and hash, other ``m=…,t=…,p=…`` (format checks only; nothing is hashed with them)."""
+    return re.sub(r"m=\d+,t=\d+,p=\d+", parameters, password_hash, count=1)
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        "m=65536,t=0,p=4",
+        "m=65536,t=11,p=4",
+        "m=65536,t=3,p=0",
+        "m=65536,t=3,p=17",
+        "m=31,t=3,p=4",  # below 8 * p
+        "m=262145,t=3,p=1",
+    ],
+)
+def test_out_of_bounds_argon2_parameters_are_rejected(password_hash: str, parameters: str) -> None:
+    stored = _with_parameters(password_hash, parameters)
+    with pytest.raises(ValueError, match="argon2id") as info:
+        provider(stored)
+    assert stored not in str(info.value) and parameters not in str(info.value)
+    user = LocalUser(username="kerem", password_hash=SecretStr(stored))
+    assert password_hash_problem(user) is not None
+
+
+def test_upper_bounds_are_inclusive(password_hash: str) -> None:
+    user = LocalUser(username="kerem", password_hash=SecretStr(_with_parameters(password_hash, "m=262144,t=10,p=16")))
+    assert password_hash_problem(user) is None
+
+
+def test_weak_but_valid_parameters_are_logged_not_refused(caplog: pytest.LogCaptureFixture) -> None:
+    weak = PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1).hash("pw")
+    user = LocalUser(username="kerem", password_hash=SecretStr(weak))
+    assert password_hash_problem(user) is None
+    assert password_hash_weakness(user) is not None
+    caplog.set_level("WARNING")
+    provider(weak)
+    assert "kerem" in caplog.text and "OWASP" in caplog.text
+    assert weak not in caplog.text
+
+
+def test_default_parameters_are_not_weak(password_hash: str) -> None:
+    assert password_hash_weakness(LocalUser(username="kerem", password_hash=SecretStr(password_hash))) is None
+
+
+def test_users_with_different_argon2_parameters_are_refused(password_hash: str) -> None:
+    """Different costs would let response time tell configured usernames apart from unknown ones."""
+    cheap = PasswordHasher(time_cost=2, memory_cost=19456, parallelism=1).hash("pw")
+    users = [
+        LocalUser(username="kerem", password_hash=SecretStr(password_hash)),
+        LocalUser(username="ayse", password_hash=SecretStr(cheap)),
+    ]
+    with pytest.raises(ValueError, match="same argon2 parameters") as info:
+        LocalIdentityProvider(users)
+    assert "kerem" in str(info.value) and "ayse" in str(info.value)
+    assert password_hash not in str(info.value) and cheap not in str(info.value)
+
+
+def test_dummy_hash_failure_becomes_the_config_error(password_hash: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ratatoskr.auth.identity.local as local_module
+
+    def broken(*args: object, **kwargs: object) -> str:
+        raise HashingError("boom")
+
+    monkeypatch.setattr(local_module.PasswordHasher, "hash", broken)
+    with pytest.raises(ValueError, match="argon2id") as info:
+        provider(password_hash)
+    assert "kerem" in str(info.value)
+
+
+async def test_concurrent_verifications_are_bounded(password_hash: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ratatoskr.auth.identity.local as local_module
+
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+
+    def slow(stored: str, password: str) -> bool:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.05)
+        with lock:
+            running -= 1
+        return False
+
+    monkeypatch.setattr(local_module, "_verify", slow)
+    local = provider(password_hash)
+    await asyncio.gather(*(local.verify_password("kerem", "x") for _ in range(12)))
+    assert 1 <= peak <= local_module.MAX_CONCURRENT_VERIFICATIONS
+
+
 # ── hash-password command ──
 
 
@@ -180,6 +302,21 @@ def test_hash_password_command_rejects_mismatch_and_empty() -> None:
     err = io.StringIO()
     assert run_hash_password(io.StringIO("\n"), io.StringIO(), err) == 1
     assert "empty" in err.getvalue()
+
+
+def test_hash_password_command_reads_piped_bytes_as_utf8_without_bom() -> None:
+    """A pipe on Windows has a legacy text encoding; the bytes are UTF-8 (possibly with a BOM) all the same."""
+    piped = io.TextIOWrapper(io.BytesIO("﻿pässwörd\r\n".encode()), encoding="cp1252")
+    out = io.StringIO()
+    assert run_hash_password(piped, out, io.StringIO()) == 0
+    assert PasswordHasher().verify(out.getvalue().strip(), "pässwörd")
+
+
+def test_hash_password_command_rejects_undecodable_input() -> None:
+    piped = io.TextIOWrapper(io.BytesIO(b"\xff\xfe\xfa\n"), encoding="cp1252")
+    err = io.StringIO()
+    assert run_hash_password(piped, io.StringIO(), err) == 1
+    assert "UTF-8" in err.getvalue()
 
 
 def test_hash_password_command_output_verifies() -> None:

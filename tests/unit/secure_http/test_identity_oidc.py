@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import ssl
+import time
 from collections.abc import AsyncIterator
 from urllib.parse import parse_qs, urlsplit
 
@@ -300,9 +302,15 @@ async def test_hmac_token_with_published_oct_key_is_rejected(oidc, fake_issuer) 
 async def test_unknown_kid_refetch_is_rate_limited(oidc, fake_issuer, other_rsa_key, clock) -> None:
     fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
     await oidc.complete("c", VERIFIER, "nn")
-    for _ in range(5):
+    # The first unknown kid refetches; the issuer really does not publish it: a definitive verification failure.
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(key=other_rsa_key, nonce="nn"))
+    with pytest.raises(IdentityError, match="signature") as info:
+        await oidc.complete("c", VERIFIER, "nn")
+    assert not isinstance(info.value, UpstreamUnavailableError)
+    # During the cooldown nothing is fetched, so nothing is known: retry later, do not revoke.
+    for _ in range(4):
         fake_issuer.queue_token_response(id_token=fake_issuer.id_token(key=other_rsa_key, nonce="nn"))
-        with pytest.raises(IdentityError, match="signature"):
+        with pytest.raises(UpstreamUnavailableError):
             await oidc.complete("c", VERIFIER, "nn")
     assert fake_issuer.jwks_fetches == 2  # initial load + one forced refresh, not one per bad token
     clock.advance(JWKS_REFRESH_COOLDOWN_SECONDS + 1)
@@ -386,3 +394,223 @@ async def test_errors_never_contain_tokens_or_client_secret(oidc, fake_issuer) -
         await oidc.refresh("up-refresh-secret-value")
     assert "up-refresh-secret-value" not in str(info.value)
     assert "upstream-secret" not in str(info.value)
+
+
+# ── retry (UpstreamUnavailableError) versus revoke (any other IdentityError) ──
+
+HTML = {"content": b"<html>maintenance</html>", "headers": {"Content-Type": "text/html"}}
+
+
+@pytest.mark.parametrize(
+    ("status", "kwargs"),
+    [
+        (429, {"json": {"error": "slow_down"}}),
+        (408, {}),
+        (302, {"headers": {"Location": "https://elsewhere.example.com/"}}),
+        (404, HTML),
+        (200, HTML),
+        (200, {"json": ["not", "an", "object"]}),
+    ],
+)
+async def test_token_endpoint_non_answers_are_retryable(oidc, fake_issuer, status, kwargs) -> None:
+    fake_issuer.token_responses.append(httpx.Response(status, **kwargs))
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.refresh("up-1")
+
+
+@pytest.mark.parametrize(("status", "error"), [(400, "invalid_grant"), (401, "invalid_client")])
+async def test_token_endpoint_refusals_revoke(oidc, fake_issuer, status, error) -> None:
+    fake_issuer.queue_token_response(status, error=error)
+    with pytest.raises(UpstreamRejectedError, match=error):
+        await oidc.refresh("up-1")
+
+
+def _userinfo_replies(fake_issuer, response: httpx.Response) -> None:
+    fake_issuer.router.get(fake_issuer.userinfo_endpoint).mock(return_value=response)
+    fake_issuer.queue_token_response(access_token="up-access")
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_userinfo_refusals_revoke(oidc, fake_issuer, status) -> None:
+    _userinfo_replies(fake_issuer, httpx.Response(status))
+    with pytest.raises(UpstreamRejectedError):
+        await oidc.refresh("up-1")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(429),
+        httpx.Response(500),
+        httpx.Response(302, headers={"Location": "/x"}),
+        httpx.Response(200, **HTML),
+    ],
+)
+async def test_userinfo_non_answers_are_retryable(oidc, fake_issuer, response) -> None:
+    _userinfo_replies(fake_issuer, response)
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.refresh("up-1")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(404),
+        httpx.Response(429),
+        httpx.Response(401),
+        httpx.Response(302, headers={"Location": "/"}),
+        httpx.Response(200, **HTML),
+    ],
+)
+async def test_discovery_failures_are_retryable(oidc, fake_issuer, response) -> None:
+    fake_issuer.router.get(fake_issuer.issuer + ".well-known/openid-configuration").mock(return_value=response)
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.refresh("up-1")
+
+
+@pytest.mark.parametrize("response", [httpx.Response(404), httpx.Response(429), httpx.Response(200, **HTML)])
+async def test_jwks_failures_without_cached_keys_are_retryable(oidc, fake_issuer, response) -> None:
+    fake_issuer.router.get(fake_issuer.jwks_uri).mock(return_value=response)
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(), refresh_token="up-2")
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.refresh("up-1")
+
+
+async def test_jwks_refetch_failure_keeps_serving_cached_keys(
+    oidc, fake_issuer, clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    await oidc.complete("c", VERIFIER, "nn")
+    clock.advance(JWKS_MAX_AGE_SECONDS + 1)
+    route = fake_issuer.router.get(fake_issuer.jwks_uri).mock(return_value=httpx.Response(429))
+    before = route.call_count  # respx reuses the route of the same pattern, so count from here
+    caplog.set_level("WARNING")
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    assert (await oidc.complete("c", VERIFIER, "nn")).principal.subject == "alice@example.com"
+    assert route.call_count - before == 1 and "JWKS" in caplog.text
+    # The failed refetch is not retried on every sign-in, only after the cooldown.
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    await oidc.complete("c", VERIFIER, "nn")
+    assert route.call_count - before == 1
+    clock.advance(JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    await oidc.complete("c", VERIFIER, "nn")
+    assert route.call_count - before == 2
+
+
+async def test_failed_id_token_verification_revokes(oidc, fake_issuer, other_rsa_key) -> None:
+    forged = fake_issuer.id_token(key=other_rsa_key, header={"alg": "RS256", "kid": "key-1"})
+    fake_issuer.queue_token_response(id_token=forged)
+    with pytest.raises(IdentityError) as info:
+        await oidc.refresh("up-1")
+    assert not isinstance(info.value, UpstreamUnavailableError)
+
+
+# ── deadlines and malformed input ──
+
+
+async def test_slow_drip_response_hits_the_overall_deadline(oidc, fake_issuer, monkeypatch) -> None:
+    import ratatoskr.auth.identity.oidc as oidc_module
+
+    monkeypatch.setattr(oidc_module, "UPSTREAM_TIMEOUT_SECONDS", 0.3)
+
+    async def drip() -> AsyncIterator[bytes]:
+        while True:
+            yield b" "
+            await asyncio.sleep(0.05)
+
+    fake_issuer.router.get(fake_issuer.issuer + ".well-known/openid-configuration").mock(
+        side_effect=lambda request: httpx.Response(200, content=drip())
+    )
+    started = time.monotonic()
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.metadata()
+    assert time.monotonic() - started < 2
+
+
+async def test_stream_error_is_retryable(oidc, fake_issuer) -> None:
+    fake_issuer.router.post(fake_issuer.token_endpoint).mock(side_effect=httpx.StreamClosed())
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.refresh("up-1")
+
+
+async def test_unparseable_endpoint_url_is_refused(oidc, fake_issuer) -> None:
+    fake_issuer.discovery["token_endpoint"] = "https://[::1/token"
+    with pytest.raises(IdentityError):
+        await oidc.metadata()
+
+
+async def test_non_ascii_access_token_is_not_sent_to_userinfo(oidc, fake_issuer) -> None:
+    fake_issuer.queue_token_response(access_token="töken")
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.refresh("up-1")
+
+
+# ── subject (sub) continuity ──
+
+
+async def test_id_token_must_carry_sub(oidc, fake_issuer) -> None:
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn", sub=None))
+    with pytest.raises(IdentityError, match="sub"):
+        await oidc.complete("c", VERIFIER, "nn")
+
+
+async def test_userinfo_must_carry_sub(oidc, fake_issuer) -> None:
+    fake_issuer.userinfo = {"email": "alice@example.com", "groups": ["ops"]}
+    fake_issuer.queue_token_response(access_token="up-access")
+    with pytest.raises(IdentityError, match="sub") as info:
+        await oidc.refresh("up-1")
+    assert not isinstance(info.value, UpstreamUnavailableError)
+
+
+async def test_userinfo_sub_must_match_the_id_token_sub(oidc, fake_issuer) -> None:
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"), refresh_token="up-1")
+    await oidc.complete("c", VERIFIER, "nn")
+    fake_issuer.userinfo = {"sub": "someone-else", "email": "alice@example.com"}
+    fake_issuer.queue_token_response(access_token="up-access")
+    with pytest.raises(IdentityError, match="sub") as info:
+        await oidc.refresh("up-1")
+    assert not isinstance(info.value, UpstreamUnavailableError)
+
+
+async def test_sub_is_tracked_across_upstream_rotation(oidc, fake_issuer) -> None:
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"), refresh_token="up-1")
+    await oidc.complete("c", VERIFIER, "nn")
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(), refresh_token="up-2")
+    assert (await oidc.refresh("up-1")).refresh_token == "up-2"
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(sub="someone-else"), refresh_token="up-3")
+    with pytest.raises(IdentityError, match="sub"):
+        await oidc.refresh("up-2")
+
+
+# ── header-supplied key locations and kid-less tokens ──
+
+
+@pytest.mark.parametrize("location", ["jku", "x5u"])
+async def test_key_location_headers_are_never_fetched(oidc, fake_issuer, rsa_key, other_rsa_key, location) -> None:
+    attacker = fake_issuer.router.get("https://attacker.example.com/keys").mock(
+        return_value=httpx.Response(200, json=dict(KeySet([other_rsa_key]).as_dict(private=False)))
+    )
+    header = {"alg": "RS256", "kid": "key-2", location: "https://attacker.example.com/keys"}
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(key=other_rsa_key, header=header, nonce="nn"))
+    with pytest.raises(IdentityError, match="signature"):
+        await oidc.complete("c", VERIFIER, "nn")
+    header = {"alg": "RS256", "kid": "key-1", location: "https://attacker.example.com/keys"}
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(key=rsa_key, header=header, nonce="nn"))
+    assert (await oidc.complete("c", VERIFIER, "nn")).principal.subject == "alice@example.com"
+    assert attacker.call_count == 0
+
+
+async def test_token_without_kid_uses_the_only_published_key(oidc, fake_issuer) -> None:
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(header={"alg": "RS256"}, nonce="nn"))
+    assert (await oidc.complete("c", VERIFIER, "nn")).principal.subject == "alice@example.com"
+
+
+async def test_token_without_kid_is_rejected_when_several_keys_are_published(
+    oidc, fake_issuer, rsa_key, other_rsa_key
+) -> None:
+    fake_issuer.jwks = dict(KeySet([rsa_key, other_rsa_key]).as_dict(private=False))
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(header={"alg": "RS256"}, nonce="nn"))
+    with pytest.raises(IdentityError, match="signature") as info:
+        await oidc.complete("c", VERIFIER, "nn")
+    assert not isinstance(info.value, UpstreamUnavailableError)
