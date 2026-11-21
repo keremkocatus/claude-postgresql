@@ -25,7 +25,10 @@ argon2-cffi 25.1, cryptography (AES-GCM, HKDF), joserfc 1.8 (JWT/JWKS; typed, re
 `httpx.ASGITransport` against the real Starlette app.
 
 **Spec:** `docs/superpowers/specs/2026-11-21-multi-backend-redesign-design.md` (§5, §7, §8 health, §9 Dockerfile).
-**Contract:** `docs/superpowers/plans/2026-11-21-phase1-interfaces.md`. Plan 1a is implemented before this plan.
+**Contract:** `docs/superpowers/plans/2026-11-21-phase1-interfaces.md` (including its notes sections).
+**Baseline:** Plan 1a as implemented on `design/multi-backend-redesign` at commit `c4c8de0` (505 unit tests,
+143 integration tests). Every task below was applied in order to a copy of that tree and verified there
+(unit suite, ruff, mypy strict after each task). Repo conventions: `CLAUDE.md`.
 
 ---
 
@@ -66,6 +69,39 @@ These were checked by reading the installed source and by running probes; do not
 10. `uvicorn` defaults to `proxy_headers=True` with `forwarded_allow_ips=127.0.0.1`; Ratatoskr disables it and
     applies `server.trusted_proxies` itself. `aiosqlite` logs every statement *with parameters* at DEBUG.
 
+## Plan 1a facts this plan builds on (verified in the code at `c4c8de0`)
+
+- `build_app(config, *, resolver, audit, auth_server_provider=None, auth_settings=None, registry=None)
+  -> FastMCP[AppState]`. Ownership rule: whoever creates the `BackendRegistry` closes it. With `registry=None`
+  build_app creates one and its FastMCP lifespan closes it (stdio); with an injected registry the lifespan only
+  yields `AppState` and never closes it. `BackendRegistry.close_all()` is final (later `get` calls are refused).
+- Every tool goes through `ToolRuntime.run` / `run_global`, which return `ToolResult(text, is_error)`; tools return
+  `CallToolResult` (`isError=true` on failure, text starting with `Error:`). A `PermissionError` raised by the
+  resolver becomes `Error: Authentication required.` with audit result `denied` — exactly what
+  `TokenPrincipalResolver` raises. Successful output is never redacted; error text, logs and audit `query_text` are.
+- Audit: `build_event(...)` creates every `AuditEvent`; results are `ok | denied | error | timeout` and `error_class`
+  is set for everything but `ok`. Auth events use the same builder (`auth/events.py`).
+- Logging: `setup_logging(level, stream=None)` installs the only handler, a redacting JSON handler on the **root**
+  logger writing to **stderr**, and quiets `mcp.server.lowlevel.server` at INFO. HTTP keeps logs on stderr. uvicorn
+  must not install handlers of its own (`log_config=None`; see `transport/serve.py` and its test). The redacting
+  formatter masks values under dict keys that look like secrets (`token`, `secret`, `password`, …), so log counts
+  and fields with such names go into the message instead of `extra=`. `tests/unit/conftest.py` restores the root
+  logger after every test (autouse), and the HTTP tests rely on it.
+- CLI (`cli.py`): `resolve_config_path`, `build_parser`, `summarize`, `_check_config`, `_serve`,
+  `main(argv) -> int`; exit codes `EXIT_UNEXPECTED_ERROR = 1`, `EXIT_CONFIG_ERROR = 2`, `EXIT_INTERRUPTED = 130`;
+  unexpected exceptions are logged through the redacting handler (`logger.exception("fatal error")`).
+  `load_config(path, env=None, *, insecure_dev=False)` validates the streamable-http rules (auth, secret_key,
+  https unless `--insecure-dev` on a loopback host). 1a's `check-config` prints a "streamable-http … not available"
+  note and `serve` refuses HTTP; Task 16 removes both.
+- `pyproject.toml`: version is dynamic (`src/ratatoskr/__init__.py`); dependencies `mcp>=1.30,<2`, `asyncpg`,
+  `pydantic`, `pyyaml`; uvicorn, starlette and httpx arrive only transitively through `mcp`, so Task 1 declares them.
+- Tests are packages (`tests/__init__.py`, `tests/unit/__init__.py`); unit tests run with
+  `.venv/Scripts/python -m pytest -q` (integration tests are deselected by `addopts`).
+- `PostgresConnection` has an optional `write_dsn` (write mode only); the test configs here use read-mode
+  connections with a `dsn` that is never opened.
+- `app.py` itself assigns `mcp._mcp_server.version` (1a's choice, guarded by 1a's protocol test). This plan adds no
+  private SDK access.
+
 ## Contract additions made by this plan
 
 - `ServerSettings.trusted_proxies: list[str] = []` — IPs/CIDRs whose `X-Forwarded-For` is honoured.
@@ -83,7 +119,14 @@ These were checked by reading the installed source and by running probes; do not
   passes its own registry and closes it in the process-level lifespan; 1a's `app.py` is not modified by this plan.
 - `build_http_app(config, *, insecure_dev=False, clock=time.time, registry=None) -> HttpApp(asgi, store, provider,
   registry)`; `registry` exists for tests. No private SDK attribute is used anywhere in this plan.
-- Uses 1a's `load_config(path, env=None, *, insecure_dev=False)` (a 1a addition) only through the CLI.
+- CLI: `ratatoskr hash-password`; `check-config --insecure-dev` (validates exactly what `serve --insecure-dev`
+  accepts) and, for streamable-http, also runs the HTTP preconditions and prints their warnings; `serve` over
+  streamable-http keeps 1a's exit codes (2 config error, 1 unexpected, 130 interrupted).
+- A local `password_hash` that is not a valid argon2id hash (`argon2.extract_parameters` must parse it and report
+  type `ID`) is a `ConfigError` raised by the HTTP preconditions, so `serve` and `check-config` refuse it with the
+  same message: `auth.local user '<name>': password_hash must be an argon2id hash (generate one with
+  `ratatoskr hash-password`)`. The message never contains the value. (Only for streamable-http configs: stdio
+  ignores `auth`.)
 
 ---
 
@@ -120,8 +163,8 @@ These were checked by reading the installed source and by running probes; do not
 | `transport/preconditions.py` | refuse HTTP without auth / https / secret; `--insecure-dev` rules |
 | `transport/security.py` | MCP `AuthSettings` and `TransportSecuritySettings` from `public_url` |
 | `transport/register_limit.py` | per-IP rate limit middleware for `POST /register` |
-| `transport/app.py` | `build_http_app()` composition root → `HttpApp(asgi, store, provider)` |
-| `transport/serve.py` | `serve_http()` under uvicorn |
+| `transport/app.py` | `build_http_app()` composition root → `HttpApp(asgi, store, provider, registry)` |
+| `transport/serve.py` | `serve_http()` under uvicorn; uvicorn logs routed to the redacting root handler |
 
 **Created — tests (`tests/unit/secure_http/` and `e2e/`, each with an empty `__init__.py` like 1a's test packages)**
 
@@ -146,58 +189,69 @@ These were checked by reading the installed source and by running probes; do not
 | `e2e/test_http_local_flow.py` | DCR → authorize → login → token → `list_connections` → refresh → revoke; audit; logs |
 | `e2e/test_http_security.py` | redirect allowlist, PKCE, CSRF, 401, DNS rebinding, rate limits |
 | `e2e/test_http_oidc_flow.py` | OIDC login, group refresh, offboarding, callback attacks |
-| `test_cli_http.py` | `hash-password` and `serve` dispatch |
+| `test_cli_http.py` | `hash-password`, `serve` over HTTP (dispatch, exit codes), `check-config --insecure-dev` |
+| `test_transport_serve.py` | uvicorn config; uvicorn log records reach the redacting root handler |
 
-**Created — other:** `Dockerfile` (rewritten), `.dockerignore`, `docs/authentik.md`.
+**Created — other:** `Dockerfile` (the stale 0.1 one was deleted in Plan 1a), `.dockerignore`, `docs/authentik.md`.
 
 **Modified (Plan 1a files):** `pyproject.toml` (dependencies), `src/ratatoskr/config/models.py` (`ServerSettings`
 fields), `src/ratatoskr/auth/resolver.py` (adds `TokenPrincipalResolver`), `src/ratatoskr/cli.py` (`serve` HTTP
-branch, `hash-password`), `tests/unit/test_cli.py` (drops `test_serve_refuses_http_transport_for_now`).
+branch, `check-config --insecure-dev`, `hash-password`, note removed), `tests/unit/test_cli.py` (drops the three tests
+about the removed refusal/note; `HTTP_CONFIG` gets a real argon2id hash instead of `password_hash: x`).
 
-**Repo rules for every task:** ruff (line length 120), `mypy --strict` clean for `src`, Python 3.12 typing, small
-single-purpose modules, no secrets in logs, never commit with failing tests. Do not touch files of other plans
+**Repo rules for every task (`CLAUDE.md`):** tests first; `from __future__ import annotations` in every module
+(package `__init__.py` files stay docstring-only); ruff (line length 120) and `mypy --strict` clean; small
+single-purpose modules; no secrets in user-facing errors or logs (text shown to clients is fixed wording, details go
+to the log, which the root handler redacts); logs on stderr; never commit with failing tests. Do not touch files of other plans
 beyond the modifications listed above; do not connect to any real identity provider or database.
 
 ---
 
-### Task 0: Preflight — confirm Plan 1a is in place
+### Task 0: Preflight — confirm the Plan 1a baseline
 
 **Files:** none (read-only checks).
 
 - [ ] **Step 1: Suite is green before starting**
 
-Run: `.venv/Scripts/python -m pytest tests/unit -q && .venv/Scripts/python -m ruff check src tests && .venv/Scripts/python -m mypy src`
-Expected: all pass.
+Run: `.venv/Scripts/python -m pytest -q && .venv/Scripts/python -m ruff check src tests && .venv/Scripts/python -m mypy src`
+Expected: `505 passed, 143 deselected`; ruff and mypy clean.
 
-- [ ] **Step 2: Contract objects exist with the shapes this plan uses**
+- [ ] **Step 2: The 1a shapes this plan uses**
 
 Run:
 
 ```bash
 .venv/Scripts/python - <<'PY'
 import inspect
+from ratatoskr import cli
 from ratatoskr.app import build_app
-from ratatoskr.cli import EXIT_CONFIG_ERROR, build_parser, main
+from ratatoskr.auth.resolver import StdioPrincipalResolver
+from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.loader import load_config
-from ratatoskr.observability.audit import CompositeAuditSink, LogAuditSink
+from ratatoskr.config.models import AuthSettings, ServerSettings
+from ratatoskr.observability.audit import CompositeAuditSink, LogAuditSink, build_event
+from ratatoskr.observability.logging import setup_logging
+from ratatoskr.tools.runtime import ToolResult
 print(inspect.signature(build_app))
 print(inspect.signature(load_config))
-LogAuditSink()
+print(inspect.signature(build_event))
+print(inspect.signature(setup_logging))
+assert "registry" in inspect.signature(build_app).parameters
+assert "owns_registry" in inspect.getsource(build_app)
+assert (cli.EXIT_UNEXPECTED_ERROR, cli.EXIT_CONFIG_ERROR, cli.EXIT_INTERRUPTED) == (1, 2, 130)
+assert hasattr(cli, "HTTP_NOT_AVAILABLE_NOTE") and "_serve" in dir(cli) and "_check_config" in dir(cli)
+assert "trusted_proxies" not in ServerSettings.model_fields
 CompositeAuditSink([LogAuditSink()])
-src = inspect.getsource(build_app)
-assert "auth_server_provider=auth_server_provider" in src and "auth=auth_settings" in src
-assert "registry" in inspect.signature(build_app).parameters, "1a Task 17 adds build_app(registry=...)"
-assert "owns_registry" in src, "an injected registry must not be closed by build_app's lifespan"
 PY
-grep -n 'asyncio_mode' pyproject.toml
-ls tests/unit/__init__.py tests/unit/test_cli.py
+grep -n '"mcp>=\|uvicorn\|asyncio_mode' pyproject.toml
+ls tests/unit/__init__.py tests/unit/conftest.py tests/unit/test_cli.py
 ```
 
 Expected: `build_app(config, *, resolver, audit, auth_server_provider=None, auth_settings=None, registry=None)`;
-`load_config(path, env=None, *, insecure_dev=False)`; both sink constructors succeed; the assertions hold;
-`asyncio_mode = "auto"`; both test files exist (1a's tests are a package, so the new test directories get
-`__init__.py` too). If a shape differs, adapt the single call site named in the failing task and record it in that
-task's commit message.
+`load_config(path, env=None, *, insecure_dev=False)`; `build_event(*, subject, auth_source, connection, tool,
+query_text, duration_ms, rows, result, error_class, ts=None)`; `setup_logging(level='INFO', stream=None)`; the
+assertions hold; `pyproject.toml` lists `mcp>=1.30,<2`, no `uvicorn`, and `asyncio_mode = "auto"`; the three test
+files exist. If anything differs, stop and reconcile this plan with the code before Task 1.
 
 ---
 
@@ -211,7 +265,8 @@ task's commit message.
 
 - [ ] **Step 1: Add dependencies to `pyproject.toml`**
 
-Append to `[project] dependencies` (keep the entries 1a already has):
+Append to `[project] dependencies`, after `"pyyaml>=6.0"` (uvicorn, starlette and httpx are only transitive
+dependencies of `mcp` today; this plan imports them directly):
 
 ```toml
     "aiosqlite>=0.22",
@@ -224,7 +279,7 @@ Append to `[project] dependencies` (keep the entries 1a already has):
     "uvicorn>=0.30",
 ```
 
-Append to the `dev` extra under `[project.optional-dependencies]`:
+Append to the `dev` extra under `[project.optional-dependencies]`, after `"testcontainers>=4.0"`:
 
 ```toml
     "respx>=0.23",
@@ -523,8 +578,8 @@ class ServerSettings(BaseModel):
     allowed_redirect_hosts: list[str] = ["claude.ai", "claude.com", "localhost", "127.0.0.1"]
     stdio_role: str | None = None
     log_level: str = "INFO"
+    # Proxy IPs/CIDRs whose X-Forwarded-For is trusted for client IPs (rate limiting). Empty: never trusted.
     trusted_proxies: list[str] = []
-    """Proxy IPs/CIDRs whose X-Forwarded-For is trusted for client IPs (rate limiting). Empty: never trusted."""
     audit_retention: timedelta = timedelta(days=90)
 
     @field_validator("log_level")
@@ -550,8 +605,8 @@ class ServerSettings(BaseModel):
 
 - [ ] **Step 7: Run tests, lint, types**
 
-Run: `.venv/Scripts/python -m pytest tests/unit -q && .venv/Scripts/python -m ruff check --fix src tests && .venv/Scripts/python -m mypy src`
-Expected: PASS (whole unit suite, including 1a's config tests).
+Run: `.venv/Scripts/python -m pytest -q && .venv/Scripts/python -m ruff check --fix src tests && .venv/Scripts/python -m mypy src`
+Expected: PASS (`509 passed`: 1a's 505 plus 4).
 
 - [ ] **Step 8: Commit**
 
@@ -659,6 +714,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.auth.crypto'
 
 ```python
 """Token hashing, opaque token generation and keys derived from ``server.secret_key``."""
+
+from __future__ import annotations
 
 import base64
 import hashlib
@@ -1026,6 +1083,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.state'`.
 ```python
 """Plain records exchanged between the auth layer and the state store."""
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -1110,6 +1169,8 @@ Every method takes ``now`` explicitly where time matters, so implementations sta
 Raw tokens and codes never reach the store; callers pass SHA-256 hashes (``auth.crypto.hash_token``).
 """
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -1190,6 +1251,8 @@ class Store(Protocol):
 
 ```python
 """Ordered SQLite schema migrations. Append new entries; never edit an applied one."""
+
+from __future__ import annotations
 
 MIGRATIONS: tuple[str, ...] = (
     # 1 — initial schema (spec §7)
@@ -1282,6 +1345,8 @@ MIGRATIONS: tuple[str, ...] = (
 One aiosqlite connection (one writer thread) in WAL mode with ``synchronous=NORMAL``. An asyncio lock serialises
 statements so that multi-statement transactions from concurrent coroutines never interleave.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
@@ -1875,6 +1940,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.state.audit'
 ``flush_interval`` seconds or every ``batch_size`` events. ``aclose`` writes everything still queued.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 
@@ -1968,10 +2035,11 @@ class SqliteAuditSink:
 ```python
 """Hourly removal of expired codes, tokens, pending authorizations, idle rate limits and old audit rows."""
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import logging
-from dataclasses import asdict
 from datetime import timedelta
 
 from ratatoskr.state.records import CleanupStats, Clock
@@ -2000,7 +2068,17 @@ class CleanupTask:
     async def run_once(self) -> CleanupStats:
         now = self._clock()
         stats = await self._store.cleanup(now, audit_cutoff=now - self._retention)
-        logger.info("state cleanup finished", extra={"cleanup": asdict(stats)})
+        # Counts go in the message: the JSON formatter masks values under keys that look like "token".
+        logger.info(
+            "state cleanup removed %d pending, %d codes, %d expired credentials, %d upstream sessions, "
+            "%d rate-limit rows, %d audit events",
+            stats.pending,
+            stats.codes,
+            stats.tokens,
+            stats.upstream_sessions,
+            stats.rate_limits,
+            stats.audit_events,
+        )
         return stats
 
     def start(self) -> None:
@@ -2097,6 +2175,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.auth.redirec
 
 ```python
 """Redirect URI allowlist for dynamic client registration (spec §5.2 step 1)."""
+
+from __future__ import annotations
 
 from urllib.parse import urlsplit
 
@@ -2227,6 +2307,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.auth.ratelim
 ```python
 """Sliding-window rate limiting with exponential lockout, persisted in the state store (spec §5.4)."""
 
+from __future__ import annotations
+
 import asyncio
 from dataclasses import dataclass
 
@@ -2298,8 +2380,9 @@ git commit -m "Add persistent sliding-window rate limiter with exponential locko
 
 **Files:**
 - Create: `src/ratatoskr/auth/tokens.py`
-- Modify: `src/ratatoskr/auth/resolver.py` (complete replacement below; `PrincipalResolver` and
-  `StdioPrincipalResolver` keep the contract behaviour exactly)
+- Modify: `src/ratatoskr/auth/resolver.py` (complete replacement below: `PrincipalResolver` and
+  `StdioPrincipalResolver` are 1a's code unchanged; the imports, `_current_access_token` and
+  `TokenPrincipalResolver` are new)
 - Test: `tests/unit/secure_http/test_token_resolver.py`
 
 - [ ] **Step 1: Write the failing test**
@@ -2403,6 +2486,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.auth.tokens'
 ```python
 """SDK token models extended with the identity Ratatoskr needs on every request."""
 
+from __future__ import annotations
+
 from typing import Literal
 
 from mcp.server.auth.provider import AccessToken, RefreshToken
@@ -2427,10 +2512,11 @@ class RatatoskrRefreshToken(RefreshToken):
 
 - [ ] **Step 4: Replace `src/ratatoskr/auth/resolver.py`**
 
-If 1a's file has extra docstrings or helpers, keep them; the classes must read:
 
 ```python
-"""Resolve the :class:`Principal` of the current tool call (stdio process user or OAuth bearer token)."""
+"""Resolve the principal of the current tool call."""
+
+from __future__ import annotations
 
 from typing import Protocol
 
@@ -2445,16 +2531,24 @@ from ratatoskr.auth.tokens import RatatoskrAccessToken
 
 
 class PrincipalResolver(Protocol):
-    def resolve(self) -> Principal: ...
+    def resolve(self) -> Principal:
+        """Return the identity of the current request; raise PermissionError when there is none."""
+        ...
 
 
 class StdioPrincipalResolver:
+    """stdio has no authentication: the local user acts as a member of ``server.stdio_role``."""
+
     def __init__(self, role: str | None) -> None:
-        self._role = role
+        self._principal = Principal(
+            subject="stdio",
+            display_name="local stdio user",
+            groups=frozenset({role}) if role else frozenset(),
+            auth_source="stdio",
+        )
 
     def resolve(self) -> Principal:
-        groups = frozenset({self._role}) if self._role else frozenset()
-        return Principal(subject="stdio", display_name="local stdio user", groups=groups, auth_source="stdio")
+        return self._principal
 
 
 def _current_access_token() -> AccessToken | None:
@@ -2476,6 +2570,8 @@ def _current_access_token() -> AccessToken | None:
 
 
 class TokenPrincipalResolver:
+    """streamable-http: the identity carried by the bearer token of the current request."""
+
     def resolve(self) -> Principal:
         token = _current_access_token()
         if not isinstance(token, RatatoskrAccessToken):
@@ -2490,7 +2586,7 @@ class TokenPrincipalResolver:
 
 - [ ] **Step 5: Run it (plus 1a's resolver tests)**
 
-Run: `.venv/Scripts/python -m pytest tests/unit -q && .venv/Scripts/python -m mypy src`
+Run: `.venv/Scripts/python -m pytest -q && .venv/Scripts/python -m mypy src`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -2511,6 +2607,8 @@ git commit -m "Add Ratatoskr token models and request-scoped TokenPrincipalResol
 
 argon2 verification runs in a worker thread (`asyncio.to_thread`) so a login never stalls the event loop. An unknown
 username is verified against a dummy hash created at start-up, so it costs the same as a wrong password.
+`password_hash_problem(user)` is the single format check (parseable argon2 PHC string of type argon2id); the provider
+uses it here and the HTTP preconditions (Task 12) use it so `serve` and `check-config` give the same message.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2520,6 +2618,8 @@ from __future__ import annotations
 import io
 
 import pytest
+from argon2 import PasswordHasher
+from argon2.low_level import Type
 from pydantic import SecretStr
 
 from ratatoskr.auth.identity.local import LocalIdentityProvider, hash_password
@@ -2568,9 +2668,15 @@ async def test_unknown_user_still_runs_argon2(password_hash: str, monkeypatch: p
     assert len(calls) == 1 and calls[0].startswith("$argon2id$")
 
 
-def test_non_argon2id_hash_is_rejected() -> None:
-    with pytest.raises(ValueError, match="argon2id"):
-        provider("plaintext-password")
+@pytest.mark.parametrize(
+    "stored", ["plaintext-password", "x", "$argon2id$garbage", PasswordHasher(type=Type.I).hash("pw"), ""]
+)
+def test_non_argon2id_hash_is_rejected_without_echoing_it(stored: str) -> None:
+    with pytest.raises(ValueError, match="argon2id") as info:
+        provider(stored)
+    assert "kerem" in str(info.value)
+    if stored:
+        assert stored not in str(info.value)
 
 
 def test_lookup_reflects_configuration(password_hash: str) -> None:
@@ -2628,6 +2734,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.auth.identit
 ```python
 """Shared identity-provider types. Both providers produce a :class:`Principal`."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -2674,11 +2782,14 @@ class RedirectIdentityProvider(Protocol):
 ```python
 """Local users from configuration, verified with argon2id (spec §5.1 ``local``)."""
 
+from __future__ import annotations
+
 import asyncio
 import secrets
 
-from argon2 import PasswordHasher
+from argon2 import PasswordHasher, extract_parameters
 from argon2.exceptions import InvalidHashError, VerificationError
+from argon2.low_level import Type
 
 from ratatoskr.auth.principal import Principal
 from ratatoskr.config.models import LocalUser
@@ -2689,6 +2800,20 @@ _HASHER = PasswordHasher()
 def hash_password(password: str) -> str:
     """argon2id hash in PHC string format, as stored in ``auth.local.users[].password_hash``."""
     return _HASHER.hash(password)
+
+
+def password_hash_problem(user: LocalUser) -> str | None:
+    """Why ``user.password_hash`` is not a usable argon2id hash, or ``None``. The message never contains the value."""
+    try:
+        parameters = extract_parameters(user.password_hash.get_secret_value())
+    except InvalidHashError:
+        parameters = None
+    if parameters is None or parameters.type is not Type.ID:
+        return (
+            f"auth.local user {user.username!r}: password_hash must be an argon2id hash"
+            " (generate one with `ratatoskr hash-password`)"
+        )
+    return None
 
 
 def _verify(password_hash: str, password: str) -> bool:
@@ -2702,11 +2827,9 @@ class LocalIdentityProvider:
     def __init__(self, users: list[LocalUser]) -> None:
         self._users: dict[str, LocalUser] = {}
         for user in users:
-            if not user.password_hash.get_secret_value().startswith("$argon2id$"):
-                raise ValueError(
-                    f"auth.local user {user.username!r}: password_hash must be an argon2id hash"
-                    " (generate one with `ratatoskr hash-password`)"
-                )
+            problem = password_hash_problem(user)
+            if problem is not None:
+                raise ValueError(problem)
             self._users[user.username] = user
         # Unknown usernames are checked against this hash so they cost the same time as a wrong password.
         self._dummy_hash = _HASHER.hash(secrets.token_urlsafe(32))
@@ -2739,6 +2862,8 @@ class LocalIdentityProvider:
 
 ```python
 """``ratatoskr hash-password``: read a password without echo (or from stdin) and print its argon2id hash."""
+
+from __future__ import annotations
 
 import getpass
 from collections.abc import Callable
@@ -3011,6 +3136,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.auth.identit
 Authorization code flow with PKCE (S256), ``state`` and ``nonce``. ID tokens are verified against the issuer's
 JWKS (signature, ``iss``, ``aud``/``azp``, ``exp``, ``iat``, ``nonce``); only asymmetric algorithms are accepted.
 """
+
+from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
@@ -3733,15 +3860,17 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.auth.oauth_s
 
 - [ ] **Step 3: Implement the auth-event helper**
 
-`src/ratatoskr/auth/events.py`:
+`src/ratatoskr/auth/events.py` (built on 1a's `build_event`, so auth events share the audit taxonomy: `ok` for a
+completed action, `denied` for a refused one, `error_class` set whenever the result is not `ok`):
 
 ```python
 """Audit events for authentication (login, token reuse, upstream refresh)."""
 
-from datetime import UTC, datetime
+from __future__ import annotations
+
 from typing import Literal
 
-from ratatoskr.observability.audit import AuditEvent, AuditResult, AuditSink
+from ratatoskr.observability.audit import AuditResult, AuditSink, build_event
 
 AuthEventName = Literal[
     "login_succeeded",
@@ -3762,20 +3891,22 @@ def record_auth_event(
     result: AuditResult,
     error_class: str | None = None,
 ) -> None:
-    """Auth events reuse :class:`AuditEvent`: ``tool`` carries the event name, ``connection`` is ``None``."""
+    """Auth events reuse the tool-call audit shape: ``tool`` carries the event name, ``connection`` is ``None``.
+
+    Results follow the audit taxonomy: ``ok`` for a completed action, ``denied`` for a refused one. ``error_class``
+    is set for every result but ``ok`` (it repeats the event name, which is what an operator filters on).
+    """
     sink.record(
-        AuditEvent(
-            ts=datetime.now(UTC),
+        build_event(
             subject=subject,
             auth_source=auth_source,
             connection=None,
             tool=name,
             query_text=None,
-            query_sha256=None,
             duration_ms=0.0,
             rows=None,
             result=result,
-            error_class=error_class,
+            error_class=error_class if error_class is not None or result == "ok" else name,
         )
     )
 ```
@@ -3793,6 +3924,8 @@ and refresh-token expiry, client authentication and refresh scope narrowing. Thi
 to us: the redirect host allowlist, S256 challenge shape, RFC 8707 resource binding, single-use codes, hashed
 storage, refresh rotation with reuse detection, family revocation and upstream (OIDC) re-validation.
 """
+
+from __future__ import annotations
 
 import logging
 import re
@@ -4377,6 +4510,8 @@ The cookie is ``HttpOnly`` and ``SameSite=Strict``; an attacker can neither read
 cross-site, and the form token cannot be forged without ``server.secret_key``.
 """
 
+from __future__ import annotations
+
 from starlette.responses import Response
 
 from ratatoskr.auth.crypto import Signer, new_token
@@ -4421,6 +4556,8 @@ class CsrfProtector:
 
 ```python
 """HTML for the sign-in pages and the security headers every auth page carries."""
+
+from __future__ import annotations
 
 import base64
 import hashlib
@@ -4522,7 +4659,7 @@ git commit -m "Add CSRF protection and hardened login pages" -m "Co-Authored-By:
 - Test: `tests/unit/secure_http/test_transport_settings.py`
 
 Preconditions (raised as `ConfigError` before anything starts): transport is `streamable-http`; `auth` present with
-users (local) or `oidc` section; `secret_key` ≥ 32 characters; `public_url` present, an origin, and https.
+users (local, every `password_hash` a valid argon2id hash) or `oidc` section; `secret_key` ≥ 32 characters; `public_url` present, an origin, and https.
 `--insecure-dev` is refused unless `server.host` is loopback; with it, `public_url` may be plain http but only on
 127.0.0.1/localhost; whenever the flag is given, a warning is returned and logged at every start. Auth is never
 optional. The tests build invalid variants with `model_copy` so they reach this code even if 1a's model validators
@@ -4539,6 +4676,7 @@ import pytest
 from pydantic import AnyHttpUrl, SecretStr
 
 from ratatoskr.config.loader import ConfigError
+from ratatoskr.config.models import LocalAuthSettings, LocalUser
 from ratatoskr.transport.client_ip import client_ip, parse_trusted_proxies
 from ratatoskr.transport.preconditions import check_http_preconditions
 from ratatoskr.transport.security import mcp_auth_settings, transport_security
@@ -4633,6 +4771,16 @@ def test_insecure_dev_warns_even_with_https(make_config) -> None:
     assert settings.warnings
 
 
+def test_local_password_hashes_must_be_argon2id(make_config) -> None:
+    config = make_config()
+    assert config.auth is not None
+    users = [LocalUser(username="kerem", password_hash=SecretStr("not-a-hash"))]
+    bad = config.model_copy(update={"auth": config.auth.model_copy(update={"local": LocalAuthSettings(users=users)})})
+    with pytest.raises(ConfigError, match="user 'kerem': password_hash must be an argon2id hash") as info:
+        check_http_preconditions(bad, insecure_dev=False)
+    assert "not-a-hash" not in str(info.value)
+
+
 def test_wrong_transport_is_refused(make_config) -> None:
     with pytest.raises(ConfigError, match="streamable-http"):
         check_http_preconditions(with_server(make_config(), transport="stdio"), insecure_dev=False)
@@ -4675,6 +4823,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.transport'`.
 
 ```python
 """Client IP for rate limiting. ``X-Forwarded-For`` is honoured only when the peer is a configured trusted proxy."""
+
+from __future__ import annotations
 
 from collections.abc import Sequence
 from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
@@ -4722,8 +4872,11 @@ def client_ip(scope: Scope, trusted: Sequence[Network]) -> str:
 ```python
 """Refuse to serve streamable-http unless it is authenticated and behind https (spec §4, §5.4)."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
+from ratatoskr.auth.identity.local import password_hash_problem
 from ratatoskr.config.loader import ConfigError
 from ratatoskr.config.models import AuthSettings, RatatoskrConfig
 
@@ -4748,8 +4901,13 @@ def check_http_preconditions(config: RatatoskrConfig, *, insecure_dev: bool) -> 
     auth = config.auth
     if auth is None:
         raise ConfigError("transport 'streamable-http' requires an 'auth' section; HTTP never runs unauthenticated")
-    if auth.mode == "local" and (auth.local is None or not auth.local.users):
-        raise ConfigError("auth.mode 'local' requires at least one entry in auth.local.users")
+    if auth.mode == "local":
+        if auth.local is None or not auth.local.users:
+            raise ConfigError("auth.mode 'local' requires at least one entry in auth.local.users")
+        for user in auth.local.users:
+            problem = password_hash_problem(user)
+            if problem is not None:
+                raise ConfigError(problem)
     if auth.mode == "oidc" and auth.oidc is None:
         raise ConfigError("auth.mode 'oidc' requires the auth.oidc section")
     secret = server.secret_key.get_secret_value() if server.secret_key is not None else ""
@@ -4782,6 +4940,8 @@ def check_http_preconditions(config: RatatoskrConfig, *, insecure_dev: bool) -> 
 
 ```python
 """SDK settings derived from ``server.public_url``: OAuth metadata and DNS-rebinding protection."""
+
+from __future__ import annotations
 
 from urllib.parse import urlsplit
 
@@ -4842,7 +5002,8 @@ The e2e tests drive the real Starlette app returned by `build_http_app` through 
 not run lifespans, so `run_app` enters `app.router.lifespan_context` itself). `OAuthDriver` plays claude.ai: DCR,
 PKCE authorize, the browser form (parsing the CSRF field), `/token`, then raw MCP JSON-RPC (`initialize`,
 `notifications/initialized`, `tools/call`) with SSE response parsing. The tool used is 1a's `list_connections`,
-which reads configuration only (no database is contacted; the test DSNs point at `127.0.0.1:1`).
+which reads configuration only (no database is contacted; the test DSNs point at `127.0.0.1:1`); the driver
+also asserts the result is not an MCP error (`isError` false), since 1a reports tool failures that way.
 
 - [ ] **Step 1: Write the driver**
 
@@ -4891,6 +5052,7 @@ def sse_message(body: str) -> dict[str, Any]:
 
 
 def tool_text(message: dict[str, Any]) -> str:
+    assert message["result"].get("isError") is False, message
     return "\n".join(part["text"] for part in message["result"]["content"] if part["type"] == "text")
 
 
@@ -5305,6 +5467,8 @@ conftest).
 ```python
 """Browser leg of the authorization flow: ``/login`` (local form or OIDC redirect) and ``/oauth/callback``."""
 
+from __future__ import annotations
+
 import logging
 from collections.abc import Sequence
 
@@ -5521,6 +5685,8 @@ class LoginRoutes:
 ```python
 """``/healthz`` (process is up) and ``/readyz`` (state store accepts writes; backends are not checked)."""
 
+from __future__ import annotations
+
 import logging
 
 from mcp.server.fastmcp import FastMCP
@@ -5559,6 +5725,8 @@ class HealthRoutes:
 ```python
 """Per-IP rate limit on dynamic client registration (``POST /register``, spec §5.2 step 1)."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 
 from starlette.responses import JSONResponse
@@ -5595,7 +5763,9 @@ class RegistrationRateLimitMiddleware:
 
 - [ ] **Step 7: Implement the composition root**
 
-`src/ratatoskr/transport/app.py` (the only place that constructs `LogAuditSink`/`CompositeAuditSink`; see Task 0).
+`src/ratatoskr/transport/app.py` (the only place that constructs `LogAuditSink`/`CompositeAuditSink`). A local
+user whose `password_hash` is not argon2id is already refused by the preconditions; the `ValueError` conversion
+in `build_http_app` is defence in depth for callers that skip them.
 Shutdown order: the session manager exits first (no session can use a backend any more), then the registry is
 closed, then the cleanup task, the audit writer (flushes what the shutdown itself recorded), the upstream HTTP client
 and finally the store:
@@ -5607,6 +5777,8 @@ Ownership rule (shared with Plan 1a's ``build_app``): whoever creates the backen
 the FastMCP lifespan once per MCP session, so this module creates the registry, injects it into ``build_app`` (whose
 lifespan then never closes it) and closes it once, in the process-level Starlette lifespan.
 """
+
+from __future__ import annotations
 
 import logging
 import time
@@ -5627,6 +5799,7 @@ from ratatoskr.auth.ratelimit import LOGIN_RULE, REGISTER_RULE, RateLimiter
 from ratatoskr.auth.resolver import TokenPrincipalResolver
 from ratatoskr.auth.web import CALLBACK_PATH, LoginRoutes
 from ratatoskr.backends.registry import BackendRegistry
+from ratatoskr.config.loader import ConfigError
 from ratatoskr.config.models import RatatoskrConfig
 from ratatoskr.observability.audit import CompositeAuditSink, LogAuditSink
 from ratatoskr.observability.health import HealthRoutes
@@ -5676,7 +5849,10 @@ def build_http_app(
     local = None
     oidc = None
     if settings.auth.mode == "local" and settings.auth.local is not None:
-        local = LocalIdentityProvider(settings.auth.local.users)
+        try:
+            local = LocalIdentityProvider(settings.auth.local.users)
+        except ValueError as exc:  # message names the user, never the hash
+            raise ConfigError(str(exc)) from None
     if settings.auth.mode == "oidc" and settings.auth.oidc is not None:
         http_client = httpx.AsyncClient(timeout=UPSTREAM_HTTP_TIMEOUT_SECONDS, follow_redirects=False)
         oidc = OidcIdentityProvider(settings.auth.oidc, settings.public_url + CALLBACK_PATH, http_client, clock)
@@ -5746,7 +5922,7 @@ appear in 1a's table for permitted connections and to be absent otherwise (`Poli
 
 - [ ] **Step 9: Run the whole unit suite**
 
-Run: `.venv/Scripts/python -m pytest tests/unit -q`
+Run: `.venv/Scripts/python -m pytest -q`
 Expected: PASS.
 
 - [ ] **Step 10: Commit**
@@ -6060,21 +6236,26 @@ git commit -m "Add OIDC end-to-end tests: login, group refresh, offboarding, cal
 
 ---
 
-### Task 16: `serve` over streamable-HTTP and `ratatoskr hash-password`
+### Task 16: `serve` over streamable-HTTP, `check-config --insecure-dev`, `ratatoskr hash-password`
 
 **Files:**
 - Create: `src/ratatoskr/transport/serve.py`
-- Modify: `src/ratatoskr/cli.py` (functions `build_parser`, `_serve`, `main`; new helper `_serve_http`)
-- Modify: `tests/unit/test_cli.py` (delete `test_serve_refuses_http_transport_for_now`)
-- Test: `tests/unit/secure_http/test_cli_http.py`
+- Modify: `src/ratatoskr/cli.py` (complete file below)
+- Modify: `tests/unit/test_cli.py` (delete three tests about the removed refusal/note)
+- Test: `tests/unit/secure_http/test_cli_http.py`, `tests/unit/secure_http/test_transport_serve.py`
 
-The code below is written against Plan 1a's `cli.py` (Task 18 of the 1a plan: `resolve_config_path`,
-`build_parser`, `summarize`, `_check_config`, `_serve`, `main(argv) -> int`, `EXIT_CONFIG_ERROR = 2`,
-`load_config(path, *, insecure_dev=...)`, `setup_logging`). If 1a's final file differs, apply the same three changes:
-a `hash-password` sub-command dispatched before any config is loaded, and the `streamable-http` branch of `serve`
-calling `serve_http` instead of raising.
+`serve` keeps 1a's structure and exit codes: config errors exit 2 (now also the HTTP preconditions raised by
+`serve_http` before it binds), unexpected exceptions are logged through the redacting handler and exit 1, Ctrl-C
+exits 130. `check-config` takes `--insecure-dev` so that a config `serve --insecure-dev` accepts also validates
+there, and for streamable-http it runs the same preconditions as `serve` (including the argon2id check on local
+password hashes) and prints their warnings. `_serve_http` runs those preconditions itself before calling
+`serve_http`, so both commands fail with the same message and exit code 2 before anything binds. 1a's
+"streamable-http … not available" note disappears. uvicorn runs with `log_config=None`, and any handler already on
+the `uvicorn` loggers is removed, so its records go through the redacting root handler on stderr.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
+
+`tests/unit/secure_http/test_cli_http.py`:
 
 ```python
 from __future__ import annotations
@@ -6083,15 +6264,17 @@ import io
 import sys
 from pathlib import Path
 
+import pytest
 from argon2 import PasswordHasher
 
 import ratatoskr.cli
+from ratatoskr.cli import main
 
 CONFIG = """
 server:
   transport: streamable-http
-  public_url: https://mcp.example.com
-  host: 0.0.0.0
+  public_url: {public_url}
+  host: {host}
   state_path: {state}
   secret_key: ${{TEST_RATATOSKR_SECRET}}
 auth:
@@ -6110,9 +6293,38 @@ connections:
 """
 
 
+@pytest.fixture
+def write_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, password_hash: str):
+    monkeypatch.setenv("TEST_RATATOSKR_SECRET", "s" * 40)
+    monkeypatch.setenv("TEST_RATATOSKR_HASH", password_hash)
+    monkeypatch.setenv("TEST_RATATOSKR_DSN", "postgresql://u:p@127.0.0.1:1/db")
+
+    def write(public_url: str = "https://mcp.example.com", host: str = "0.0.0.0") -> str:
+        path = tmp_path / "config.yaml"
+        text = CONFIG.format(public_url=public_url, host=host, state=(tmp_path / "state.db").as_posix())
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    return write
+
+
+@pytest.fixture
+def served(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        ratatoskr.cli,
+        "serve_http",
+        lambda config, *, insecure_dev: calls.append((config.server.transport, insecure_dev)),
+    )
+    return calls
+
+
+# ── hash-password ───────────────────────────────────────────────────────────
+
+
 def test_hash_password_prints_an_argon2id_hash(monkeypatch, capsys) -> None:
     monkeypatch.setattr(sys, "stdin", io.StringIO("s3cret-pass\n"))
-    assert ratatoskr.cli.main(["hash-password"]) == 0
+    assert main(["hash-password"]) == 0
     printed = capsys.readouterr().out.strip()
     assert printed.startswith("$argon2id$")
     assert PasswordHasher().verify(printed, "s3cret-pass")
@@ -6120,82 +6332,265 @@ def test_hash_password_prints_an_argon2id_hash(monkeypatch, capsys) -> None:
 
 def test_hash_password_rejects_empty_input(monkeypatch, capsys) -> None:
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    assert ratatoskr.cli.main(["hash-password"]) == 1
+    assert main(["hash-password"]) == 1
     assert "empty" in capsys.readouterr().err
 
 
-def test_serve_dispatches_streamable_http(monkeypatch, tmp_path: Path, password_hash: str) -> None:
-    config_file = tmp_path / "config.yaml"
-    config_file.write_text(CONFIG.format(state=(tmp_path / "state.db").as_posix()), encoding="utf-8")
-    monkeypatch.setenv("TEST_RATATOSKR_SECRET", "s" * 40)
-    monkeypatch.setenv("TEST_RATATOSKR_HASH", password_hash)
-    monkeypatch.setenv("TEST_RATATOSKR_DSN", "postgresql://u:p@127.0.0.1:1/db")
-    calls: list[tuple[str, bool]] = []
-    monkeypatch.setattr(
-        ratatoskr.cli,
-        "serve_http",
-        lambda config, *, insecure_dev: calls.append((config.server.transport, insecure_dev)),
-    )
-    assert ratatoskr.cli.main(["serve", "--config", str(config_file)]) == 0
-    assert calls == [("streamable-http", False)]
+# ── serve ───────────────────────────────────────────────────────────────────
+
+
+def test_serve_dispatches_streamable_http(write_config, served) -> None:
+    assert main(["serve", "--config", write_config()]) == 0
+    assert served == [("streamable-http", False)]
+
+
+def test_serve_passes_insecure_dev_on_loopback(write_config, served) -> None:
+    path = write_config(public_url="http://127.0.0.1:8000", host="127.0.0.1")
+    assert main(["serve", "--config", path, "--insecure-dev"]) == 0
+    assert served == [("streamable-http", True)]
+
+
+def test_serve_reports_http_precondition_errors(write_config, capsys) -> None:
+    assert main(["serve", "--config", write_config(public_url="https://mcp.example.com/mcp")]) == 2
+    assert "no path" in capsys.readouterr().err
+
+
+def test_serve_fatal_error_is_logged_redacted(write_config, monkeypatch, capsys) -> None:
+    def explode(config, *, insecure_dev):
+        raise RuntimeError("could not reach postgresql://admin:hunter2@db.internal/app")
+
+    monkeypatch.setattr(ratatoskr.cli, "serve_http", explode)
+    assert main(["serve", "--config", write_config()]) == 1
+    err = capsys.readouterr().err
+    assert "fatal error" in err and "hunter2" not in err
+
+
+def test_serve_keyboard_interrupt_exits_130(write_config, monkeypatch) -> None:
+    def interrupt(config, *, insecure_dev):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ratatoskr.cli, "serve_http", interrupt)
+    assert main(["serve", "--config", write_config()]) == 130
+
+
+# ── check-config ────────────────────────────────────────────────────────────
+
+
+def test_check_config_accepts_http_without_a_transport_note(write_config, capsys) -> None:
+    assert main(["check-config", "--config", write_config()]) == 0
+    out = capsys.readouterr().out
+    assert "Config OK" in out and "transport: streamable-http" in out
+    assert "not available" not in out and "Warning" not in out
+
+
+def test_check_config_takes_insecure_dev_like_serve(write_config, capsys) -> None:
+    path = write_config(public_url="http://127.0.0.1:8000", host="127.0.0.1")
+    assert main(["check-config", "--config", path]) == 2
+    assert "must use https" in capsys.readouterr().err
+    assert main(["check-config", "--config", path, "--insecure-dev"]) == 0
+    assert "Warning: INSECURE DEV MODE" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("command", ["check-config", "serve"])
+@pytest.mark.parametrize("stored", ["not-a-hash", "$argon2id$garbage"])
+def test_invalid_local_password_hash_is_a_config_error(write_config, monkeypatch, capsys, served, command, stored):
+    monkeypatch.setenv("TEST_RATATOSKR_HASH", stored)
+    assert main([command, "--config", write_config()]) == 2
+    err = capsys.readouterr().err
+    assert "auth.local user 'kerem': password_hash must be an argon2id hash" in err
+    assert stored.split("$")[-1] not in err
+    assert served == []
+
+
+def test_check_config_applies_the_http_preconditions(write_config, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("TEST_RATATOSKR_SECRET", "too-short")
+    assert main(["check-config", "--config", write_config()]) == 2
+    err = capsys.readouterr().err
+    assert "at least 32 characters" in err and "too-short" not in err
 ```
 
-- [ ] **Step 2: Run it**
+`tests/unit/secure_http/test_transport_serve.py`:
 
-Run: `.venv/Scripts/python -m pytest tests/unit/secure_http/test_cli_http.py -q`
-Expected: FAIL — `SystemExit: 2` from argparse (`invalid choice: 'hash-password'`) in the two hash-password tests;
-the serve test fails because `ratatoskr.cli` has no attribute `serve_http` (monkeypatch raises `AttributeError`).
+```python
+from __future__ import annotations
+
+import io
+import logging
+
+import pytest
+import uvicorn
+from starlette.applications import Starlette
+
+from ratatoskr.observability.logging import setup_logging
+from ratatoskr.transport import serve as serve_module
+from ratatoskr.transport.serve import UVICORN_LOGGERS, uvicorn_config
+
+
+@pytest.fixture
+def clean_uvicorn_loggers():
+    yield
+    for name in (*UVICORN_LOGGERS, "uvicorn.access"):
+        named = logging.getLogger(name)
+        for handler in list(named.handlers):
+            named.removeHandler(handler)
+        named.propagate = True
+    logging.getLogger("aiosqlite").setLevel(logging.NOTSET)
+
+
+def test_uvicorn_logs_go_through_the_redacting_root_handler(make_config, clean_uvicorn_loggers) -> None:
+    stream = io.StringIO()
+    setup_logging("INFO", stream=stream)
+    # What uvicorn's default LOGGING_CONFIG (or an earlier uvicorn.run) leaves behind: own handler, no propagation.
+    bypass = io.StringIO()
+    logging.getLogger("uvicorn.error").addHandler(logging.StreamHandler(bypass))
+    logging.getLogger("uvicorn").propagate = False
+
+    config = uvicorn_config(Starlette(), make_config().server)
+
+    assert config.log_config is None and config.access_log is False and config.proxy_headers is False
+    for name in UVICORN_LOGGERS:
+        assert logging.getLogger(name).handlers == [] and logging.getLogger(name).propagate
+    assert not logging.getLogger("uvicorn.access").hasHandlers()
+    logging.getLogger("uvicorn.error").error("connect to postgresql://admin:hunter2@db.internal/app failed")
+    out = stream.getvalue()
+    assert '"logger": "uvicorn.error"' in out
+    assert "postgresql://***" in out and "hunter2" not in out
+    assert bypass.getvalue() == ""
+
+
+def test_serve_http_runs_uvicorn_with_that_config(make_config, monkeypatch, clean_uvicorn_loggers) -> None:
+    seen: list[uvicorn.Config] = []
+    monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: seen.append(self.config))
+    config = make_config(server_extra={"port": 8123})
+    serve_module.serve_http(config, insecure_dev=False)
+    assert len(seen) == 1
+    assert (seen[0].host, seen[0].port, seen[0].log_config, seen[0].access_log) == ("0.0.0.0", 8123, None, False)
+    assert isinstance(seen[0].app, Starlette)
+    assert logging.getLogger("aiosqlite").level == logging.INFO
+```
+
+- [ ] **Step 2: Run them**
+
+Run: `.venv/Scripts/python -m pytest tests/unit/secure_http/test_cli_http.py tests/unit/secure_http/test_transport_serve.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'ratatoskr.transport.serve'` (test_transport_serve);
+argparse `SystemExit: 2` (`invalid choice: 'hash-password'`); the serve tests fail because `ratatoskr.cli` has no
+attribute `serve_http`, and the check-config tests on `--insecure-dev`.
 
 - [ ] **Step 3: Implement `serve_http`**
 
 `src/ratatoskr/transport/serve.py`:
 
 ```python
-"""Run the streamable-http app under uvicorn."""
+"""Run the streamable-http app under uvicorn, with every log line going through Ratatoskr's redacting handler."""
+
+from __future__ import annotations
 
 import logging
 
 import uvicorn
+from starlette.types import ASGIApp
 
-from ratatoskr.config.models import RatatoskrConfig
+from ratatoskr.config.models import RatatoskrConfig, ServerSettings
 from ratatoskr.transport.app import build_http_app
 
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.asgi")
 
-def serve_http(config: RatatoskrConfig, *, insecure_dev: bool) -> None:
-    """Build the app and block until shutdown.
 
-    ``proxy_headers=False``: uvicorn must not rewrite the client address; ``transport.client_ip`` applies
-    ``server.trusted_proxies`` itself. ``access_log=False``: request lines carry ``/login?request=…`` and
-    ``/oauth/callback?code=…`` values that must not reach logs. ``log_config=None`` keeps Ratatoskr's logging.
-    aiosqlite logs every statement with its parameters at DEBUG, so it is capped at INFO.
+def route_uvicorn_logs_to_root() -> None:
+    """Drop handlers uvicorn (or an earlier ``uvicorn.run``) installed so its records reach the root JSON handler.
+
+    ``setup_logging`` puts the only handler, which redacts, on the root logger. uvicorn's default
+    ``LOGGING_CONFIG`` would give ``uvicorn``/``uvicorn.access`` their own plain handlers with ``propagate=False``,
+    bypassing that redaction.
     """
-    http_app = build_http_app(config, insecure_dev=insecure_dev)
-    logging.getLogger("aiosqlite").setLevel(logging.INFO)
-    uvicorn.run(
-        http_app.asgi,
-        host=config.server.host,
-        port=config.server.port,
+    for name in UVICORN_LOGGERS:
+        uvicorn_logger = logging.getLogger(name)
+        for handler in list(uvicorn_logger.handlers):
+            uvicorn_logger.removeHandler(handler)
+        uvicorn_logger.propagate = True
+
+
+def uvicorn_config(app: ASGIApp, server: ServerSettings) -> uvicorn.Config:
+    """``log_config=None``: uvicorn installs no logging config of its own.
+
+    ``access_log=False``: request lines carry ``/login?request=…`` and ``/oauth/callback?code=…`` values that must
+    not reach logs (uvicorn then also empties ``uvicorn.access`` and stops it propagating). ``proxy_headers=False``:
+    uvicorn must not rewrite the client address; ``transport.client_ip`` applies ``server.trusted_proxies`` itself.
+    """
+    config = uvicorn.Config(
+        app,
+        host=server.host,
+        port=server.port,
         proxy_headers=False,
         server_header=False,
         access_log=False,
         log_config=None,
         lifespan="on",
     )
+    route_uvicorn_logs_to_root()
+    return config
+
+
+def serve_http(config: RatatoskrConfig, *, insecure_dev: bool) -> None:
+    """Build the app and block until shutdown. Raises ``ConfigError`` before binding when the config is unfit.
+
+    aiosqlite logs every statement with its parameters at DEBUG, so it is capped at INFO.
+    """
+    http_app = build_http_app(config, insecure_dev=insecure_dev)
+    logging.getLogger("aiosqlite").setLevel(logging.INFO)
+    uvicorn.Server(uvicorn_config(http_app.asgi, config.server)).run()
 ```
 
-- [ ] **Step 4: Wire the CLI**
+- [ ] **Step 4: Replace `src/ratatoskr/cli.py`**
 
-In `src/ratatoskr/cli.py` add these imports (ruff sorts them):
+Compared with 1a: two imports for the new commands plus `check_http_preconditions`; `HTTP_NOT_AVAILABLE_NOTE` is
+gone; `build_parser` gains `check-config --insecure-dev` and `hash-password`; `_check_config` loads with
+`insecure_dev` and runs the HTTP preconditions; `_serve` hands streamable-http to the new `_serve_http`; `main`
+dispatches `hash-password` before any config is read. `resolve_config_path`, `summarize` and the stdio path are 1a's
+code unchanged.
 
 ```python
+"""Command line: ``ratatoskr serve``, ``ratatoskr check-config`` and ``ratatoskr hash-password``."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+from ratatoskr import __version__
+from ratatoskr.app import build_app
 from ratatoskr.auth.password_cli import run_hash_password
+from ratatoskr.auth.resolver import StdioPrincipalResolver
+from ratatoskr.config.loader import ConfigError, load_config
+from ratatoskr.config.models import RatatoskrConfig
+from ratatoskr.observability.audit import LogAuditSink
+from ratatoskr.observability.logging import setup_logging
+from ratatoskr.transport.preconditions import check_http_preconditions
 from ratatoskr.transport.serve import serve_http
-```
 
-Replace `build_parser`, `_serve` and `main`, and add `_serve_http`, exactly as follows (`resolve_config_path`,
-`summarize` and `_check_config` stay as 1a wrote them):
+DEFAULT_CONFIG_PATH = Path("/config/config.yaml")
+CONFIG_ENV_VAR = "RATATOSKR_CONFIG"
+EXIT_UNEXPECTED_ERROR = 1
+EXIT_CONFIG_ERROR = 2
+EXIT_INTERRUPTED = 130
 
-```python
+logger = logging.getLogger("ratatoskr.cli")
+
+
+def resolve_config_path(argument: str | None, env: Mapping[str, str] | None = None) -> Path:
+    """--config wins, then RATATOSKR_CONFIG, then /config/config.yaml."""
+    environment = os.environ if env is None else env
+    if argument:
+        return Path(argument)
+    if environment.get(CONFIG_ENV_VAR):
+        return Path(environment[CONFIG_ENV_VAR])
+    return DEFAULT_CONFIG_PATH
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ratatoskr", description="Ratatoskr MCP server")
     parser.add_argument("--version", action="version", version=f"ratatoskr {__version__}")
@@ -6207,19 +6602,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check = commands.add_parser("check-config", help="validate the config file and print a summary")
     check.add_argument("--config", help=f"config file (default: ${CONFIG_ENV_VAR} or {DEFAULT_CONFIG_PATH})")
+    check.add_argument(
+        "--insecure-dev", action="store_true", help="validate as `serve --insecure-dev` would (local testing only)"
+    )
     commands.add_parser(
         "hash-password", help="read a password (prompted twice, or one line from stdin) and print its argon2id hash"
     )
     return parser
 
 
-def _serve_http(config: RatatoskrConfig, *, insecure_dev: bool) -> int:
-    logger.info("starting ratatoskr %s over streamable-http at %s", __version__, config.server.public_url)
+def summarize(config: RatatoskrConfig) -> str:
+    """A secret-free overview of the configuration."""
+    server = config.server
+    lines = [f"transport: {server.transport}"]
+    if server.transport == "stdio":
+        lines.append(f"stdio_role: {server.stdio_role or '(not set: the stdio user cannot see any connection)'}")
+    lines.append(f"auth: {config.auth.mode if config.auth else 'none'}")
+    lines.append(f"roles ({len(config.roles)}): {', '.join(sorted(config.roles)) or '-'}")
+    lines.append(f"connections ({len(config.connections)}):")
+    for name in sorted(config.connections):
+        connection = config.connections[name]
+        description = f"  {connection.description}" if connection.description else ""
+        separate = ""
+        if connection.mode == "write":
+            separate = f", separate write role: {'yes' if connection.write_dsn is not None else 'no'}"
+        lines.append(f"  - {name}: {connection.kind}, mode={connection.mode}{separate}{description}")
+    return "\n".join(lines)
+
+
+def _check_config(args: argparse.Namespace) -> int:
+    path = resolve_config_path(args.config)
     try:
-        serve_http(config, insecure_dev=insecure_dev)
+        config = load_config(path, insecure_dev=args.insecure_dev)
+        warnings: tuple[str, ...] = ()
+        if config.server.transport == "streamable-http":
+            warnings = check_http_preconditions(config, insecure_dev=args.insecure_dev).warnings
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+    except Exception as exc:
+        # Unexpected: its message may carry config values, so only the class name is shown.
+        print(f"Unexpected error while checking the config: {type(exc).__name__}", file=sys.stderr)
+        return EXIT_UNEXPECTED_ERROR
+    print(f"Config OK: {path}")
+    print(summarize(config))
+    for warning in warnings:
+        print(f"Warning: {warning}")
     return 0
 
 
@@ -6235,9 +6663,33 @@ def _serve(args: argparse.Namespace) -> int:
         return _serve_http(config, insecure_dev=args.insecure_dev)
     if config.server.stdio_role is None:
         logger.warning("server.stdio_role is not set: the stdio user cannot see any connection")
-    app = build_app(config, resolver=StdioPrincipalResolver(config.server.stdio_role), audit=LogAuditSink())
-    logger.info("starting ratatoskr %s over stdio with %d connection(s)", __version__, len(config.connections))
-    app.run(transport="stdio")
+    try:
+        app = build_app(config, resolver=StdioPrincipalResolver(config.server.stdio_role), audit=LogAuditSink())
+        logger.info("starting ratatoskr %s over stdio with %d connection(s)", __version__, len(config.connections))
+        app.run(transport="stdio")
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+    except Exception:
+        # Through the redacting JSON handler: a raw traceback on stderr could carry a DSN or password.
+        logger.exception("fatal error")
+        return EXIT_UNEXPECTED_ERROR
+    return 0
+
+
+def _serve_http(config: RatatoskrConfig, *, insecure_dev: bool) -> int:
+    try:
+        check_http_preconditions(config, insecure_dev=insecure_dev)  # same checks and messages as check-config
+        logger.info("starting ratatoskr %s over streamable-http at %s", __version__, config.server.public_url)
+        serve_http(config, insecure_dev=insecure_dev)
+    except ConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+    except Exception:
+        # Through the redacting JSON handler: a raw traceback on stderr could carry a DSN or password.
+        logger.exception("fatal error")
+        return EXIT_UNEXPECTED_ERROR
     return 0
 
 
@@ -6250,17 +6702,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _serve(args)
 ```
 
-Also update the module docstring to ``Command line: ``ratatoskr serve``, ``check-config`` and ``hash-password``.``
+- [ ] **Step 5: Retire 1a's tests for the removed behaviour**
 
-- [ ] **Step 5: Retire 1a's "HTTP is refused" test**
+Delete these three functions from `tests/unit/test_cli.py`; `test_cli_http.py` covers the new behaviour:
 
-Delete `test_serve_refuses_http_transport_for_now` from `tests/unit/test_cli.py`; it asserts the refusal that step 4
-removes and is superseded by `test_serve_dispatches_streamable_http`. Keep `test_serve_validates_http_rules_first`
-(config validation still runs first and still exits 2 on an http `public_url`).
+- `test_check_config_accepts_http_but_says_serve_will_refuse_it` (the note no longer exists; replaced by
+  `test_check_config_accepts_http_without_a_transport_note`)
+- `test_check_config_stdio_has_no_transport_note` (the note no longer exists)
+- `test_serve_refuses_http_transport_for_now` (replaced by `test_serve_dispatches_streamable_http`)
+
+Then give `HTTP_CONFIG` a real argon2id hash, since `password_hash: x` is now a config error. Insert the constant
+above `HTTP_CONFIG` and replace the hash line and the end of the literal (the hash is precomputed: argon2id of
+`test-password`; any valid argon2id hash works):
+
+```python
+# argon2id hash of "test-password": serve and check-config reject anything that is not a valid argon2id hash.
+TEST_PASSWORD_HASH = "$argon2id$v=19$m=65536,t=3,p=4$vqjtPycf4eCOEVef7XA3Mw$0+yulBFTphKjBkP93QxBsGWmg2Gtx6xSnkaEDxhPAgs"
+```
+
+```python
+      - username: kerem
+        password_hash: '{password_hash}'
+connections:
+  main:
+    kind: postgres
+    dsn: ${MAIN_DSN}
+""".replace("{password_hash}", TEST_PASSWORD_HASH)
+```
+
+(`replace`, not an f-string, because the literal also holds `${SECRET}` / `${MAIN_DSN}` references.) Keep
+`test_serve_validates_http_rules_first` and the rest of the file unchanged. `tests/unit/test_config_models.py` keeps
+its `"password_hash": "x"`: model validation never checks the hash format, only the HTTP preconditions do.
 
 - [ ] **Step 6: Run everything touched**
 
-Run: `.venv/Scripts/python -m pytest tests/unit -q && .venv/Scripts/python -m ruff check --fix src tests && .venv/Scripts/python -m mypy src`
+Run: `.venv/Scripts/python -m pytest -q && .venv/Scripts/python -m ruff check src tests && .venv/Scripts/python -m mypy src`
 Expected: PASS.
 
 - [ ] **Step 7: Manual smoke test (optional but recommended)**
@@ -6295,14 +6771,16 @@ sleep 4; curl -s http://127.0.0.1:8765/healthz; curl -s http://127.0.0.1:8765/re
 kill "$SERVER_PID"; rm -rf .tmp-smoke
 ```
 
-Expected: the log shows the `INSECURE DEV MODE` warning; `{"status":"ok"}`, `{"status":"ready"}`, `401`. Without
-`--insecure-dev` the same command exits with the `ConfigError` "server.public_url must use https".
+Expected: stderr shows JSON log lines (including uvicorn's startup lines) and the `INSECURE DEV MODE` warning;
+`{"status":"ok"}`, `{"status":"ready"}`, `401`. Without `--insecure-dev` the same command exits 2 with
+"server.public_url must use https"; `ratatoskr check-config --config .tmp-smoke/config.yaml --insecure-dev`
+prints `Config OK` and the warning.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/ratatoskr/transport/serve.py src/ratatoskr/cli.py tests/unit/test_cli.py tests/unit/secure_http/test_cli_http.py
-git commit -m "Serve streamable-HTTP from the CLI and add ratatoskr hash-password" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add src/ratatoskr/transport/serve.py src/ratatoskr/cli.py tests/unit/test_cli.py tests/unit/secure_http/test_cli_http.py tests/unit/secure_http/test_transport_serve.py
+git commit -m "Serve streamable-HTTP from the CLI, add hash-password and check-config --insecure-dev" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -6319,7 +6797,7 @@ stage copies only that venv, runs as uid/gid 10001, writes only to `/data` (SQLi
 file system. `HEALTHCHECK` calls `/healthz` on port 8000 (keep `server.port: 8000` in containers). Compose, Caddy,
 CI and `/metrics` are stage 4.
 
-- [ ] **Step 1: Replace `Dockerfile`**
+- [ ] **Step 1: Create `Dockerfile`**
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -6403,7 +6881,7 @@ image with `--read-only -v ratatoskr-data:/data -v "$PWD/config.yaml:/config/con
 
 ```bash
 git add Dockerfile .dockerignore
-git commit -m "Rewrite Dockerfile: multi-stage, non-root uid 10001, read-only root, healthcheck" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "Add Dockerfile: multi-stage, non-root uid 10001, read-only root, healthcheck" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -6542,14 +7020,15 @@ git commit -m "Add Authentik setup guide and manual verification checklist" -m "
 
 - [ ] **Step 1: Full gate**
 
-Run: `.venv/Scripts/python -m pytest tests/unit -q && .venv/Scripts/python -m ruff check src tests && .venv/Scripts/python -m mypy src`
-Expected: PASS. The 1b tests add 183 tests and ~15 s (argon2 and RSA key generation dominate; the RSA keys are
+Run: `.venv/Scripts/python -m pytest -q && .venv/Scripts/python -m ruff check src tests && .venv/Scripts/python -m mypy src`
+Expected: PASS — `703 passed, 143 deselected` (1a's 505 minus the 3 retired CLI tests, plus
+201 1b tests; about 15 s more, dominated by argon2 and RSA key generation, the RSA keys being
 session-scoped).
 
 - [ ] **Step 2: Integration suite still green (Docker)**
 
 Run: `.venv/Scripts/python -m pytest -m integration -q`
-Expected: PASS (1a's PostgreSQL tests; 1b adds none).
+Expected: `143 passed` (1a's PostgreSQL tests; 1b adds none).
 
 - [ ] **Step 3: Spec cross-check**
 
