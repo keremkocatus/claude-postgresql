@@ -1,9 +1,16 @@
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+from ratatoskr import cli
 from ratatoskr.cli import DEFAULT_CONFIG_PATH, main, resolve_config_path
 
 STDIO_CONFIG = """
@@ -145,3 +152,133 @@ def test_serve_runs_stdio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(FastMCP, "run", fake_run)
     assert main(["serve", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 0
     assert calls == ["stdio"]
+
+
+LEAKY_DSN = "postgresql://dbuser:leak-pass-4417@db.internal/app"
+
+
+def test_serve_unexpected_error_is_logged_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
+
+    def failing_build_app(*args: Any, **kwargs: Any) -> FastMCP[Any]:
+        raise RuntimeError(f"cannot start with {LEAKY_DSN}")
+
+    monkeypatch.setattr(cli, "build_app", failing_build_app)
+    assert main(["serve", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 1
+    captured = capsys.readouterr()
+    assert "leak-pass-4417" not in captured.out + captured.err
+    assert "fatal error" in captured.err
+
+
+def test_serve_keyboard_interrupt_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
+
+    def interrupted_run(self: FastMCP[Any], transport: str = "stdio", mount_path: str | None = None) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FastMCP, "run", interrupted_run)
+    assert main(["serve", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 130
+
+
+def test_check_config_unexpected_error_prints_only_the_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def failing_load_config(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError(f"cannot read {LEAKY_DSN}")
+
+    monkeypatch.setattr(cli, "load_config", failing_load_config)
+    assert main(["check-config", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 1
+    captured = capsys.readouterr()
+    assert "RuntimeError" in captured.err
+    assert "leak-pass-4417" not in captured.out + captured.err
+    assert "db.internal" not in captured.out + captured.err
+
+
+def _read_message(lines: queue.Queue[str | None], timeout: float) -> dict[str, Any]:
+    line = lines.get(timeout=timeout)
+    assert line is not None, "server closed stdout early"
+    message = json.loads(line)
+    assert isinstance(message, dict)
+    assert message.get("jsonrpc") == "2.0"
+    return message
+
+
+def test_serve_stdio_subprocess_speaks_json_rpc_without_leaking(tmp_path: Path) -> None:
+    """Real process over stdio; the DSN points at a closed local port and is never opened."""
+    password = "subproc-pass-9182"
+    config = STDIO_CONFIG.replace("${MAIN_DSN}", f"postgresql://app:{password}@127.0.0.1:1/app")
+    path = _write(tmp_path, config)
+    env = {key: value for key, value in os.environ.items() if key != "RATATOSKR_CONFIG"}
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ratatoskr", "serve", "--config", str(path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    lines: queue.Queue[str | None] = queue.Queue()
+    stdout_lines: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def pump_stdout() -> None:
+        assert process.stdout is not None
+        for raw in process.stdout:
+            stdout_lines.append(raw)
+            lines.put(raw)
+        lines.put(None)
+
+    def pump_stderr() -> None:
+        assert process.stderr is not None
+        stderr_chunks.append(process.stderr.read())
+
+    threads = [threading.Thread(target=pump_stdout, daemon=True), threading.Thread(target=pump_stderr, daemon=True)]
+    for thread in threads:
+        thread.start()
+
+    def send(message: dict[str, Any]) -> None:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                },
+            }
+        )
+        assert _read_message(lines, 30)["id"] == 1
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        tools = _read_message(lines, 30)
+        assert tools["id"] == 2
+        assert len(tools["result"]["tools"]) == 11
+        send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_connections"}})
+        called = _read_message(lines, 30)
+        assert called["id"] == 3
+        assert "| main | postgres |" in called["result"]["content"][0]["text"]
+        process.stdin.close()
+        assert process.wait(timeout=30) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+    for thread in threads:
+        thread.join(timeout=10)
+
+    for raw in stdout_lines:
+        if raw.strip():
+            assert json.loads(raw)["jsonrpc"] == "2.0"
+    output = "".join(stdout_lines) + "".join(stderr_chunks)
+    assert password not in output

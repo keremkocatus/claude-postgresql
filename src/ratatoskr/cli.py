@@ -19,7 +19,9 @@ from ratatoskr.observability.logging import setup_logging
 
 DEFAULT_CONFIG_PATH = Path("/config/config.yaml")
 CONFIG_ENV_VAR = "RATATOSKR_CONFIG"
+EXIT_UNEXPECTED_ERROR = 1
 EXIT_CONFIG_ERROR = 2
+EXIT_INTERRUPTED = 130
 
 logger = logging.getLogger("ratatoskr.cli")
 
@@ -71,6 +73,10 @@ def _check_config(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+    except Exception as exc:
+        # Unexpected: its message may carry config values, so only the class name is shown.
+        print(f"Unexpected error while checking the config: {type(exc).__name__}", file=sys.stderr)
+        return EXIT_UNEXPECTED_ERROR
     print(f"Config OK: {path}")
     print(summarize(config))
     return 0
@@ -91,9 +97,16 @@ def _serve(args: argparse.Namespace) -> int:
     setup_logging(config.server.log_level)
     if config.server.stdio_role is None:
         logger.warning("server.stdio_role is not set: the stdio user cannot see any connection")
-    app = build_app(config, resolver=StdioPrincipalResolver(config.server.stdio_role), audit=LogAuditSink())
-    logger.info("starting ratatoskr %s over stdio with %d connection(s)", __version__, len(config.connections))
-    app.run(transport="stdio")
+    try:
+        app = build_app(config, resolver=StdioPrincipalResolver(config.server.stdio_role), audit=LogAuditSink())
+        logger.info("starting ratatoskr %s over stdio with %d connection(s)", __version__, len(config.connections))
+        app.run(transport="stdio")
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+    except Exception:
+        # Through the redacting JSON handler: a raw traceback on stderr could carry a DSN or password.
+        logger.exception("fatal error")
+        return EXIT_UNEXPECTED_ERROR
     return 0
 
 

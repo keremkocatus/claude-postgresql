@@ -1,5 +1,6 @@
 from typing import Any
 
+import pytest
 from mcp.server.fastmcp import FastMCP
 
 from ratatoskr.app import build_app
@@ -48,6 +49,22 @@ class _ClosingRegistry(BackendRegistry):
     async def close_all(self) -> None:
         self.closed += 1
         await super().close_all()
+
+
+async def test_owned_registry_is_closed_once_when_lifespan_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[BackendRegistry] = []
+    original = BackendRegistry.close_all
+
+    async def counting_close_all(self: BackendRegistry) -> None:
+        closed.append(self)
+        await original(self)
+
+    monkeypatch.setattr(BackendRegistry, "close_all", counting_close_all)
+    app = _app()
+    assert app.settings.lifespan is not None
+    async with app.settings.lifespan(app) as state:
+        assert closed == []
+    assert closed == [state.registry]
 
 
 async def test_injected_registry_is_not_closed_by_session_lifespan() -> None:
