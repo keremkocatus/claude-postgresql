@@ -17,6 +17,7 @@ from ratatoskr.auth.crypto import pkce_challenge
 from ratatoskr.auth.identity.base import IdentityError, UpstreamRejectedError, UpstreamUnavailableError
 from ratatoskr.auth.identity.oidc import (
     JWKS_MAX_AGE_SECONDS,
+    JWKS_MAX_STALE_SECONDS,
     JWKS_REFRESH_COOLDOWN_SECONDS,
     MAX_RESPONSE_BYTES,
     OidcIdentityProvider,
@@ -614,3 +615,40 @@ async def test_token_without_kid_is_rejected_when_several_keys_are_published(
     with pytest.raises(IdentityError, match="signature") as info:
         await oidc.complete("c", VERIFIER, "nn")
     assert not isinstance(info.value, UpstreamUnavailableError)
+
+
+# ── staleness cap and discovery policy errors during refresh ──
+
+
+async def test_cached_jwks_older_than_the_cap_is_not_served(oidc, fake_issuer, clock) -> None:
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    await oidc.complete("c", VERIFIER, "nn")
+    fake_issuer.router.get(fake_issuer.jwks_uri).mock(return_value=httpx.Response(429))
+    clock.advance(JWKS_MAX_STALE_SECONDS - 120)
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    assert (await oidc.complete("c", VERIFIER, "nn")).principal.subject == "alice@example.com"
+    clock.advance(240)  # past the cap, and past the refetch backoff
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    with pytest.raises(UpstreamUnavailableError, match="JWKS"):
+        await oidc.complete("c", VERIFIER, "nn")
+    clock.advance(1)  # also while the refetch backoff is running
+    fake_issuer.queue_token_response(id_token=fake_issuer.id_token(nonce="nn"))
+    with pytest.raises(UpstreamUnavailableError, match="JWKS"):
+        await oidc.complete("c", VERIFIER, "nn")
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"issuer": "https://attacker.example.com/"}, {"token_endpoint": "http://idp.example.com/token/"}],
+)
+async def test_discovery_policy_errors_pause_refresh_but_block_login(oidc, fake_issuer, change) -> None:
+    fake_issuer.discovery.update(change)
+    with pytest.raises(UpstreamUnavailableError):
+        await oidc.refresh("up-1")
+    with pytest.raises(IdentityError) as info:
+        await oidc.complete("c", VERIFIER, "nn")
+    assert not isinstance(info.value, UpstreamUnavailableError)
+    with pytest.raises(IdentityError) as info:
+        await oidc.authorization_url("st", "nn", VERIFIER)
+    assert not isinstance(info.value, UpstreamUnavailableError)
+    assert fake_issuer.token_requests == []

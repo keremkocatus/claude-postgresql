@@ -223,6 +223,33 @@ def test_default_parameters_are_not_weak(password_hash: str) -> None:
     assert password_hash_weakness(LocalUser(username="kerem", password_hash=SecretStr(password_hash))) is None
 
 
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        # The OWASP password storage cheat sheet's equivalent argon2id settings (all p=1) ...
+        "m=47104,t=1,p=1",
+        "m=19456,t=2,p=1",
+        "m=12288,t=3,p=1",
+        "m=9216,t=4,p=1",
+        "m=7168,t=5,p=1",
+        # ... and anything at least as expensive in both memory and iterations.
+        "m=65536,t=1,p=4",
+        "m=12288,t=4,p=2",
+    ],
+)
+def test_owasp_equivalent_parameters_are_not_weak(password_hash: str, parameters: str) -> None:
+    user = LocalUser(username="kerem", password_hash=SecretStr(_with_parameters(password_hash, parameters)))
+    assert password_hash_weakness(user) is None
+
+
+@pytest.mark.parametrize("parameters", ["m=46080,t=1,p=1", "m=19456,t=1,p=1", "m=9216,t=3,p=1", "m=7168,t=4,p=1"])
+def test_parameters_below_every_owasp_option_are_weak(password_hash: str, parameters: str) -> None:
+    stored = _with_parameters(password_hash, parameters)
+    message = password_hash_weakness(LocalUser(username="kerem", password_hash=SecretStr(stored)))
+    assert message is not None and "OWASP" in message and "kerem" in message
+    assert stored not in message
+
+
 def test_users_with_different_argon2_parameters_are_refused(password_hash: str) -> None:
     """Different costs would let response time tell configured usernames apart from unknown ones."""
     cheap = PasswordHasher(time_cost=2, memory_cost=19456, parallelism=1).hash("pw")
@@ -306,10 +333,16 @@ def test_hash_password_command_rejects_mismatch_and_empty() -> None:
 
 def test_hash_password_command_reads_piped_bytes_as_utf8_without_bom() -> None:
     """A pipe on Windows has a legacy text encoding; the bytes are UTF-8 (possibly with a BOM) all the same."""
-    piped = io.TextIOWrapper(io.BytesIO("﻿pässwörd\r\n".encode()), encoding="cp1252")
+    piped = io.TextIOWrapper(io.BytesIO("\ufeffpässwörd\r\n".encode()), encoding="cp1252")
     out = io.StringIO()
     assert run_hash_password(piped, out, io.StringIO()) == 0
     assert PasswordHasher().verify(out.getvalue().strip(), "pässwörd")
+
+
+def test_hash_password_help_points_powershell_users_to_the_prompt() -> None:
+    from ratatoskr.auth.password_cli import DESCRIPTION
+
+    assert "PowerShell 5.1" in DESCRIPTION and "prompt" in DESCRIPTION
 
 
 def test_hash_password_command_rejects_undecodable_input() -> None:

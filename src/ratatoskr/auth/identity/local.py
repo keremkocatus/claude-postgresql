@@ -35,9 +35,9 @@ _PHC_ARGON2ID = re.compile(r"\$argon2id\$v=19\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]{
 MAX_TIME_COST = 10
 MAX_PARALLELISM = 16
 MAX_MEMORY_COST_KIB = 262144
-# OWASP password storage cheat sheet minimum for argon2id; weaker hashes are accepted with a warning.
-OWASP_MIN_MEMORY_COST_KIB = 19456
-OWASP_MIN_TIME_COST = 2
+# OWASP password storage cheat sheet: equivalent argon2id settings (memory KiB, iterations), all with p=1. A hash
+# cheaper than every one of them is accepted with a warning.
+OWASP_ARGON2ID_OPTIONS: tuple[tuple[int, int], ...] = ((47104, 1), (19456, 2), (12288, 3), (9216, 4), (7168, 5))
 MAX_CONCURRENT_VERIFICATIONS = 4
 _VERIFY_POOL = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_VERIFICATIONS, thread_name_prefix="argon2")
 
@@ -91,17 +91,22 @@ def password_hash_problem(user: LocalUser) -> str | None:
 
 
 def password_hash_weakness(user: LocalUser) -> str | None:
-    """A warning when a usable hash is below the OWASP minimum (m >= 19456 KiB, t >= 2), else ``None``."""
+    """A warning when a usable hash is cheaper than every OWASP-recommended argon2id setting, else ``None``.
+
+    A hash is fine when its memory and its iterations are both at least those of one entry of
+    :data:`OWASP_ARGON2ID_OPTIONS` (parallelism does not make a guess cheaper, so it is not compared).
+    """
     parameters = _parameters(user)
     if parameters is None:
         return None
-    if parameters.memory_cost < OWASP_MIN_MEMORY_COST_KIB or parameters.time_cost < OWASP_MIN_TIME_COST:
-        return (
-            f"auth.local user {user.username!r}: password_hash is weaker than the OWASP minimum"
-            f" (m={OWASP_MIN_MEMORY_COST_KIB} KiB, t={OWASP_MIN_TIME_COST});"
-            " regenerate it with `ratatoskr hash-password`"
-        )
-    return None
+    m, t = parameters.memory_cost, parameters.time_cost
+    if any(m >= min_m and t >= min_t for min_m, min_t in OWASP_ARGON2ID_OPTIONS):
+        return None
+    return (
+        f"auth.local user {user.username!r}: password_hash uses cheaper argon2id settings than the OWASP"
+        " recommendations (for example m=19456 KiB with t=2, or m=47104 KiB with t=1);"
+        " regenerate it with `ratatoskr hash-password`"
+    )
 
 
 def _verify(password_hash: str, password: str) -> bool:

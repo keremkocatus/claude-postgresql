@@ -8,16 +8,18 @@ headers (``jku``, ``x5u``) are never fetched.
 Upstream hardening: the issuer and every endpoint from discovery must be https (unless ``allow_insecure_http``, for
 ``--insecure-dev`` only); the discovery ``issuer`` must equal the configured one; every request has an overall
 deadline, does not follow redirects and reads at most :data:`MAX_RESPONSE_BYTES`. The JWKS is cached for
-:data:`JWKS_MAX_AGE_SECONDS` (stale-if-error: a failed age-based refetch keeps the cached keys); an unknown ``kid``
-forces a refetch at most once per :data:`JWKS_REFRESH_COOLDOWN_SECONDS`, so made-up key ids cannot make us hammer
-the issuer.
+:data:`JWKS_MAX_AGE_SECONDS` (stale-if-error: a failed age-based refetch keeps the cached keys, but never keys older
+than :data:`JWKS_MAX_STALE_SECONDS`); an unknown ``kid`` forces a refetch at most once per
+:data:`JWKS_REFRESH_COOLDOWN_SECONDS`, so made-up key ids cannot make us hammer the issuer.
 
 Errors — retry versus revoke. Only a definitive answer about the user's session is a plain :class:`IdentityError` or
 :class:`UpstreamRejectedError` (the caller revokes our tokens): token endpoint 400/401, userinfo 401/403, an ID token
-that fails verification, a changed ``sub``, a discovery document that names another issuer or plain-http endpoints.
+that fails verification, a changed ``sub``. A discovery document that names another issuer or plain-http endpoints
+is a hard error at sign-in and a pause (:class:`UpstreamUnavailableError`) during refresh.
 Everything else — network errors, timeouts, 3xx, 408, 429, 5xx, any other non-200, a non-JSON or oversized body,
-every failure of discovery or JWKS, an unknown ``kid`` while refetching is cooling down — is
-:class:`UpstreamUnavailableError` (keep our tokens, retry later). Messages never contain tokens or secrets.
+every other failure of discovery or JWKS, an unknown ``kid`` while refetching is cooling down, cached keys past the
+staleness cap — is :class:`UpstreamUnavailableError` (keep our tokens, retry later). Messages never contain tokens or
+secrets.
 
 ``sub`` continuity (OIDC Core §5.3.2, §12.2): the ``sub`` seen for an upstream refresh token is remembered in memory
 (bounded, keyed by the token's hash), and a refresh whose ID token or userinfo names another ``sub`` is refused.
@@ -61,12 +63,17 @@ UPSTREAM_TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 1024 * 1024
 JWKS_MAX_AGE_SECONDS = 3600.0
 JWKS_REFRESH_COOLDOWN_SECONDS = 60.0
+JWKS_MAX_STALE_SECONDS = 24 * 3600.0
 MAX_TRACKED_SESSIONS = 10_000
 _OAUTH_ERROR_CODE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _BEARER_TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")
 _TOKEN_REFUSALS = frozenset({400, 401})
 _USERINFO_REFUSALS = frozenset({401, 403})
 _NO_REFUSALS: frozenset[int] = frozenset()
+
+
+class _DiscoveryPolicyError(IdentityError):
+    """The discovery document names another issuer or a non-https endpoint: sign-in fails hard, refresh pauses."""
 
 
 @dataclass(frozen=True)
@@ -152,6 +159,7 @@ class OidcIdentityProvider:
         self._keys: KeySet | None = None
         self._keys_generation = 0
         self._keys_fetched_at = 0.0
+        self._keys_retry_at = 0.0
         self._last_forced_refresh: float | None = None
         self._keys_lock = asyncio.Lock()
         self._subjects: OrderedDict[str, str] = OrderedDict()
@@ -242,7 +250,7 @@ class OidcIdentityProvider:
                 )
                 issuer = _require_str(data, "issuer")
                 if not self._issuer_matches(issuer):
-                    raise IdentityError("OIDC discovery issuer does not match the configured issuer")
+                    raise _DiscoveryPolicyError("OIDC discovery issuer does not match the configured issuer")
                 advertised = data.get("id_token_signing_alg_values_supported")
                 algorithms = (
                     tuple(a for a in advertised if a in ALLOWED_ALGORITHMS) if isinstance(advertised, list) else ()
@@ -264,7 +272,7 @@ class OidcIdentityProvider:
                 }
                 for name, url in endpoints.items():
                     if url is not None and not self._is_allowed_url(url):
-                        raise IdentityError(f"OIDC discovery {name} must be an https URL")
+                        raise _DiscoveryPolicyError(f"OIDC discovery {name} must be an https URL")
                 self._metadata = metadata
             return self._metadata
 
@@ -280,7 +288,8 @@ class OidcIdentityProvider:
 
         ``force`` (unknown ``kid``) refetches at most once per cooldown; during the cooldown the cached set is
         returned unchanged (possibly just refreshed by a concurrent caller). An age-based refetch that fails keeps
-        serving the cached keys and is retried after the cooldown.
+        serving the cached keys and is retried after the cooldown, but keys last fetched more than
+        :data:`JWKS_MAX_STALE_SECONDS` ago are never served (a key the issuer withdrew must not live on).
         """
         meta = await self.metadata()
         async with self._keys_lock:
@@ -292,12 +301,14 @@ class OidcIdentityProvider:
                 if last is None or now - last >= JWKS_REFRESH_COOLDOWN_SECONDS:
                     self._last_forced_refresh = now
                     await self._fetch_keys(meta, now)
-            elif now - self._keys_fetched_at >= JWKS_MAX_AGE_SECONDS:
+            elif now - self._keys_fetched_at >= JWKS_MAX_AGE_SECONDS and now >= self._keys_retry_at:
                 try:
                     await self._fetch_keys(meta, now)
                 except IdentityError as exc:
-                    logger.warning("issuer JWKS refetch failed; keeping the cached keys: %s", exc)
-                    self._keys_fetched_at = now - JWKS_MAX_AGE_SECONDS + JWKS_REFRESH_COOLDOWN_SECONDS
+                    logger.warning("issuer JWKS refetch failed; keeping the cached keys for now: %s", exc)
+                    self._keys_retry_at = now + JWKS_REFRESH_COOLDOWN_SECONDS
+            if now - self._keys_fetched_at >= JWKS_MAX_STALE_SECONDS:
+                raise UpstreamUnavailableError("issuer JWKS could not be refetched and the cached keys are too old")
             return self._keys, self._keys_generation
 
     # ── ID token validation ─────────────────────────────────────────────
@@ -421,6 +432,12 @@ class OidcIdentityProvider:
         Raises :class:`UpstreamUnavailableError` when the issuer gives no usable answer (keep our tokens, retry later)
         and any other :class:`IdentityError` when the session is refused or the answer fails verification (revoke).
         """
+        try:
+            await self.metadata()
+        except _DiscoveryPolicyError as exc:
+            # A discovery document fetched during refresh that breaks policy says nothing about this session:
+            # pause (no tokens leave, nothing is accepted) instead of revoking every session. Sign-in stays refused.
+            raise UpstreamUnavailableError(f"refresh paused: {exc}") from exc
         known_sub = self._subjects.get(hash_token(refresh_token))
         data = await self._token_request({"grant_type": "refresh_token", "refresh_token": refresh_token})
         id_token = data.get("id_token")
