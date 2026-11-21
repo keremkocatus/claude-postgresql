@@ -64,6 +64,32 @@ class HttpApp:
     registry: BackendRegistry
 
 
+class _LazyTransport(httpx.AsyncBaseTransport):
+    """Creates the real transport (connection pool, TLS context) on the first request.
+
+    The upstream client is built with the app but used only while the app runs, and the lifespan closes it. A client
+    built by a ``build_http_app`` call that then fails, or by an app that is never started, has opened nothing and
+    leaves nothing behind.
+    """
+
+    def __init__(self) -> None:
+        self._inner: httpx.AsyncHTTPTransport | None = None
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self._inner is None:
+            self._inner = httpx.AsyncHTTPTransport()
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        inner, self._inner = self._inner, None
+        if inner is not None:
+            await inner.aclose()
+
+
+def _upstream_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=_LazyTransport(), timeout=UPSTREAM_HTTP_TIMEOUT_SECONDS, follow_redirects=False)
+
+
 def _oidc_provider(
     settings: HttpSettings, http_client: httpx.AsyncClient, clock: Clock, *, insecure_dev: bool
 ) -> OidcIdentityProvider:
@@ -91,7 +117,9 @@ def build_http_app(
 ) -> HttpApp:
     """Build the HTTP app; ``ConfigError`` when the configuration cannot be served.
 
-    ``registry`` is for tests; production passes none and one is created here. Either way this app closes it.
+    ``registry`` is for tests; production passes none and one is created here. Whichever it is, the app's lifespan
+    closes it when the app shuts down (or fails to start). An app that is never started closes nothing; the registry
+    opens backends only on first use, so it then holds nothing either.
     ``settings`` lets a caller that already ran :func:`check_http_preconditions` (and reported its warnings) pass the
     result, so the local users are not checked (and their warnings not logged) twice; without it the preconditions
     run here and their warnings are logged.
@@ -110,7 +138,7 @@ def build_http_app(
     http_client: httpx.AsyncClient | None = None
     oidc: OidcIdentityProvider | None = None
     if settings.auth.mode == "oidc":
-        http_client = httpx.AsyncClient(timeout=UPSTREAM_HTTP_TIMEOUT_SECONDS, follow_redirects=False)
+        http_client = _upstream_client()
         oidc = _oidc_provider(settings, http_client, clock, insecure_dev=insecure_dev)
 
     backends = registry if registry is not None else BackendRegistry(config)
@@ -150,7 +178,6 @@ def build_http_app(
     app.add_middleware(
         EndpointRateLimitMiddleware,
         path=REGISTER_PATH,
-        methods=["POST"],
         key_prefix="register",
         limiter=RateLimiter(store, REGISTER_RULE, clock),
         trusted_proxies=trusted_proxies,
@@ -159,7 +186,6 @@ def build_http_app(
     app.add_middleware(
         EndpointRateLimitMiddleware,
         path=AUTHORIZE_PATH,
-        methods=["GET", "POST"],
         key_prefix="authorize",
         limiter=RateLimiter(store, AUTHORIZE_RULE, clock),
         trusted_proxies=trusted_proxies,
@@ -173,19 +199,21 @@ def build_http_app(
 
     @asynccontextmanager
     async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
-        # Callbacks run in reverse: the session manager exits first (no session can use a backend any more), then
-        # the registry is closed, then the cleanup task, the audit writer (flushing what shutdown itself recorded),
-        # the upstream HTTP client and finally the store. A failing step does not skip the ones after it.
+        # Every release is registered before anything starts, so a failed start releases everything too (each one is
+        # a no-op for what never started). Callbacks run in reverse: the session manager exits first (no session can
+        # use a backend any more), then the registry is closed, then the cleanup task, the audit writer (flushing
+        # what shutdown itself recorded), the upstream HTTP client and finally the store. A failing step does not
+        # skip the ones after it.
         async with AsyncExitStack() as stack:
             stack.push_async_callback(store.close)
             if http_client is not None:
                 stack.push_async_callback(http_client.aclose)
-            await store.open()
-            sqlite_sink.start()
             stack.push_async_callback(sqlite_sink.aclose)
-            cleanup.start()
             stack.push_async_callback(cleanup.stop)
             stack.push_async_callback(backends.close_all)
+            await store.open()
+            sqlite_sink.start()
+            cleanup.start()
             await stack.enter_async_context(session_manager_lifespan(starlette_app))
             yield
 

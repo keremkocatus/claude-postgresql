@@ -3,12 +3,19 @@
 Each request reserves one attempt atomically (:meth:`RateLimiter.reserve`) before it reaches the SDK handler, so a
 burst of parallel requests can never get past the limit; nothing is refunded. Requests are counted per
 :func:`rate_limit_address` of the client IP (IPv6 by /64).
+
+Every request on the path counts, whatever its method: the SDK handlers do not look at the method (a non-preflight
+``OPTIONS /register`` with a JSON body registers a client, ``HEAD /authorize`` with a form body creates a pending
+authorization). The one exception is a genuine CORS preflight (``OPTIONS`` with ``Origin`` and
+``Access-Control-Request-Method``, exactly Starlette's rule), which the CORS middleware answers without calling the
+handler.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 
+from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -37,13 +44,20 @@ def authorization_refused(retry_after: int) -> Response:
     )
 
 
+def _is_cors_preflight(scope: Scope) -> bool:
+    """Starlette's ``CORSMiddleware`` answers exactly these itself; any other request reaches the SDK handler."""
+    if scope["method"] != "OPTIONS":
+        return False
+    headers = Headers(scope=scope)
+    return "origin" in headers and "access-control-request-method" in headers
+
+
 class EndpointRateLimitMiddleware:
     def __init__(
         self,
         app: ASGIApp,
         *,
         path: str,
-        methods: Iterable[str],
         key_prefix: str,
         limiter: RateLimiter,
         trusted_proxies: Sequence[Network],
@@ -51,14 +65,13 @@ class EndpointRateLimitMiddleware:
     ) -> None:
         self._app = app
         self._path = path
-        self._methods = frozenset(methods)
         self._prefix = key_prefix
         self._limiter = limiter
         self._trusted = tuple(trusted_proxies)
         self._refused = refused
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"] == self._path and scope["method"] in self._methods:
+        if scope["type"] == "http" and scope["path"] == self._path and not _is_cors_preflight(scope):
             key = f"{self._prefix}:ip:{rate_limit_address(client_ip(scope, self._trusted))}"
             reservation = await self._limiter.reserve([key])
             if not reservation.granted:

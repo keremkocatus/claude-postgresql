@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -43,7 +44,8 @@ _FLOW_PURPOSE = "ratatoskr-oidc-flow/v1"
 _MAX_FIELD = 4096
 _MAX_USERNAME = 256
 _MAX_PASSWORD = 1024
-_MAX_LOGGED_ERROR = 64
+_MAX_AUDIT_NAME = 64
+_ERROR_CODE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
 def _field(form: FormData, name: str, limit: int = _MAX_FIELD) -> str:
@@ -57,6 +59,16 @@ def _expired() -> Response:
         "Go back to your MCP client and connect again.",
         400,
     )
+
+
+def _audit_name(username: str) -> str:
+    """The typed username as audited: normalised like the lockout key and cut, so input cannot bloat the trail."""
+    return normalize_username(username)[:_MAX_AUDIT_NAME]
+
+
+def _error_code(value: str) -> str:
+    """An OAuth error code from the issuer's redirect, or ``unknown`` when it is not a plain code."""
+    return value if _ERROR_CODE.fullmatch(value) else "unknown"
 
 
 def _flow_message(pending_id: str) -> str:
@@ -166,7 +178,9 @@ class LoginRoutes:
         reservation = await self._limiter.reserve([ip_key, user_key])
         if not reservation.granted:
             retry = int(reservation.retry_after) + 1
-            record_auth_event(self._audit, "login_rate_limited", subject=username, auth_source="local", result="denied")
+            record_auth_event(
+                self._audit, "login_rate_limited", subject=_audit_name(username), auth_source="local", result="denied"
+            )
             response = self._form(
                 pending,
                 username=username,
@@ -178,7 +192,9 @@ class LoginRoutes:
 
         principal = await self._local.verify_password(username, password)
         if principal is None:
-            record_auth_event(self._audit, "login_failed", subject=username, auth_source="local", result="denied")
+            record_auth_event(
+                self._audit, "login_failed", subject=_audit_name(username), auth_source="local", result="denied"
+            )
             return self._form(pending, username=username, error="Invalid username or password.", status=401)
 
         await self._limiter.refund(reservation)
@@ -210,7 +226,17 @@ class LoginRoutes:
             return self._finish(_expired())
         upstream_error = request.query_params.get("error")
         if upstream_error:
-            logger.info("identity provider returned error %r", upstream_error[:_MAX_LOGGED_ERROR])
+            code = _error_code(upstream_error)
+            logger.info("identity provider returned error %s", code)
+            record_auth_event(
+                self._audit,
+                "login_failed",
+                subject="unknown",
+                auth_source="oidc",
+                result="denied",
+                error_class=f"idp_error:{code}",
+            )
+            # The client gets a fixed access_denied with its own stored state; nothing from the issuer is echoed.
             return self._finish(RedirectResponse(self._provider.denied_redirect(pending), status_code=302))
         code = request.query_params.get("code", "")[:_MAX_FIELD]
         nonce, verifier = pending.pending.nonce, pending.pending.upstream_verifier

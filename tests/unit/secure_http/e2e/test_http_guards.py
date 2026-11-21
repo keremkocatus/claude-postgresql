@@ -7,12 +7,13 @@ import asyncio
 import re
 import sqlite3
 from collections.abc import AsyncIterator
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 import pytest
 from pydantic import AnyHttpUrl
 
+from ratatoskr.auth.identity.local import normalize_username
 from ratatoskr.auth.ratelimit import LOGIN_RULE, REGISTER_RULE
 from ratatoskr.transport.app import build_http_app
 from ratatoskr.transport.body_limit import MAX_AUTH_BODY_BYTES
@@ -174,6 +175,53 @@ async def test_parallel_authorize_burst_from_one_ip_is_capped(http_app, run_app)
             assert (await other.http.get("/authorize", params=other.authorize_params())).status_code == 302
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Access-Control-Request-Method": "POST"}, {"Origin": "https://inspector.example"}],
+    ids=["plain", "no-origin", "no-request-method"],
+)
+async def test_options_register_with_a_body_is_counted(http_app, run_app, headers) -> None:
+    """The SDK registers a client for any method its route accepts; a non-preflight OPTIONS must count too."""
+    body = {"redirect_uris": [CLIENT_REDIRECT], "token_endpoint_auth_method": "client_secret_post"}
+    async with run_app(http_app) as driver:
+        responses = await asyncio.gather(
+            *(
+                driver.http.request("OPTIONS", "/register", json=body, headers=headers)
+                for _ in range(REGISTER_RULE.limit + 10)
+            )
+        )
+    statuses = [r.status_code for r in responses]
+    assert statuses.count(201) == REGISTER_RULE.limit
+    assert statuses.count(429) == 10
+
+
+async def test_head_authorize_with_a_form_body_is_counted(http_app, run_app) -> None:
+    """Starlette routes HEAD to the GET handler and the SDK then reads the form body: HEAD must count too."""
+    async with run_app(http_app) as driver:
+        await driver.register()
+        form = urlencode(driver.authorize_params())
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        responses = await asyncio.gather(
+            *(
+                driver.http.request("HEAD", "/authorize", content=form, headers=headers)
+                for _ in range(AUTHORIZE_RULE.limit + 10)
+            )
+        )
+    statuses = [r.status_code for r in responses]
+    assert statuses.count(302) == AUTHORIZE_RULE.limit
+    assert statuses.count(429) == 10
+
+
+async def test_a_cors_preflight_is_not_counted(http_app, run_app) -> None:
+    preflight = {"Origin": "https://inspector.example", "Access-Control-Request-Method": "POST"}
+    async with run_app(http_app) as driver:
+        for _ in range(REGISTER_RULE.limit + 5):
+            answer = await driver.http.request("OPTIONS", "/register", headers=preflight)
+            assert answer.status_code == 200
+        statuses = [(await driver.register()).status_code for _ in range(REGISTER_RULE.limit)]
+    assert statuses == [201] * REGISTER_RULE.limit
+
+
 # ── login rate limit ────────────────────────────────────────────────────────
 
 _CSRF_FIELD = re.compile(r'name="csrf_token" value="([^"]+)"')
@@ -277,6 +325,36 @@ async def test_ip_lockout_groups_ipv6_clients_by_their_64_network(http_app, run_
         async with driver.spawn("2001:db8:1:3::1") as elsewhere:
             elsewhere.client_id = driver.client_id
             assert (await (await LoginForm.open(elsewhere)).submit("ayse", PASSWORD)).status_code == 302
+
+
+async def test_audit_records_the_normalised_username_cut_to_64_characters(http_app, run_app, tmp_path) -> None:
+    typed = "  ＫEREM-" + "x" * 300
+    expected = normalize_username(typed)[:64]
+    async with run_app(http_app) as driver:
+        await driver.register()
+        form = await LoginForm.open(driver)
+        for _ in range(LOGIN_RULE.limit):
+            assert (await form.submit(typed, "wrong")).status_code == 401
+        assert (await form.submit(typed, "wrong")).status_code == 429
+    subjects = {(tool, subject) for tool, subject, _, _ in audit_rows(tmp_path)}
+    assert ("login_failed", expected) in subjects
+    assert ("login_rate_limited", expected) in subjects
+    assert not any(len(subject) > 64 for _, subject in subjects)
+
+
+async def test_unknown_and_known_users_get_the_same_answer(http_app, run_app) -> None:
+    async with run_app(http_app) as driver:
+        await driver.register()
+        answers = []
+        for username in ("kerem", "nobody"):
+            form = await LoginForm.open(driver)
+            sent_csrf = form.csrf
+            response = await form.submit(username, "wrong")
+            body = response.text.replace(form.csrf, "<csrf>").replace(form.request_id, "<request>")
+            answers.append((response.status_code, body.replace(f'value="{username}"', 'value="<user>"')))
+            assert sent_csrf != form.csrf
+    assert answers[0] == answers[1]
+    assert answers[0][0] == 401
 
 
 async def test_csrf_is_checked_before_the_pending_request_and_the_rate_limit(http_app, run_app) -> None:
@@ -390,3 +468,32 @@ async def test_oidc_flow_cookie_is_lax_bound_to_the_request_and_single_use(
         assert replay.status_code == 400
         assert len(fake_issuer.token_requests) == 1, "the replay never reached the issuer"
     assert ("login_succeeded", "alice@example.com", "oidc", "ok") in audit_rows(tmp_path)
+
+
+async def test_identity_provider_error_is_audited_and_never_reflected(
+    make_config, run_app, clock, fake_issuer, tmp_path
+) -> None:
+    http_app = build_http_app(make_config(mode="oidc"), clock=clock)
+    async with run_app(http_app) as driver:
+        await driver.register()
+        start = await driver.http.get(await driver.authorize())
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+        response = await driver.http.get(
+            "/oauth/callback",
+            params={"state": state, "error": "<script>alert(1)</script>", "error_description": "<b>evil</b>"},
+        )
+        assert response.status_code == 302
+        assert response.headers["location"] == CLIENT_REDIRECT + "?error=access_denied&state=claude-state"
+        assert "script" not in response.text and "evil" not in response.text
+        assert fake_issuer.token_requests == []
+        second = await driver.http.get(await driver.authorize())
+        state = parse_qs(urlsplit(second.headers["location"]).query)["state"][0]
+        assert (await driver.http.get("/oauth/callback", params={"state": state, "error": "access_denied"})).is_redirect
+    with sqlite3.connect(tmp_path / "state.db") as raw:
+        rows = raw.execute(
+            "SELECT tool, subject, auth_source, result, error_class FROM audit_events WHERE tool = 'login_failed'"
+        ).fetchall()
+    assert rows == [
+        ("login_failed", "unknown", "oidc", "denied", "idp_error:unknown"),
+        ("login_failed", "unknown", "oidc", "denied", "idp_error:access_denied"),
+    ]

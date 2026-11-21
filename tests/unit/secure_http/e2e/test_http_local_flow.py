@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 
 import pytest
 
+from ratatoskr.observability.health import READY_CACHE_SECONDS, HealthRoutes
 from ratatoskr.transport.app import build_http_app
 from tests.unit.secure_http.conftest import SECRET_KEY
 
@@ -179,3 +181,31 @@ async def test_no_secrets_reach_the_logs(http_app, run_app, caplog, password_has
     assert caplog.records, "the flow is expected to log something"
     leaked = [s for s in secrets if s in caplog.text]
     assert leaked == []
+
+
+class CountingStore:
+    def __init__(self) -> None:
+        self.checks = 0
+        self.fail = False
+
+    async def check_writable(self) -> None:
+        self.checks += 1
+        await asyncio.sleep(0.01)
+        if self.fail:
+            raise RuntimeError("disk full")
+
+
+async def test_readiness_is_checked_at_most_once_per_cache_period(clock) -> None:
+    store = CountingStore()
+    health = HealthRoutes(store, clock=clock)  # type: ignore[arg-type]
+    answers = await asyncio.gather(*(health.readyz(None) for _ in range(50)))  # type: ignore[arg-type]
+    assert {a.status_code for a in answers} == {200}
+    assert store.checks == 1, "a flood of probes must not queue up on the store writer"
+
+    store.fail = True
+    clock.advance(READY_CACHE_SECONDS - 0.5)
+    assert (await health.readyz(None)).status_code == 200  # type: ignore[arg-type]
+    clock.advance(1.0)
+    assert (await health.readyz(None)).status_code == 503  # type: ignore[arg-type]
+    assert (await health.readyz(None)).status_code == 503  # type: ignore[arg-type]
+    assert store.checks == 2
