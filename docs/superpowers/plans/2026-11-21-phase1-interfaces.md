@@ -369,3 +369,10 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Task 16/18/19: `config.example.yaml` ve README'ye `auth.session_max_age` (varsayılan 30d) eklenmeli; saatlik temizlik
   log satırı `CleanupStats.clients` ve `.families` sayılarını da göstermeli (`state/maintenance.py`).
 - Task 16: `ratatoskr hash-password --help` metni `password_cli.DESCRIPTION` (PowerShell 5.1 notu dahil) olmalı.
+- Task 13 (Q6a review, ÖNEMLİ): SDK'nın DNS-rebinding kontrolü yalnız `/mcp`'yi kapsar. `/login`, `/oauth/callback`,
+  `/authorize`, `/token`, `/register`, `/revoke`, `/.well-known/*` için public_url host'una izin veren bir Host kontrolü
+  (TrustedHostMiddleware ya da küçük ASGI kontrolü) eklenmeli; `/healthz`, `/readyz` hariç tutulabilir. E2E test:
+  `POST /login` + `Host: evil.example` reddedilir. Rate-limit anahtarları `/login`, `/register`, `/authorize`, `/token`
+  için `rate_limit_address(client_ip(...))`. `secure_cookies = public_url.startswith("https://")` kalsın; `csrf.verify`
+  `load_pending` ve rate limiter'dan önce çalışsın. `HttpSettings.local_provider` yeniden kullanılsın.
+- Task 18: HSTS reverse proxy'de (Caddy) ayarlanır; rehberde belirtilsin.
