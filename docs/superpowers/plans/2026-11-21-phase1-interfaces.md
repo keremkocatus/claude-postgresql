@@ -345,4 +345,7 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Q2 review: rate-limit oku-değiştir-yaz atomikliği süreç içi (RateLimiter kilidi); tek replika için yeterli.
 - Rate limiter API: `reserve(keys) -> Reservation(retry_after, granted)`, `refund(reservation)`, `retry_after`,
   `hit`, `reset`. Login: reserve → engellendiyse 429 + `Retry-After: int(r.retry_after)+1` + `login_rate_limited`;
-  yanlış parola → kayıt kalır, `login_failed`, 401; doğru parola → `refund(r)`. Kayıt (DCR) `retry_after`+`hit`.
+  yanlış parola → kayıt kalır, `login_failed`, 401; doğru parola → `refund(r)`. Kayıt (DCR) de `reserve([key])` kullanır (refund yok); `retry_after`+`hit` paralel isteklerle limiti aşar (60 paralel istekte 60 geçti).
+- Task 12 (client_ip): IP'yi kanonikleştir (`str(ip_address(hop))`), `ipv4_mapped`'i aç, rate-limit anahtarı için IPv6'yı
+  /64 ağına indir (`str(ip_network(f"{ip}/64", strict=False).network_address)`).
+- Task 10/13 (register_client): istemci başına redirect URI sayısını sınırla (örn. 10); URI uzunluğu 2048'i aşamaz.
