@@ -18,6 +18,7 @@ REJECTED_IN_READ_MODE = [
     ("SELECT nextval('ticket_seq')", "cannot execute nextval() in a read-only transaction"),
     ("SELECT add_item()", "cannot execute INSERT in a read-only transaction"),
     ("SELECT * FROM items FOR UPDATE", "cannot execute SELECT FOR UPDATE in a read-only transaction"),
+    ("SELECT * FROM items FOR SHARE", "cannot execute SELECT FOR SHARE in a read-only transaction"),
     ("CREATE TABLE evil (id int)", "cannot execute CREATE TABLE in a read-only transaction"),
 ]
 
@@ -110,14 +111,32 @@ async def test_explain_rejects_an_explain_prefix(seeded: str, make_harness: Make
 
 async def test_session_setting_tricks_do_not_survive(seeded: str, make_harness: MakeHarness) -> None:
     harness = make_harness(make_pg_config(seeded, mode="read", pool={"min_size": 1, "max_size": 1}))
-    await harness.call("pg_query", sql="SELECT set_config('default_transaction_read_only', 'off', false)")
-    await harness.call("pg_query", sql="SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
-    await harness.call("pg_query", sql="COMMIT")
+    turned_off = await harness.call("pg_query", sql="SELECT set_config('default_transaction_read_only', 'off', false)")
+    assert "| off |" in turned_off, turned_off
+    characteristics = await harness.call("pg_query", sql="SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+    assert characteristics.startswith("0 row(s) in "), characteristics
+    committed = await harness.call("pg_query", sql="COMMIT")
+    assert committed.startswith("0 row(s) in "), committed
+    assert [event.result for event in harness.sink.events] == ["ok"] * 3
     shown = await harness.call("pg_query", sql="SHOW default_transaction_read_only")
     assert "| on |" in shown
     text = await harness.call("pg_query", sql="DELETE FROM items")
     assert "read-only transaction" in text
     assert await count_items(seeded) == 3
+
+
+async def test_session_level_advisory_lock_does_not_survive(seeded: str, make_harness: MakeHarness) -> None:
+    harness = make_harness(make_pg_config(seeded, mode="read", pool={"min_size": 1, "max_size": 1}))
+
+    async def backend_pid() -> str:
+        text = await harness.call("pg_query", sql="SELECT pg_backend_pid()")
+        return text.split("\n", 1)[1]  # the table, without the timing header
+
+    pid = await backend_pid()
+    locked = await harness.call("pg_query", sql="SELECT pg_advisory_lock(42)")
+    assert locked.startswith("1 row(s) in "), locked
+    assert await fetch_value(seeded, "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'") == 0
+    assert await backend_pid() == pid  # the same pooled backend was reused, so the lock really was released
 
 
 async def test_pg_query_returns_rows_and_respects_max_rows(seeded: str, make_harness: MakeHarness) -> None:

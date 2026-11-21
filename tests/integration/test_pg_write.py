@@ -40,6 +40,20 @@ async def test_write_explain_analyze_still_runs_the_write_guard(seeded: str, mak
     assert [event.error_class for event in harness.sink.events] == ["InvalidRequestError"] * 2
 
 
+@pytest.mark.parametrize(
+    "sql",
+    ["SELECT 1; DELETE FROM orders", "SELECT 1; END; DELETE FROM orders", "DELETE FROM orders RETURNING 1; END"],
+)
+async def test_write_explain_analyze_refuses_smuggled_statements(
+    seeded: str, make_harness: MakeHarness, sql: str
+) -> None:
+    harness = make_harness(make_pg_config(seeded, mode="write"))
+    text = await harness.call("pg_explain", sql=sql, analyze=True)
+    assert text.startswith("Error: PostgreSQL error 42601"), text
+    assert await fetch_value(seeded, "SELECT count(*) FROM orders") == 1
+    assert harness.sink.events[-1].result == "error"
+
+
 async def test_execute_commits_all_statements(seeded: str, make_harness: MakeHarness) -> None:
     harness = make_harness(make_pg_config(seeded, mode="write"))
     statements: list[dict[str, Any]] = [
@@ -82,7 +96,10 @@ async def test_execute_rolls_back_everything_on_failure(seeded: str, make_harnes
 async def test_execute_rejects_multiple_commands_in_one_statement(seeded: str, make_harness: MakeHarness) -> None:
     harness = make_harness(make_pg_config(seeded, mode="write"))
     text = await harness.call("pg_execute", statements=[{"sql": "DELETE FROM orders; DELETE FROM items"}])
+    assert text.startswith("Error: Statement 1 of 1 failed, so the transaction was rolled back"), text
+    assert "\nPostgreSQL error 42601: " in text
     assert "cannot insert multiple commands into a prepared statement" in text
+    assert harness.sink.events[-1].result == "error"
     assert await count_items(seeded) == 3
     assert await fetch_value(seeded, "SELECT count(*) FROM orders") == 1
 

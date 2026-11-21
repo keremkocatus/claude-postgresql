@@ -176,11 +176,11 @@ async def test_one_audit_event_per_call_with_its_result(seeded: str, make_harnes
 
 async def test_unreachable_connection_reports_without_leaking(make_harness: MakeHarness) -> None:
     harness = make_harness(make_pg_config(UNREACHABLE_DSN))
-    started = time.perf_counter()
     text = await harness.call("pg_query", sql="SELECT 1")
     assert text.startswith("Error: Connection 'db' is unavailable"), text
+    started = time.perf_counter()
     health = await harness.call("connection_health", connection="db")  # backing off: no second connect
-    assert time.perf_counter() - started < 15
+    assert time.perf_counter() - started < 0.5
     assert health.splitlines()[2].startswith("| db | postgres | unavailable | - | - | Connection 'db' is unavailable")
     everything = await harness.call("connection_health")
     assert "| db | postgres | unavailable |" in everything
