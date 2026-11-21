@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-_VERSION = b""
+_VERSION = b"\x01"
 _KID_BYTES = 4
 _NONCE_BYTES = 12
 _TAG_BYTES = 16
