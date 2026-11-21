@@ -104,3 +104,69 @@ def test_uses_os_environ_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("MAIN_DSN", "postgresql://env@db/app")
     config = load_config(_write(tmp_path, BASE))
     assert config.connections["main"].dsn.get_secret_value() == "postgresql://env@db/app"
+
+
+def _assert_detached(error: ConfigError, *secrets: str) -> None:
+    assert error.__context__ is None
+    assert error.__cause__ is None
+    for secret in secrets:
+        assert secret not in str(error)
+
+
+def test_validation_error_has_no_chained_exception(tmp_path: Path) -> None:
+    text = BASE.replace("mode: write", "mode: admin")
+    dsn = "postgresql://u:topsecret@db/app"
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(_write(tmp_path, text), env={"MAIN_DSN": dsn})
+    _assert_detached(excinfo.value, dsn, "topsecret")
+
+
+def test_misplaced_secret_in_duration_is_not_echoed(tmp_path: Path) -> None:
+    text = BASE + "    statement_timeout: ${PG_DSN}\n"
+    dsn = "postgresql://u:topsecret@db/app"
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(_write(tmp_path, text), env={"MAIN_DSN": "postgresql://db/app", "PG_DSN": dsn})
+    assert "connections.main.statement_timeout" in str(excinfo.value)
+    _assert_detached(excinfo.value, dsn, "topsecret")
+
+
+def test_huge_duration_is_a_config_error(tmp_path: Path) -> None:
+    text = BASE + "    statement_timeout: 99999999999d\n"
+    with pytest.raises(ConfigError, match="too large"):
+        load_config(_write(tmp_path, text), env={"MAIN_DSN": "postgresql://db/app"})
+
+
+def test_yaml_error_reports_position_without_source_snippet(tmp_path: Path) -> None:
+    text = "connections:\n  main: {dsn: postgresql://u:topsecret@db/app, kind: [postgres\n"
+    with pytest.raises(ConfigError, match=r"line \d+, column \d+") as excinfo:
+        load_config(_write(tmp_path, text), env={})
+    _assert_detached(excinfo.value, "topsecret")
+
+
+def test_duplicate_keys_are_rejected(tmp_path: Path) -> None:
+    text = BASE.replace("    mode: write\n", "    mode: read\n    dsn_extra: x\n    mode: write\n")
+    with pytest.raises(ConfigError, match=r"duplicate key 'mode'.*line 11") as excinfo:
+        load_config(_write(tmp_path, text), env={"MAIN_DSN": "postgresql://db/app"})
+    assert "write" not in str(excinfo.value).split("duplicate key")[1]
+
+
+def test_config_file_with_invalid_utf8_is_a_config_error(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"connections: {}\n# topsecret \xff\n")
+    with pytest.raises(ConfigError, match="not valid UTF-8") as excinfo:
+        load_config(path, env={})
+    _assert_detached(excinfo.value, "topsecret")
+
+
+def test_secret_file_problem_does_not_leak_contents(tmp_path: Path) -> None:
+    secret = tmp_path / "dsn.bin"
+    secret.write_bytes(b"postgresql://u:topsecret@db/app\xff")
+    text = BASE.replace("${MAIN_DSN}", "${file:" + secret.as_posix() + "}")
+    with pytest.raises(ConfigError, match="cannot read secret file") as excinfo:
+        load_config(_write(tmp_path, text), env={})
+    _assert_detached(excinfo.value, "topsecret")
+
+
+def test_env_value_is_not_interpolated_again(tmp_path: Path) -> None:
+    config = load_config(_write(tmp_path, BASE), env={"MAIN_DSN": "${OTHER}", "OTHER": "postgresql://other/db"})
+    assert config.connections["main"].dsn.get_secret_value() == "${OTHER}"

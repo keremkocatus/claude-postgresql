@@ -165,3 +165,10 @@ def test_log_level_is_normalised() -> None:
     assert config.server.log_level == "DEBUG"
     with pytest.raises(ValidationError, match="log_level"):
         RatatoskrConfig.model_validate(_config(server={"log_level": "LOUD"}))
+
+
+def test_oidc_block_requires_client_secret() -> None:
+    data = _http()
+    data["auth"] = {"mode": "oidc", "oidc": {"issuer": "https://id.example.com", "client_id": "ratatoskr"}}
+    with pytest.raises(ValidationError, match="client_secret"):
+        RatatoskrConfig.model_validate(data)

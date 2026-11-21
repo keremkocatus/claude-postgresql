@@ -33,3 +33,16 @@ def test_rejects_bool_and_negative_numbers() -> None:
         parse_duration(True)
     with pytest.raises(ValueError):
         parse_duration(-1)
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan"), 1e300, "99999999999d"])
+def test_rejects_non_finite_and_huge_values(value: float | str) -> None:
+    with pytest.raises(ValueError):
+        parse_duration(value)
+
+
+def test_error_message_does_not_echo_the_input() -> None:
+    secret = "postgresql://u:topsecret@db/app"
+    with pytest.raises(ValueError) as excinfo:
+        parse_duration(secret)
+    assert "topsecret" not in str(excinfo.value)
