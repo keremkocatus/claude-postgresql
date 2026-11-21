@@ -1,0 +1,8 @@
+# Allowlist: the build context is only what the image installs.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!src/
+**/__pycache__
+**/*.pyc

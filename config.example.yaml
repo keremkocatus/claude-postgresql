@@ -4,15 +4,43 @@
 # Durations accept a number of seconds or "30s", "5m", "1h", "30d".
 
 server:
-  transport: stdio            # stdio only in this release; streamable-http (remote, OAuth) arrives in the next one
+  transport: stdio            # stdio (local, Claude Desktop / Code) | streamable-http (remote, OAuth; see below)
   stdio_role: admins          # over stdio you act as a member of this group (see roles); unset = no access
   log_level: INFO             # DEBUG | INFO | WARNING | ERROR | CRITICAL; logs go to stderr as redacted JSON
+  # ── streamable-http only (set transport: streamable-http and uncomment the auth section below) ──
+  # public_url: https://mcp.example.com   # origin only, https; the MCP endpoint is <public_url>/mcp
+  # host: 0.0.0.0                         # 127.0.0.1 by default; 0.0.0.0 in a container
+  # port: 8000                            # keep 8000 in the container (the image's health check uses it)
+  # state_path: /data/state.db            # SQLite state: clients, tokens, rate limits, audit trail
+  # secret_key: ${SERVER_SECRET_KEY}      # >= 32 characters, random; changing it signs everyone out
+  # trusted_proxies: [172.18.0.0/16]      # your reverse proxy's IP/network; X-Forwarded-For only from these
+  # allowed_redirect_hosts: [claude.ai, claude.com, localhost, 127.0.0.1]   # OAuth client redirect hosts (exact)
+  # audit_retention: 90d                  # audit rows older than this are deleted hourly (minimum 1d)
 
 # group -> { connection name or "*": read | write }
 # Effective access = the highest grant of your groups, capped by the connection's mode. No grant = no access.
 roles:
   admins: { "*": write }
   # analysts: { app-db: read }
+
+# Only for transport: streamable-http (stdio ignores it). People sign in in the browser when they add the connector.
+# auth:
+#   mode: local                       # local (users below) | oidc (e.g. Authentik, see docs/authentik.md)
+#   access_token_ttl: 1h
+#   refresh_token_ttl: 30d            # must not exceed session_max_age
+#   session_max_age: 30d              # absolute sign-in lifetime; refreshing never extends it (minimum 1d)
+#   local:
+#     users:
+#       - username: alice
+#         password_hash: ${ALICE_PASSWORD_HASH}   # from `ratatoskr hash-password`; argon2id, same parameters for all
+#         groups: [admins]
+#   # oidc:                           # with mode: oidc instead of local
+#   #   issuer: https://auth.example.com/application/o/mcp/
+#   #   client_id: ${OIDC_CLIENT_ID}
+#   #   client_secret: ${OIDC_CLIENT_SECRET}
+#   #   scopes: [openid, email, profile, groups, offline_access]
+#   #   groups_claim: groups
+#   #   subject_claim: email          # or sub; see docs/authentik.md
 
 connections:
   app-db:                     # lowercase letters, digits, '-' and '_' (max 63 characters)

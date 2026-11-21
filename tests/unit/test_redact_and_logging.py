@@ -276,3 +276,15 @@ def test_overlong_quoted_password_leaves_no_tail() -> None:
     escaped = 'password="' + "a" * 300 + '\\"SECRETTAIL' + "b" * 300 + '"'
     assert "SECRETTAIL" not in redact(spaced)
     assert "SECRETTAIL" not in redact(escaped)
+
+
+def test_uvicorn_color_message_extra_is_dropped() -> None:
+    # uvicorn adds an ANSI-coloured copy of each message as extra={"color_message": ...}; JSON lines carry msg only.
+    stream = io.StringIO()
+    setup_logging("INFO", stream=stream)
+    logging.getLogger("uvicorn.error").info(
+        "Started server process [%d]", 7, extra={"color_message": "Started server process [\x1b[36m%d\x1b[0m]"}
+    )
+    entry = json.loads(stream.getvalue().strip().splitlines()[-1])
+    assert entry["msg"] == "Started server process [7]"
+    assert "color_message" not in entry

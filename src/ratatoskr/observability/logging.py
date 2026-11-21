@@ -11,7 +11,12 @@ from typing import Any, TextIO
 
 from ratatoskr.observability.redact import SECRET_KEY_RE, redact
 
-_STANDARD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
+# uvicorn adds an ANSI-coloured duplicate of its messages as ``extra={"color_message": ...}``; JSON lines skip it.
+_STANDARD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+    "message",
+    "asctime",
+    "color_message",
+}
 
 
 MCP_REQUEST_LOGGER = "mcp.server.lowlevel.server"

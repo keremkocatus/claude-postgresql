@@ -1,4 +1,5 @@
-"""Hourly removal of expired codes, tokens, pending authorizations, idle rate limits and old audit rows."""
+"""Hourly removal of expired codes, tokens, pending authorizations, idle rate limits, old audit rows, stale clients
+and empty token families."""
 
 from __future__ import annotations
 
@@ -36,13 +37,15 @@ class CleanupTask:
         # Counts go in the message: the JSON formatter masks values under keys that look like "token".
         logger.info(
             "state cleanup removed %d pending, %d codes, %d expired credentials, %d upstream sessions, "
-            "%d rate-limit rows, %d audit events",
+            "%d rate-limit rows, %d audit events, %d clients, %d token families",
             stats.pending,
             stats.codes,
             stats.tokens,
             stats.upstream_sessions,
             stats.rate_limits,
             stats.audit_events,
+            stats.clients,
+            stats.families,
         )
         return stats
 

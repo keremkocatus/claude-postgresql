@@ -3,8 +3,8 @@
 Multi-connection MCP server (`src/ratatoskr`, PyPI `ratatoskr-mcp`, CLI `ratatoskr`). Design:
 `docs/superpowers/specs/2026-11-21-multi-backend-redesign-design.md`; shared interfaces for stage 1:
 `docs/superpowers/plans/2026-11-21-phase1-interfaces.md` (read its notes sections at the end too).
-Current state: stdio only (Plan 1a). HTTP transport, OAuth and the Docker image are Plan 1b; there is no `Dockerfile`
-until then, and `docker-compose.yml` is still the old one.
+Current state: stdio (Plan 1a) and secure streamable-HTTP (Plan 1b: OAuth AS, local + OIDC identity, SQLite state,
+`Dockerfile`). `docker-compose.yml` is still the old 0.1 one (compose, Caddy and CI are stage 4).
 
 ## Commands (Windows, repo root)
 
@@ -13,7 +13,10 @@ until then, and `docker-compose.yml` is still the old one.
   `.venv/Scripts/python -m pytest -m integration -q`
 - Lint: `.venv/Scripts/python -m ruff check src tests`
 - Types: `.venv/Scripts/python -m mypy src`
-- Validate a config: `.venv/Scripts/ratatoskr check-config --config config.yaml`
+- Format check: `.venv/Scripts/python -m ruff format --check src tests`
+- Validate a config: `.venv/Scripts/ratatoskr check-config --config config.yaml` (`--insecure-dev` validates what
+  `serve --insecure-dev` accepts)
+- Image: `docker build -t ratatoskr:dev .` (uid 10001, read-only root, writes only `/data`; local builds only)
 - Installing packages: pip's extra index on this machine is broken and slow; always pass
   `--index-url https://pypi.org/simple`.
 
@@ -24,7 +27,13 @@ database.
 ## Layout (`src/ratatoskr/`)
 
 - `config/` YAML loading (`loader.py`: `${VAR}`, `${file:/path}`), pydantic models (`models.py`), durations.
-- `auth/` `Principal`, `Policy` (effective access), principal resolvers.
+- `auth/` `Principal`, `Policy` (effective access), principal resolvers (`TokenPrincipalResolver` for HTTP);
+  OAuth AS provider (`oauth_server.py`), crypto/keys from `server.secret_key`, CSRF, rate limiter, login pages and
+  routes (`web.py`), `identity/` (local argon2id, OIDC RP), `password_cli.py` (`hash-password`).
+- `state/` SQLite state store (`sqlite.py`, WAL, one connection + lock, `migrations.py`), audit sink, hourly
+  cleanup. All OAuth/session state goes through the `Store` protocol; it stores hashes and sealed blobs only.
+- `transport/` HTTP composition root (`app.py`), preconditions (same checks for `serve` and `check-config`), client
+  IP / trusted proxies, Host check, body and endpoint limits, uvicorn (`serve.py`).
 - `backends/` `Backend` protocol, `BackendRegistry` (lazy open, 10 s retry), user-safe errors, `clamp_text`.
 - `backends/postgres/` pools and execution (`backend.py`), guard pre-checks (`guard.py`), TLS (`tls.py`), catalog
   SQL (`introspection.py`), query/execute/explain (`querying.py`), tool registration (`tools.py`) and tool texts
@@ -32,7 +41,10 @@ database.
 - `tools/runtime.py` the one wrapper every tool goes through; `tools/common.py` backend-independent tools.
 - `observability/` audit events and sinks, JSON logging, secret redaction.
 - `app.py` builds the FastMCP app; `cli.py` is the entry point.
-- Tests: `tests/fakes.py` (fake config, backends, clock, audit sink), `tests/unit/`, `tests/integration/`.
+- Tests: `tests/fakes.py` (fake config, backends, clock, audit sink), `tests/unit/`, `tests/integration/`. HTTP
+  tests live in `tests/unit/secure_http/` (fixtures in its `conftest.py`); end-to-end OAuth flows run in process
+  against the real Starlette app via `httpx.ASGITransport` in `tests/unit/secure_http/e2e/` (fake OIDC issuer via
+  respx): they are unit tests, no network, no Docker.
 - `config.example.yaml` is the annotated config reference; `tests/unit/test_example_config.py` keeps it valid.
 
 ## Rules
@@ -51,7 +63,13 @@ database.
   errors or PostgreSQL server messages; anything else becomes a generic message and the details go to the log.
   Never put a DSN, host or password in a message; `observability.redact` is a last line of defence for errors and
   logs, not the mechanism.
-- Logs go to **stderr** as JSON (stdout is the MCP stdio channel). Do not move them to stdout.
+- Logs go to **stderr** as JSON (stdout is the MCP stdio channel). Do not move them to stdout. HTTP keeps them there
+  too: uvicorn runs with `log_config=None` and `access_log=False` (request lines carry codes), and `aiosqlite` stays
+  above DEBUG (it logs statement parameters). Counts whose names look like secrets (`tokens`) go in the message,
+  not in `extra=` (the formatter masks such keys).
+- HTTP: OAuth, session and rate-limit state lives in the SQLite store (single replica); tokens are
+  stored as SHA-256 hashes, client and upstream secrets sealed with keys derived from `server.secret_key`. Text shown
+  in browser pages and OAuth errors is fixed wording; details go to the log. No private SDK attribute access.
 - PostgreSQL read path: user SQL only through the read pool, inside `ReadSession` (READ ONLY transaction, always
   rolled back) and only via the extended protocol (`fetch`, `prepare`, cursors). Never pass user SQL to
   `connection.execute(sql)` without arguments: that is the simple protocol and accepts several statements.

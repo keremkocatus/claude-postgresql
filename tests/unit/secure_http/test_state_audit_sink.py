@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from ratatoskr.observability.audit import AuditEvent
 from ratatoskr.state.audit import SqliteAuditSink
 from ratatoskr.state.maintenance import CleanupTask
-from ratatoskr.state.records import PendingAuthorization
+from ratatoskr.state.records import CleanupStats, PendingAuthorization
 from ratatoskr.state.sqlite import SqliteStore
+from ratatoskr.state.store import Store
 
 
 def event(i: int = 0, ts: datetime | None = None) -> AuditEvent:
@@ -124,6 +127,22 @@ async def test_cleanup_task_applies_retention(store: SqliteStore, clock) -> None
     stats = await CleanupTask(store, audit_retention=timedelta(days=90), clock=clock).run_once()
     assert stats.audit_events == 1 and stats.pending == 1
     assert await store.count_audit_events() == 1
+
+
+class _StatsStore:
+    async def cleanup(self, now: float, *, audit_cutoff: float) -> CleanupStats:
+        return CleanupStats(
+            pending=1, codes=2, tokens=3, upstream_sessions=4, rate_limits=5, audit_events=6, clients=7, families=8
+        )
+
+
+async def test_cleanup_log_line_reports_every_count(clock, caplog: Any) -> None:
+    store = cast(Store, _StatsStore())
+    with caplog.at_level(logging.INFO, logger="ratatoskr.state.maintenance"):
+        await CleanupTask(store, audit_retention=timedelta(days=90), clock=clock).run_once()
+    message = caplog.records[-1].getMessage()
+    assert "7 clients" in message and "8 token families" in message
+    assert "6 audit events" in message
 
 
 async def test_cleanup_task_runs_in_background_until_stopped(store: SqliteStore, clock) -> None:
