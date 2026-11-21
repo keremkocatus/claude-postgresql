@@ -12,7 +12,10 @@ from ratatoskr.auth.policy import ConnectionNotFoundError
 from ratatoskr.backends.base import Backend, ConnectionInfo
 from ratatoskr.backends.errors import BackendUnavailableError
 from ratatoskr.backends.postgres.backend import PostgresBackend
-from ratatoskr.config.models import DEFAULT_MAX_RESPONSE_BYTES, ConnectionConfig, RatatoskrConfig
+from ratatoskr.backends.prometheus.backend import PrometheusBackend
+from ratatoskr.config.models import ConnectionConfig, RatatoskrConfig
+from ratatoskr.config.prometheus_models import PrometheusConnection
+from ratatoskr.config.shared import DEFAULT_MAX_RESPONSE_BYTES
 
 RETRY_INTERVAL_SECONDS = 10.0
 
@@ -22,6 +25,8 @@ logger = logging.getLogger("ratatoskr.backends")
 
 
 def default_factory(name: str, config: ConnectionConfig) -> Backend:
+    if isinstance(config, PrometheusConnection):
+        return PrometheusBackend(name, config)
     return PostgresBackend(name, config)
 
 

@@ -2,9 +2,19 @@ from collections.abc import AsyncIterator, Iterator
 
 import pytest
 from testcontainers.community.postgres import PostgresContainer
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.wait_strategies import HttpWaitStrategy
 
 from ratatoskr.config.models import RatatoskrConfig
-from tests.integration.helpers import MakeHarness, ToolHarness, seed
+from tests.integration.helpers import (
+    PROMETHEUS_CONFIG,
+    PROMETHEUS_IMAGE,
+    PROMETHEUS_RULES,
+    MakeHarness,
+    ToolHarness,
+    seed,
+    wait_for_prometheus_data,
+)
 
 
 @pytest.fixture(scope="session")
@@ -15,6 +25,22 @@ def pg_dsn() -> Iterator[str]:
     with container:
         host_port = container.get_exposed_port(5432)
         yield f"postgresql://{container.username}:{container.password}@127.0.0.1:{host_port}/{container.dbname}"
+
+
+@pytest.fixture(scope="session")
+def prometheus_url() -> Iterator[str]:
+    """URL of a throwaway Prometheus bound to 127.0.0.1 that scrapes itself every second and evaluates two alerts."""
+    container = (
+        DockerContainer(PROMETHEUS_IMAGE)
+        .with_copy_into_container(PROMETHEUS_CONFIG.encode(), "/etc/prometheus/prometheus.yml")
+        .with_copy_into_container(PROMETHEUS_RULES.encode(), "/etc/prometheus/rules.yml")
+        .waiting_for(HttpWaitStrategy(9090, "/-/ready").for_status_code(200))
+    )
+    container.ports["9090"] = ("127.0.0.1", None)  # random host port, loopback only
+    with container:
+        url = f"http://127.0.0.1:{container.get_exposed_port(9090)}"
+        wait_for_prometheus_data(url)
+        yield url
 
 
 @pytest.fixture

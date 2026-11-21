@@ -16,18 +16,24 @@ def make_config(
     roles: dict[str, dict[str, str]] | None = None,
     **server: Any,
 ) -> RatatoskrConfig:
-    """A valid config; connections default to one read-mode 'main' connection."""
+    """A valid config; connections default to one read-mode 'main' connection.
+
+    Connections are PostgreSQL unless their values say ``kind: prometheus`` (then they get a fake URL).
+    """
     if connections is None:
         connections = {"main": {"mode": "read"}}
     data: dict[str, Any] = {
         "server": server,
         "roles": roles or {},
-        "connections": {
-            name: {"kind": "postgres", "dsn": f"postgresql://u:secret@db.internal/{name}", **values}
-            for name, values in connections.items()
-        },
+        "connections": {name: _connection(name, values) for name, values in connections.items()},
     }
     return RatatoskrConfig.model_validate(data)
+
+
+def _connection(name: str, values: dict[str, Any]) -> dict[str, Any]:
+    if values.get("kind") == "prometheus":
+        return {"url": f"http://{name}.prometheus.internal:9090", **values}
+    return {"kind": "postgres", "dsn": f"postgresql://u:secret@db.internal/{name}", **values}
 
 
 class FakeBackend:

@@ -2,6 +2,7 @@
 # Secrets never go in this file: reference them as ${ENV_VAR} or ${file:/path/to/secret}.
 # An undefined variable is an error. Validate with:  ratatoskr check-config --config config.yaml
 # Durations accept a number of seconds or "30s", "5m", "1h", "30d".
+# Proxies: outgoing HTTP (OIDC, Prometheus) honours HTTPS_PROXY / HTTP_PROXY; list internal hosts in NO_PROXY.
 
 server:
   transport: stdio            # stdio (local, Claude Desktop / Code) | streamable-http (remote, OAuth; see below)
@@ -58,6 +59,19 @@ connections:
     #   ca_file: /config/certs/app-db-ca.pem   # ignored by mode: require (libpq would treat that as verify-ca)
     #   cert_file: /config/certs/client.pem    # client certificate; set together with key_file
     #   key_file: /config/certs/client.key
+
+  # metrics:                    # Prometheus HTTP API: Prometheus, Mimir, Thanos Query, VictoriaMetrics (see README)
+  #   kind: prometheus          # always read-only (leave mode out); PromQL itself is not restricted
+  #   description: "Production metrics"
+  #   url: http://prometheus:9090   # API root (<url>/api/v1/...); for Mimir include its prefix: https://mimir/prometheus
+  #   auth:                     # none (default) | basic (username, password) | bearer (token)
+  #     type: bearer
+  #     token: ${PROM_TOKEN}
+  #   headers:                  # extra request headers, e.g. a Mimir/Cortex tenant; not Authorization or Host
+  #     X-Scope-OrgID: ${PROM_TENANT}
+  #   timeout: 30s              # per request; also sent to Prometheus as the query evaluation timeout
+  #   tls: { verify: true }     # https only; ca_file: /config/certs/prom-ca.pem trusts only that CA
+  #   limits: { max_series: 100, max_values: 500, max_points: 1000, max_range: 31d, max_response_bytes: 65536 }
 
   # staging-db:
   #   kind: postgres

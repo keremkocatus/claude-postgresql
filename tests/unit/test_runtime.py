@@ -511,3 +511,42 @@ async def test_on_unavailable_output_is_clamped() -> None:
 
 async def _never_call(backend: Backend, access: Access) -> ToolOutput:
     raise AssertionError("must not be called")
+
+
+async def test_wrong_kind_is_refused_before_the_backend_opens() -> None:
+    runtime, sink, factory = _runtime()
+    result = await runtime.run(tool="prom_query", connection="prod", need=Access.READ, call=_ok, kind="prometheus")
+    assert result == ToolResult(
+        "Error: Connection 'prod' is a postgres connection; prom_query needs a prometheus connection. "
+        "list_connections shows the kind of each connection.",
+        is_error=True,
+    )
+    assert factory.backends["prod"].open_calls == 0
+    [event] = sink.events
+    assert (event.result, event.error_class) == ("error", "InvalidRequestError")
+
+
+async def test_kind_check_comes_after_authorization() -> None:
+    runtime, sink, _ = _runtime(role=None)
+    result = await runtime.run(tool="prom_query", connection="prod", need=Access.READ, call=_ok, kind="prometheus")
+    assert result.text == "Error: Connection 'prod' not found."
+    assert sink.events[0].result == "denied"
+
+
+async def test_matching_kind_runs_the_call() -> None:
+    runtime, _, _ = _runtime()
+    result = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=_ok, kind="postgres")
+    assert result == ToolResult("prod:READ", is_error=False)
+
+
+async def test_truncation_hint_is_chosen_per_call() -> None:
+    runtime, _, _ = _runtime()
+
+    async def big(backend: Backend, access: Access) -> ToolOutput:
+        return ToolOutput(text="x" * 5000)
+
+    result = await runtime.run(
+        tool="prom_query", connection="prod", need=Access.READ, call=big, truncation_hint="Add label matchers."
+    )
+    assert result.text.endswith("Add label matchers.]")
+    assert len(result.text.encode()) <= 1024

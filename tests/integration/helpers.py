@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
 import asyncpg
+import httpx
 from mcp.types import CallToolResult, TextContent
 
 from ratatoskr.app import build_app
@@ -32,6 +34,55 @@ ANALYZE items;
 
 # A DSN nothing listens on. Policy tests use it for connections that must never be opened.
 UNREACHABLE_DSN = "postgresql://ratatoskr:hunter2@127.0.0.1:1/nowhere"
+
+PROMETHEUS_IMAGE = "prom/prometheus:v3.16.0"
+PROMETHEUS_CONFIG = """
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+rule_files: [/etc/prometheus/rules.yml]
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+"""
+PROMETHEUS_RULES = """
+groups:
+  - name: ratatoskr-test
+    rules:
+      - alert: AlwaysFiring
+        expr: vector(1)
+        labels: {severity: info}
+        annotations: {summary: Integration test alert that always fires}
+      - alert: AlwaysPending
+        expr: vector(1)
+        for: 1h
+        labels: {severity: warning}
+      - record: job:up:sum
+        expr: sum by (job) (up)
+"""
+# Nothing listens here: tests for an unreachable Prometheus.
+UNREACHABLE_PROMETHEUS = "http://127.0.0.1:1"
+
+
+def wait_for_prometheus_data(url: str, *, timeout: float = 60.0) -> None:
+    """Block until Prometheus holds at least 5 samples of `up` and both test alerts are active."""
+    deadline = time.monotonic() + timeout
+    with httpx.Client(base_url=url, timeout=5.0, trust_env=False) as client:
+        while time.monotonic() < deadline:
+            samples = client.get("/api/v1/query", params={"query": "count_over_time(up[1m])"}).json()
+            alerts = client.get("/api/v1/alerts").json()
+            result = samples["data"]["result"]
+            if result and float(result[0]["value"][1]) >= 5 and len(alerts["data"]["alerts"]) >= 2:
+                return
+            time.sleep(0.5)
+    raise RuntimeError("Prometheus did not collect samples in time")
+
+
+def make_prom_config(url: str, **values: Any) -> RatatoskrConfig:
+    """Connection 'prom' for the local container (10 s timeout); role 'admins' has '*': write."""
+    connection: dict[str, Any] = {"kind": "prometheus", "url": url, "timeout": "10s", **values}
+    return RatatoskrConfig.model_validate({"roles": {"admins": {"*": "write"}}, "connections": {"prom": connection}})
 
 
 async def seed(dsn: str) -> None:

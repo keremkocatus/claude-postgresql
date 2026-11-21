@@ -14,7 +14,12 @@ from ratatoskr.auth.policy import ConnectionNotFoundError, InsufficientAccessErr
 from ratatoskr.auth.principal import Principal
 from ratatoskr.auth.resolver import PrincipalResolver
 from ratatoskr.backends.base import Backend
-from ratatoskr.backends.errors import BackendError, BackendTimeoutError, BackendUnavailableError
+from ratatoskr.backends.errors import (
+    BackendError,
+    BackendTimeoutError,
+    BackendUnavailableError,
+    InvalidRequestError,
+)
 from ratatoskr.backends.limits import clamp_text
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.models import Access
@@ -69,8 +74,14 @@ class ToolRuntime:
         query_text: str | None = None,
         timeout: float | None = None,
         on_unavailable: Callable[[BackendUnavailableError], ToolOutput] | None = None,
+        kind: str | None = None,
+        truncation_hint: str = TRUNCATION_HINT,
     ) -> ToolResult:
         """resolve -> authorize -> registry.get -> deadline -> clamp -> audit; errors become safe ``Error:`` text.
+
+        ``kind``: the backend kind the tool needs (``prometheus``). Checked after authorization (so a forbidden
+        connection still reads "not found") and before the backend is opened. ``truncation_hint`` ends the note
+        appended when the response is clamped; it should say how to narrow a request of this kind.
 
         ``on_unavailable``: when opening the backend (``registry.get``) raises ``BackendUnavailableError``, render
         that as the tool's output instead of an ``Error:`` text. That output is the tool's answer (for example a
@@ -83,6 +94,8 @@ class ToolRuntime:
         try:
             principal = self._resolver.resolve()
             access = self.policy.authorize(principal, connection, need)
+            if kind is not None:
+                self._check_kind(tool, connection, kind)
             async with asyncio.timeout(timeout):
                 try:
                     backend = await self.registry.get(connection)
@@ -93,16 +106,24 @@ class ToolRuntime:
                 else:
                     output = await call(backend, access)
             outcome.rows = output.rows
-            result = self._success(output.text, connection)
+            result = self._success(output.text, connection, truncation_hint)
         except asyncio.CancelledError:
             outcome.result, outcome.error_class = "error", "CancelledError"
             self._record(tool, connection, principal, query_text, started, outcome)
             raise
         except Exception as exc:
             text = self._error_text(exc, tool=tool, connection=connection, outcome=outcome, identified=principal)
-            result = self._failure(text, connection)
+            result = self._failure(text, connection, truncation_hint)
         self._record(tool, connection, principal, query_text, started, outcome)
         return result
+
+    def _check_kind(self, tool: str, connection: str, kind: str) -> None:
+        actual = self.registry.describe(connection).kind
+        if actual != kind:
+            raise InvalidRequestError(
+                f"Connection '{connection}' is a {actual} connection; {tool} needs a {kind} connection. "
+                "list_connections shows the kind of each connection."
+            )
 
     async def run_global(
         self,
@@ -131,16 +152,16 @@ class ToolRuntime:
         self._record(tool, None, principal, None, started, outcome)
         return result
 
-    def _success(self, text: str, connection: str | None) -> ToolResult:
+    def _success(self, text: str, connection: str | None, hint: str = TRUNCATION_HINT) -> ToolResult:
         """Successful output is the user's data: it is clamped but never redacted (that would corrupt rows)."""
-        return ToolResult(text=self._clamp(text, connection), is_error=False)
+        return ToolResult(text=self._clamp(text, connection, hint), is_error=False)
 
-    def _failure(self, text: str, connection: str | None) -> ToolResult:
+    def _failure(self, text: str, connection: str | None, hint: str = TRUNCATION_HINT) -> ToolResult:
         """Error text is redacted first, then clamped, so the byte limit always holds."""
-        return ToolResult(text=self._clamp(redact(text), connection), is_error=True)
+        return ToolResult(text=self._clamp(redact(text), connection, hint), is_error=True)
 
-    def _clamp(self, text: str, connection: str | None) -> str:
-        return clamp_text(text, self.registry.max_response_bytes(connection), TRUNCATION_HINT).text
+    def _clamp(self, text: str, connection: str | None, hint: str) -> str:
+        return clamp_text(text, self.registry.max_response_bytes(connection), hint).text
 
     @staticmethod
     def _error_text(

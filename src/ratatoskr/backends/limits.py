@@ -20,3 +20,8 @@ def clamp_text(text: str, max_bytes: int, hint: str) -> Truncated:
     budget = max(0, max_bytes - len(note.encode("utf-8")))
     head = encoded[:budget].decode("utf-8", errors="ignore")
     return Truncated(text=head + note, truncated=True)
+
+
+def clip_input(text: str, limit: int = 64) -> str:
+    """User input echoed in an error message, cut to *limit* characters."""
+    return text if len(text) <= limit else text[:limit] + "…"

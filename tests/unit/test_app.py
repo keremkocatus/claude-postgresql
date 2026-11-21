@@ -16,17 +16,19 @@ def _app() -> FastMCP[Any]:
     return build_app(CONFIG, resolver=StdioPrincipalResolver("admins"), audit=RecordingSink())
 
 
-async def test_registers_eleven_tools() -> None:
+async def test_registers_sixteen_tools() -> None:
     names = [tool.name for tool in await _app().list_tools()]
     assert names[:2] == ["list_connections", "connection_health"]
-    assert len(names) == 11
-    assert all(name.startswith("pg_") for name in names[2:])
+    assert len(names) == 16
+    assert all(name.startswith("pg_") for name in names[2:11])
+    assert all(name.startswith("prom_") for name in names[11:])
 
 
 async def test_instructions_point_to_list_connections() -> None:
     app = _app()
     assert app.name == "ratatoskr"
     assert "list_connections" in (app.instructions or "")
+    assert "prom_query_range" in (app.instructions or "")
 
 
 async def test_list_connections_works_without_database() -> None:

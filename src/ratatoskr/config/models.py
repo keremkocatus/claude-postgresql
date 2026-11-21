@@ -20,7 +20,9 @@ from pydantic import (
     model_validator,
 )
 
-from ratatoskr.config.durations import parse_duration
+from ratatoskr.config.prometheus_models import PrometheusConnection
+from ratatoskr.config.shared import DEFAULT_MAX_RESPONSE_BYTES
+from ratatoskr.config.shared import duration_value as _duration
 
 CONNECTION_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -55,12 +57,6 @@ def _is_redirect_host(host: str) -> bool:
         except ValueError:
             return False
     return True
-
-
-def _duration(value: Any) -> timedelta:
-    if isinstance(value, str | int | float | timedelta):
-        return parse_duration(value)
-    raise ValueError("duration must be a number of seconds or a string like '30s', '5m', '1h', '30d'")
 
 
 class ServerSettings(BaseModel):
@@ -224,9 +220,6 @@ class PgTlsSettings(BaseModel):
         return self
 
 
-DEFAULT_MAX_RESPONSE_BYTES = 65536
-
-
 class PgLimits(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -269,8 +262,8 @@ class PostgresConnection(BaseModel):
         return self
 
 
-ConnectionConfig = Annotated[PostgresConnection, Field(discriminator="kind")]
-# Stage 2/3 extend this union with PrometheusConnection / LokiConnection.
+ConnectionConfig = Annotated[PostgresConnection | PrometheusConnection, Field(discriminator="kind")]
+# Stage 3 adds LokiConnection to this union.
 
 
 class RatatoskrConfig(BaseModel):

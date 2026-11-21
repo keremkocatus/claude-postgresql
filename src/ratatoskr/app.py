@@ -15,6 +15,7 @@ from ratatoskr import __version__
 from ratatoskr.auth.policy import Policy
 from ratatoskr.auth.resolver import PrincipalResolver
 from ratatoskr.backends.postgres.tools import register_postgres_tools
+from ratatoskr.backends.prometheus.tools import register_prometheus_tools
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.models import RatatoskrConfig
 from ratatoskr.observability.audit import AuditSink
@@ -22,11 +23,13 @@ from ratatoskr.tools.common import register_common_tools
 from ratatoskr.tools.runtime import ToolRuntime
 
 INSTRUCTIONS = (
-    "Ratatoskr connects you to several named data sources (currently PostgreSQL databases). "
-    "Call list_connections first to see which connections you may use and whether you can read or write; "
-    "every other tool takes one of those names as its `connection` argument. Explore with pg_list_schemas, "
-    "pg_list_tables and pg_describe_table before writing SQL, and prefer pg_query for reads. "
-    "pg_execute changes data and needs write access."
+    "Ratatoskr connects you to several named data sources: PostgreSQL databases and Prometheus servers. "
+    "Call list_connections first to see which connections you may use, their kind and whether you can read or "
+    "write; every other tool takes one of those names as its `connection` argument. PostgreSQL (pg_*): explore "
+    "with pg_list_schemas, pg_list_tables and pg_describe_table before writing SQL, and prefer pg_query for reads; "
+    "pg_execute changes data and needs write access. Prometheus (prom_*): find metrics with prom_list_metrics and "
+    "prom_label_values, then use prom_query for the current state and prom_query_range for trends; prom_alerts "
+    "shows what is firing."
 )
 
 
@@ -73,4 +76,5 @@ def build_app(
     mcp._mcp_server.version = __version__
     register_common_tools(mcp, runtime)
     register_postgres_tools(mcp, runtime)
+    register_prometheus_tools(mcp, runtime)
     return mcp

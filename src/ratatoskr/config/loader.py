@@ -20,7 +20,7 @@ from ratatoskr.config.models import RatatoskrConfig
 
 _REFERENCE_RE = re.compile(r"\$\{([^}]*)\}")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_KIND_TAGS = frozenset({"postgres"})
+_KIND_TAGS = frozenset({"postgres", "prometheus"})
 
 
 class ConfigError(Exception):
@@ -116,5 +116,8 @@ def _format_validation_error(path: Path, exc: ValidationError) -> str:
         if len(location) >= 3 and location[0] == "connections" and location[2] in _KIND_TAGS:
             del location[2]
         message = str(error["msg"]).removeprefix("Value error, ")
+        if error["type"] == "union_tag_invalid":
+            # pydantic's text repeats the given tag, which could be a misplaced ${SECRET}
+            message = f"unknown value; expected one of {error.get('ctx', {}).get('expected_tags', '')}"
         lines.append(f"  - {'.'.join(location) or '<root>'}: {message}")
     return "\n".join(lines)

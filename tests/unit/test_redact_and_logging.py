@@ -60,6 +60,16 @@ def test_setup_logging_hides_per_request_mcp_lines_at_info(level: str, shown: bo
     assert "still visible" in stream.getvalue()
 
 
+@pytest.mark.parametrize(("level", "shown"), [("INFO", False), ("DEBUG", True)])
+def test_setup_logging_hides_httpx_request_lines_at_info(level: str, shown: bool) -> None:
+    stream = io.StringIO()
+    setup_logging(level, stream=stream)
+    logging.getLogger("httpx").info('HTTP Request: POST http://prometheus.internal:9090/api/v1/query "200 OK"')
+    logging.getLogger("httpx").warning("httpx warning stays")
+    assert ("prometheus.internal" in stream.getvalue()) is shown
+    assert "httpx warning stays" in stream.getvalue()
+
+
 # --- review fixes: wider redaction, structured extras, root logger ---
 
 SECRET_URL = "postgresql://u:hunter2@h/d"

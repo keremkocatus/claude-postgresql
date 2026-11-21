@@ -264,7 +264,7 @@ def test_serve_stdio_subprocess_speaks_json_rpc_without_leaking(tmp_path: Path) 
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = _read_message(lines, 30)
         assert tools["id"] == 2
-        assert len(tools["result"]["tools"]) == 11
+        assert len(tools["result"]["tools"]) == 16
         send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_connections"}})
         called = _read_message(lines, 30)
         assert called["id"] == 3

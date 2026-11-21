@@ -20,6 +20,7 @@ _STANDARD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict
 
 
 MCP_REQUEST_LOGGER = "mcp.server.lowlevel.server"
+HTTPX_LOGGER = "httpx"
 
 _MAX_DEPTH = 20
 _CUT = "<...>"
@@ -132,3 +133,5 @@ def setup_logging(level: str = "INFO", stream: TextIO | None = None) -> None:
     # The MCP SDK logs "Processing request of type ..." at INFO for every request; keep that for DEBUG only.
     quiet = level.upper() == "INFO"
     logging.getLogger(MCP_REQUEST_LOGGER).setLevel(logging.WARNING if quiet else logging.NOTSET)
+    # httpx logs every request line (URL with query string: internal hosts, label matchers) at INFO.
+    logging.getLogger(HTTPX_LOGGER).setLevel(logging.WARNING if quiet else logging.NOTSET)
