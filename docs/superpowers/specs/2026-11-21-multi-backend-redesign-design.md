@@ -1,7 +1,7 @@
 # Çoklu Backend MCP Sunucusu — Tasarım
 
 - **Tarih:** 2026-11-21
-- **Durum:** Onay bekliyor
+- **Durum:** Onaylandı
 - **Kapsam:** `claude-postgresql` projesinin, birden fazla PostgreSQL, Prometheus ve Loki bağlantısına güvenli,
   çok kullanıcılı erişim sağlayan genel bir MCP sunucusuna dönüştürülmesi.
 
@@ -24,17 +24,20 @@ sorgular, metriklere ve loglara bakar, bunları tek konuşmada ilişkilendirir.
 
 ## 2. İsim
 
-Adaylar (2026-11-21 itibarıyla PyPI'da boş; GitHub org/repo ve GHCR adı ayrıca kontrol edilmeli):
+**Ratatoskr** — İskandinav mitolojisinde dünya ağacı Yggdrasil'de diyarlar arasında mesaj taşıyan sincap;
+Claude ile birçok veritabanı, metrik ve log sistemi arasında gidip gelen bir connector'ın karşılığı ve
+Loki ile aynı mitolojiden.
 
-| Ad | Not |
+| Kullanım | Ad |
 |---|---|
-| **`infraquery`** (öneri) | Ne yaptığını söylüyor: altyapıyı sorgula. CLI ve paket adı olarak kısa. |
-| `opslens` | Gözlemlenebilirlik çağrışımı güçlü, DB tarafını daha az anlatıyor. |
-| `opsbridge` | "Claude ile altyapı arasında köprü"; biraz jenerik. |
-| `stackprobe` | Akılda kalıcı, ama "probe" yazma işlemini çağrıştırmıyor. |
+| PyPI paketi | `ratatoskr-mcp` (`ratatoskr` PyPI'da dolu) |
+| Python modülü | `ratatoskr` |
+| CLI komutu | `ratatoskr` |
+| Docker imajı | `ghcr.io/keremkocatus/ratatoskr` |
+| GitHub repo | `ratatoskr` (eski URL GitHub tarafından yönlendirilir) |
+| Env öneki | `RATATOSKR_` (yalnız `RATATOSKR_CONFIG` gibi sunucu düzeyi ayarlar için) |
 
-Karar verilene kadar bu dokümanda paket adı `<pkg>` olarak geçer. Seçilen ad: PyPI paketi, Python modülü,
-CLI komutu, GHCR imajı (`ghcr.io/<owner>/<pkg>`) ve GitHub repo adı olarak kullanılır.
+Bu dokümanda `<pkg>` geçen her yer `ratatoskr` demektir.
 
 ## 3. Mimari
 
@@ -400,7 +403,3 @@ Her aşama kendi uygulama planına sahip olur ve kendi başına çalışır duru
 2. **Prometheus backend'i:** client, 5 tool, özetleme, integration testleri.
 3. **Loki backend'i:** client, 3 tool, integration testleri.
 4. **Paketleme ve open-source hijyeni:** compose dosyaları + Caddy, CI/GHCR, metrikler, dokümantasyon seti.
-
-## 13. Açık kararlar
-
-- Proje adı (Bölüm 2).
