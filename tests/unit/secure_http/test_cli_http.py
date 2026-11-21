@@ -172,7 +172,7 @@ def test_check_config_takes_insecure_dev_like_serve(write_config, capsys) -> Non
 def test_check_config_insecure_dev_still_requires_a_loopback_host(write_config, capsys) -> None:
     path = write_config(public_url="http://127.0.0.1:8000", host="0.0.0.0")
     assert main(["check-config", "--config", path, "--insecure-dev"]) == 2
-    assert "Config error" in capsys.readouterr().err
+    assert "--insecure-dev is only allowed when server.host" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("command", ["check-config", "serve"])

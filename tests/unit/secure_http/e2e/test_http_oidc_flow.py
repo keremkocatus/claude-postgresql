@@ -76,6 +76,12 @@ async def test_oidc_login_refresh_and_offboarding(http_app, run_app, fake_issuer
         assert rejected.status_code == 400 and rejected.json()["error"] == "invalid_grant"
         assert (await driver.call_tool(new["access_token"], session, "list_connections")).status_code == 401
 
+        # The session is gone for good: trying the same refresh token again fails without asking the issuer.
+        upstream_calls = len(fake_issuer.token_requests)
+        again = await driver.refresh(new["refresh_token"])
+        assert again.status_code == 400 and again.json()["error"] == "invalid_grant"
+        assert len(fake_issuer.token_requests) == upstream_calls
+
 
 async def test_forged_state_is_rejected_without_reaching_the_issuer(http_app, run_app, fake_issuer) -> None:
     async with run_app(http_app) as driver:

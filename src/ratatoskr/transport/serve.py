@@ -15,6 +15,9 @@ UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.asgi")
 UVICORN_ACCESS_LOGGER = "uvicorn.access"
 # aiosqlite logs every statement with its parameters (token hashes, sealed secrets) at DEBUG.
 AIOSQLITE_LOGGER = "aiosqlite"
+# How long shutdown waits for open connections (idle SSE streams, stalled requests) before cancelling them; below
+# Docker's default 10 s stop grace period so the lifespan (registry, audit flush, store) still closes cleanly.
+GRACEFUL_SHUTDOWN_SECONDS = 5
 
 
 class HttpServerStartupError(RuntimeError):
@@ -43,6 +46,8 @@ def uvicorn_config(app: ASGIApp, server: ServerSettings) -> uvicorn.Config:
     ``access_log=False``: request lines carry ``/login?request=…`` and ``/oauth/callback?code=…`` values that must
     not reach logs (uvicorn then also empties ``uvicorn.access`` and stops it propagating). ``proxy_headers=False``:
     uvicorn must not rewrite the client address; ``transport.client_ip`` applies ``server.trusted_proxies`` itself.
+    ``http="h11"``, ``ws="none"``: fixed protocol implementations, not whatever optional package happens to be
+    installed (the app serves no websockets). ``timeout_graceful_shutdown``: see :data:`GRACEFUL_SHUTDOWN_SECONDS`.
     """
     config = uvicorn.Config(
         app,
@@ -53,6 +58,9 @@ def uvicorn_config(app: ASGIApp, server: ServerSettings) -> uvicorn.Config:
         access_log=False,
         log_config=None,
         lifespan="on",
+        http="h11",
+        ws="none",
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
     route_uvicorn_logs_to_root()
     return config

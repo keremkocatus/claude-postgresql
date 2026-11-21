@@ -11,7 +11,9 @@ from starlette.applications import Starlette
 from ratatoskr.observability.logging import setup_logging
 from ratatoskr.transport import serve as serve_module
 from ratatoskr.transport.preconditions import check_http_preconditions
-from ratatoskr.transport.serve import UVICORN_LOGGERS, uvicorn_config
+from ratatoskr.transport.serve import GRACEFUL_SHUTDOWN_SECONDS, UVICORN_LOGGERS, uvicorn_config
+
+DOCKER_STOP_GRACE_SECONDS = 10
 
 
 @pytest.fixture
@@ -39,6 +41,8 @@ def test_uvicorn_logs_go_through_the_redacting_root_handler(make_config, clean_u
 
     assert config.log_config is None and config.access_log is False and config.proxy_headers is False
     assert config.server_header is False
+    # Pinned protocol implementations: no optional httptools/websockets picked up from the environment.
+    assert (config.http, config.ws) == ("h11", "none")
     for name in UVICORN_LOGGERS:
         assert logging.getLogger(name).handlers == [] and logging.getLogger(name).propagate
     assert not logging.getLogger("uvicorn.access").hasHandlers()
@@ -59,6 +63,10 @@ def test_serve_http_runs_uvicorn_with_that_config(make_config, monkeypatch, clea
     assert len(seen) == 1
     assert (seen[0].host, seen[0].port, seen[0].log_config, seen[0].access_log) == ("0.0.0.0", 8123, None, False)
     assert isinstance(seen[0].app, Starlette)
+    assert (seen[0].http, seen[0].ws) == ("h11", "none")
+    # Open connections (an idle SSE stream, a stalled request) must not hold shutdown past Docker's grace period.
+    assert seen[0].timeout_graceful_shutdown == GRACEFUL_SHUTDOWN_SECONDS
+    assert 0 < GRACEFUL_SHUTDOWN_SECONDS < DOCKER_STOP_GRACE_SECONDS
     assert logging.getLogger("aiosqlite").level == logging.INFO
 
 

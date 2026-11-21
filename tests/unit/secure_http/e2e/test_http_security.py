@@ -107,15 +107,22 @@ async def test_foreign_origin_is_rejected_by_dns_rebinding_protection(http_app, 
     async with run_app(http_app) as driver:
         await driver.register()
         tokens = await driver.exchange(await driver.login_for_code())
-        bad_origin = await driver.mcp_post(
-            tokens["access_token"], driver.rpc("tools/list"), headers={"Origin": "https://attacker.example"}
+        init = driver.rpc(
+            "initialize",
+            {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}},
         )
+        bad_origin = await driver.mcp_post(tokens["access_token"], init, headers={"Origin": "https://attacker.example"})
+        # Positive control: the same request from the public origin is served.
+        own_origin = await driver.mcp_post(tokens["access_token"], init, headers={"Origin": "https://mcp.example.com"})
     assert bad_origin.status_code == 403
+    assert own_origin.status_code == 200, own_origin.text
 
 
 async def test_invalid_login_link_shows_a_framing_protected_error_page(http_app, run_app) -> None:
     async with run_app(http_app) as driver:
-        response = await driver.http.get("/login?request=does-not-exist")
+        response = await driver.http.get("/login", params={"request": "<script>reflected-7731</script>"})
     assert response.status_code == 400
+    assert "reflected-7731" not in response.text
+    assert response.headers["cache-control"] == "no-store"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
     assert response.headers["x-content-type-options"] == "nosniff"
