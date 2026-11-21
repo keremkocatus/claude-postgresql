@@ -296,3 +296,7 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Python 3.13 `ssl.create_default_context` `VERIFY_X509_STRICT` açar; `keyUsage` içermeyen iç CA'lar reddedilir
   (libpq kabul eder). Docker imajı 3.12. Dokümante edilecek.
 - `tls.mode: require` + `ca_file` CA'yı yok sayar (libpq bunu verify-ca sayar). Dokümante edilecek.
+- `check-config` `--insecure-dev` almıyor; 1b'de `serve --insecure-dev`'in kabul ettiği bir config `check-config`'te
+  de doğrulanabilmeli (bayrağı ekle).
+- Log'lar stdio'da protokolü korumak için **stderr**'e gider (spec §8'deki "stdout" ifadesi HTTP içindir). 1b HTTP'de de
+  stderr'de bırakabilir; Docker ikisini de toplar. Bunu "düzeltip" stdio'yu bozmamak için stdout'a geçirme.
