@@ -355,3 +355,7 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   issuer da reddedilsin ki `check-config` ile `serve` aynı sonucu versin.
 - Task 18 (Authentik rehberi): `subject_claim: email` `email_verified` kontrol etmez; Authentik'te kullanıcıların
   e-postasını değiştirememesini sağlayın ya da `subject_claim: sub` kullanın (audit'teki kimlik için).
+- Task 18 (Authentik rehberi): signing key seçilmezse Authentik boş JWKS yayınlar; hata metni "issuer JWKS contains no
+  usable RSA or EC signing key" olur — sorun giderme tablosu buna göre yazılsın. `email`/`groups` yalnız ID token'dan
+  okunur: provider'da "Include claims in id_token" açık kalmalı. JWKS'te tekrarlanan `kid` → ilki kullanılır.
+- Local kullanıcıların argon2 parametreleri (m,t,p) aynı olmalı (kullanıcı sayımı riskine karşı); farklıysa config hatası.
