@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol
 
+from ratatoskr.observability.redact import redact
+
 AuditResult = Literal["ok", "denied", "error", "timeout"]
 
 MAX_AUDIT_QUERY_CHARS = 4096
@@ -45,14 +47,14 @@ def build_event(
     error_class: str | None,
     ts: datetime | None = None,
 ) -> AuditEvent:
-    """Create an event, hashing the full query text and keeping at most 4096 characters of it."""
+    """Create an event: the hash covers the full raw query text; the stored text is redacted, then cut to 4096."""
     return AuditEvent(
         ts=ts or datetime.now(UTC),
         subject=subject,
         auth_source=auth_source,
         connection=connection,
         tool=tool,
-        query_text=None if query_text is None else query_text[:MAX_AUDIT_QUERY_CHARS],
+        query_text=None if query_text is None else redact(query_text)[:MAX_AUDIT_QUERY_CHARS],
         query_sha256=None if query_text is None else hashlib.sha256(query_text.encode("utf-8")).hexdigest(),
         duration_ms=round(duration_ms, 2),
         rows=rows,

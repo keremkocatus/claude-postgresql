@@ -78,3 +78,12 @@ def test_composite_sink_isolates_failures() -> None:
     recorder = _Recorder()
     CompositeAuditSink([_Exploding(), recorder]).record(_event())
     assert len(recorder.events) == 1
+
+
+def test_build_event_redacts_query_text_but_hashes_raw() -> None:
+    query = "SELECT * FROM dblink('postgresql://u:pw@h/d', 'SELECT 1') AS t(x int)"
+    event = _event(query_text=query)
+    assert event.query_text is not None
+    assert "pw@" not in event.query_text
+    assert "postgresql://***" in event.query_text
+    assert event.query_sha256 == hashlib.sha256(query.encode()).hexdigest()
