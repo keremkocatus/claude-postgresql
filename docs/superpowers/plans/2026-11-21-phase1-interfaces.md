@@ -349,3 +349,9 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Task 12 (client_ip): IP'yi kanonikleştir (`str(ip_address(hop))`), `ipv4_mapped`'i aç, rate-limit anahtarı için IPv6'yı
   /64 ağına indir (`str(ip_network(f"{ip}/64", strict=False).network_address)`).
 - Task 10/13 (register_client): istemci başına redirect URI sayısını sınırla (örn. 10); URI uzunluğu 2048'i aşamaz.
+- Task 13: login rate-limit kullanıcı anahtarı `normalize_username(username)` (identity/local) ile kurulur.
+  `OidcIdentityProvider(..., allow_insecure_http=insecure_dev)`; kurucunun `ValueError`'ı `ConfigError`'a çevrilir.
+- Task 12 (preconditions/check-config): normalize edilince çakışan local kullanıcı adları ve https olmayan OIDC
+  issuer da reddedilsin ki `check-config` ile `serve` aynı sonucu versin.
+- Task 18 (Authentik rehberi): `subject_claim: email` `email_verified` kontrol etmez; Authentik'te kullanıcıların
+  e-postasını değiştirememesini sağlayın ya da `subject_claim: sub` kullanın (audit'teki kimlik için).
