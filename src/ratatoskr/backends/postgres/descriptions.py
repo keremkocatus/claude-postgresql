@@ -11,7 +11,7 @@ SCHEMA = "Exact schema name, case-sensitive (default 'public'). Use pg_list_sche
 TABLE = "Exact table, view or materialized view name, case-sensitive, without the schema prefix."
 NAME_LIKE = (
     "Optional case-insensitive filter on relation names (SQL ILIKE: % matches any text, _ one character), "
-    "e.g. 'order%'. Use it to narrow large schemas."
+    "e.g. 'order%'. Escape a literal % or _ with a backslash (\\_). Use it to narrow large schemas."
 )
 SQL_READ = "One SQL statement (no trailing second statement). Use $1, $2, ... placeholders for values."
 PARAMS = (

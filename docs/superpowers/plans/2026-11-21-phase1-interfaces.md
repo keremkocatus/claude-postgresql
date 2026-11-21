@@ -300,3 +300,5 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   de doğrulanabilmeli (bayrağı ekle).
 - Log'lar stdio'da protokolü korumak için **stderr**'e gider (spec §8'deki "stdout" ifadesi HTTP içindir). 1b HTTP'de de
   stderr'de bırakabilir; Docker ikisini de toplar. Bunu "düzeltip" stdio'yu bozmamak için stdout'a geçirme.
+- Desteklenen en düşük PostgreSQL sürümü 12 (`attgenerated` PG 12+, `conparentid` PG 11+). README ve config
+  referansında yazılacak.

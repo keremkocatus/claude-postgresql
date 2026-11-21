@@ -24,6 +24,11 @@ SEARCH_PATH_SQL = "SELECT pg_catalog.set_config('search_path', 'pg_catalog', tru
 ACTIVITY_LIMIT = 200
 NAME_LIKE_HINT = "Pass name_like (e.g. 'order%') to list fewer relations."
 
+
+def _heading(header: str) -> str:
+    """End a table heading with a colon unless it already ends a sentence."""
+    return header if header.endswith(".") else f"{header}:"
+
 # $1: allowed_schemas (empty array = no restriction), applied in SQL so a restricted connection only counts the
 # relations of its own schemas.
 LIST_SCHEMAS_SQL = """
@@ -292,7 +297,7 @@ async def list_tables(backend: PostgresBackend, schema: str, name_like: str | No
     header = f"{total} relation(s){where}"
     if total > len(relations):
         header += f"; showing the first {len(relations)} by name. {NAME_LIKE_HINT}"
-    return ToolOutput(text=_clamp(backend, f"{header}:\n\n{records_table(relations)}"), rows=len(relations))
+    return ToolOutput(text=_clamp(backend, f"{_heading(header)}\n\n{records_table(relations)}"), rows=len(relations))
 
 
 async def describe_table(backend: PostgresBackend, schema: str, table: str) -> ToolOutput:

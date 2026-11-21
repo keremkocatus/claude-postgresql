@@ -228,3 +228,12 @@ async def test_activity_shows_at_most_200_rows_and_says_so() -> None:
     assert "| 199 |" in output.text and "| 200 |" not in output.text
     assert output.rows == 200
     assert "LIMIT 201" in introspection.ACTIVITY_SQL and "LIMIT 201" in introspection.WAITING_LOCKS_SQL
+
+
+def test_heading_avoids_double_punctuation() -> None:
+    from ratatoskr.backends.postgres.introspection import _heading
+
+    assert _heading("3 relation(s)") == "3 relation(s):"
+    assert _heading("9 relation(s); showing the first 2 by name. Pass name_like.") == (
+        "9 relation(s); showing the first 2 by name. Pass name_like."
+    )
