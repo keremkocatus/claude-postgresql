@@ -2,6 +2,8 @@ import io
 import json
 import logging
 import sys
+import time
+from typing import Any
 
 import pytest
 
@@ -120,3 +122,131 @@ def test_setup_logging_redacts_third_party_and_avoids_duplicates() -> None:
     lines = [json.loads(line) for line in stream.getvalue().strip().splitlines()]
     assert [entry["logger"] for entry in lines] == ["asyncpg", "ratatoskr.y"]
     assert lines[0]["msg"] == "connect postgresql://***"
+
+
+# --- second review: formatter robustness, prefixed keys, escapes, performance ---
+
+
+def _log_to_stream(*args: object, **kwargs: Any) -> tuple[str, list[dict[str, Any]]]:
+    stream = io.StringIO()
+    setup_logging("INFO", stream=stream)
+    logging.getLogger("ratatoskr.z").info(*args, **kwargs)
+    out = stream.getvalue()
+    return out, [json.loads(line) for line in out.strip().splitlines()]
+
+
+def test_bad_format_args_never_leak(capsys: pytest.CaptureFixture[str]) -> None:
+    out, entries = _log_to_stream("bad fmt %s %s", SECRET_URL)
+    err = capsys.readouterr().err
+    assert "hunter2" not in out
+    assert err == ""
+    assert entries[-1]["msg"] == "bad fmt %s %s"
+    assert entries[-1]["format_error"] == "TypeError"
+    assert entries[-1]["level"] == "INFO"
+
+
+class _Unprintable:
+    def __str__(self) -> str:
+        raise RuntimeError(SECRET_URL)
+
+    __repr__ = __str__
+
+
+def test_unprintable_extra_is_replaced() -> None:
+    out, entries = _log_to_stream("x", extra={"obj": _Unprintable(), "items": [_Unprintable()]})
+    assert "hunter2" not in out
+    assert entries[-1]["obj"] == "<unprintable _Unprintable>"
+    assert entries[-1]["items"] == ["<unprintable _Unprintable>"]
+
+
+def test_self_referencing_extra_does_not_raise() -> None:
+    cyclic: dict[str, object] = {"name": "n"}
+    cyclic["self"] = cyclic
+    shared = ["a"]
+    _, entries = _log_to_stream("x", extra={"c": cyclic, "pair": [shared, shared]})
+    assert entries[-1]["c"] == {"name": "n", "self": "<...>"}
+    assert entries[-1]["pair"] == [["a"], ["a"]]  # shared, not cyclic: kept
+
+
+def test_deep_nesting_is_cut() -> None:
+    deep: list[object] = []
+    current = deep
+    for _ in range(100):
+        inner: list[object] = []
+        current.append(inner)
+        current = inner
+    out, _ = _log_to_stream("x", extra={"deep": deep})
+    assert "<...>" in out
+
+
+def test_failing_stream_does_not_leak(capsys: pytest.CaptureFixture[str]) -> None:
+    class _Broken(io.StringIO):
+        def write(self, text: str) -> int:
+            raise OSError("disk gone")
+
+    setup_logging("INFO", stream=_Broken())
+    logging.getLogger("ratatoskr.z").info("connect %s", SECRET_URL)
+    assert "hunter2" not in capsys.readouterr().err
+
+
+def test_redacts_prefixed_secret_keys_in_text() -> None:
+    assert redact("db_password=hunter2 user=app") == "db_password=*** user=app"
+    assert redact('{"db_password": "x", "user": "app"}') == '{"db_password": "***", "user": "app"}'
+    assert redact("X-Api-Key: abc123") == "X-Api-Key: ***"
+    assert redact("apikey=abc api-key=def") == "apikey=*** api-key=***"
+    assert redact("PGPASSWORD=abc") == "PGPASSWORD=***"
+
+
+def test_redacts_prefixed_secret_keys_in_structured_extras() -> None:
+    secrets = {"db_password": "s1", "user_token": "s2", "password_hash": "s3", "X-Api-Key": "s4"}
+    out, entries = _log_to_stream("x", extra={"cfg": secrets})
+    assert entries[-1]["cfg"] == {key: "***" for key in secrets}
+    assert all(value not in out for value in secrets.values())
+
+
+def test_normal_fields_are_never_masked() -> None:
+    fields = {
+        "connection": "main",
+        "subject": "alice",
+        "tool": "pg_query",
+        "rows": 3,
+        "duration_ms": 1.5,
+        "query_sha256": "ab" * 32,
+        "auth_source": "local",
+        "result": "ok",
+        "error_class": None,
+        "audit_ts": "2026-01-01T00:00:00+00:00",
+    }
+    _, entries = _log_to_stream("hello", extra=fields)
+    entry = entries[-1]
+    assert entry["msg"] == "hello"
+    assert entry["logger"] == "ratatoskr.z"
+    assert entry["level"] == "INFO"
+    assert "ts" in entry
+    for key, value in fields.items():
+        assert entry[key] == value
+
+
+def test_redacts_libpq_escaped_quote() -> None:
+    assert redact(r"password='a\'b' user=x") == "password=*** user=x"
+    assert redact(r'password="a\"b" user=x') == "password=*** user=x"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a-" * 500_000,
+        "x" * 1_000_000,
+        '"' * 1_000_000,
+        "password='" * 100_000,
+        '"password": "' * 80_000,
+        "Authorization: " * 70_000,
+        "postgresql://" * 80_000,
+        ("lorem ipsum db_password=x " * 40_000)[:1_000_000],
+    ],
+    ids=["dashes", "word", "quotes", "unterminated-kv", "unterminated-json", "auth", "urls", "mixed"],
+)
+def test_redaction_is_fast_on_one_megabyte(text: str) -> None:
+    started = time.perf_counter()
+    redact(text)
+    assert time.perf_counter() - started < 2.0

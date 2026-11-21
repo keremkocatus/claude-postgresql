@@ -4,26 +4,26 @@ from __future__ import annotations
 
 import re
 
-# Key names whose value is a secret (``password=…``, ``"token": "…"``, ``PGPASSWORD=…``).
-_SECRET_KEYS = (
-    r"pgpassword|password|passwd|pwd|access_token|refresh_token|id_token|token"
-    r"|client_secret|secret_key|secret|api_key|apikey"
-)
+# Secret key names (``password=…``, ``"token": "…"``, ``PGPASSWORD=…``). The patterns are not anchored on
+# the left, so prefixed names (``db_password``, ``user_token``, ``X-Api-Key``) match on their tail: the
+# prefix stays in the text untouched and only the value is masked.
+_SECRET_KEYS = r"password|passwd|pwd|token|secret|api[_-]?key"
+
+# Quoted values honour backslash escapes (libpq ``'a\'b'``, JSON ``"a\"b"``) and are length-bounded so a
+# run of unterminated quotes cannot make the scan quadratic; an over-long or unterminated quoted value falls
+# back to masking up to the next quote or whitespace.
+_QUOTED_VALUE = r"\"(?:[^\"\\]|\\.){0,512}\"|'(?:[^'\\]|\\.){0,512}'|[\"'][^\s\"']*"
 
 _URL_RE = re.compile(r"\b(postgres(?:ql)?(?:\+\w+)?)://[^\s'\"<>\\]+", re.IGNORECASE)
 _AUTH_HEADER_RE = re.compile(
     r"\b(authorization\s*[:=]\s*)(?:(bearer|basic|digest|negotiate)\s+)?[^\s,;'\"\\]+", re.IGNORECASE
 )
 _BEARER_RE = re.compile(r"\b(bearer)\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE)
-# Quoted key, colon, value: JSON objects and Python dict reprs. Quoted values honour backslash escapes.
-_QUOTED_KEY_RE = re.compile(
-    rf"([\"'])({_SECRET_KEYS})\1(\s*:\s*)(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^\s,;}}\]]+)", re.IGNORECASE
-)
-_KEYVALUE_RE = re.compile(
-    rf"\b({_SECRET_KEYS})\s*([=:])\s*('[^']*'|\"[^\"]*\"|[^\s,;'\"]+)", re.IGNORECASE
-)
-# Dict keys whose value is masked as a whole by structured redaction (see ``logging.JsonFormatter``).
-SECRET_KEY_RE = re.compile(rf"(?:{_SECRET_KEYS}|authorization|dsn)", re.IGNORECASE)
+# Key, closing quote, colon, value: JSON objects and Python dict reprs (``"db_password": "x"``).
+_QUOTED_KEY_RE = re.compile(rf"({_SECRET_KEYS})([\"'])(\s*:\s*)(?:{_QUOTED_VALUE}|[^\s,;}}\]]+)", re.IGNORECASE)
+_KEYVALUE_RE = re.compile(rf"({_SECRET_KEYS})\s*([=:])\s*(?:{_QUOTED_VALUE}|[^\s,;'\"]+)", re.IGNORECASE)
+# Dict keys whose value is masked as a whole by structured redaction (searched, so prefixes match too).
+SECRET_KEY_RE = re.compile(rf"{_SECRET_KEYS}|authorization|dsn", re.IGNORECASE)
 
 
 def _mask_auth_header(match: re.Match[str]) -> str:
@@ -32,8 +32,8 @@ def _mask_auth_header(match: re.Match[str]) -> str:
 
 
 def _mask_quoted_key(match: re.Match[str]) -> str:
-    quote = match.group(1)
-    return f"{quote}{match.group(2)}{quote}{match.group(3)}{quote}***{quote}"
+    quote = match.group(2)
+    return f"{match.group(1)}{quote}{match.group(3)}{quote}***{quote}"
 
 
 def _mask_keyvalue(match: re.Match[str]) -> str:
