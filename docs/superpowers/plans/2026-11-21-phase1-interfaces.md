@@ -359,3 +359,7 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   usable RSA or EC signing key" olur — sorun giderme tablosu buna göre yazılsın. `email`/`groups` yalnız ID token'dan
   okunur: provider'da "Include claims in id_token" açık kalmalı. JWKS'te tekrarlanan `kid` → ilki kullanılır.
 - Local kullanıcıların argon2 parametreleri (m,t,p) aynı olmalı (kullanıcı sayımı riskine karşı); farklıysa config hatası.
+- Task 13 (Q5 review): `/authorize` için IP başına rate-limit (`RateLimiter.reserve`), `/register`, `/token`, `/revoke`,
+  `/authorize`, `/login`, `/oauth/callback` için ~64 KiB ASGI istek gövdesi sınırı.
+- Kod tekrar kullanımı: token'lar iptal edilmez (RFC 6749 §4.1.2 SHOULD'dan bilinçli sapma; PKCE kapısı + tek kullanımlık
+  silme). Refresh için 10 sn tolerans penceresi; `auth.session_max_age` (varsayılan 30 gün) mutlak oturum ömrü.
