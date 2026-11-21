@@ -26,6 +26,9 @@ connections:
     dsn: ${MAIN_DSN}
 """
 
+# argon2id hash of "test-password": serve and check-config reject anything that is not a valid argon2id hash.
+TEST_PASSWORD_HASH = "$argon2id$v=19$m=65536,t=3,p=4$vqjtPycf4eCOEVef7XA3Mw$0+yulBFTphKjBkP93QxBsGWmg2Gtx6xSnkaEDxhPAgs"
+
 HTTP_CONFIG = """
 server:
   transport: streamable-http
@@ -36,12 +39,12 @@ auth:
   local:
     users:
       - username: kerem
-        password_hash: x
+        password_hash: '{password_hash}'
 connections:
   main:
     kind: postgres
     dsn: ${MAIN_DSN}
-"""
+""".replace("{password_hash}", TEST_PASSWORD_HASH)
 
 OIDC_CONFIG = """
 server:
@@ -122,34 +125,6 @@ def test_check_config_uses_env_path(
     monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
     monkeypatch.setenv("RATATOSKR_CONFIG", str(_write(tmp_path, STDIO_CONFIG)))
     assert main(["check-config"]) == 0
-
-
-def test_check_config_accepts_http_but_says_serve_will_refuse_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
-    monkeypatch.setenv("SECRET", "s" * 32)
-    assert main(["check-config", "--config", str(_write(tmp_path, HTTP_CONFIG))]) == 0
-    out = capsys.readouterr().out
-    assert "Config OK" in out
-    assert "streamable-http is validated but not available in this version; serve will refuse it" in out
-
-
-def test_check_config_stdio_has_no_transport_note(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
-    assert main(["check-config", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 0
-    assert "not available in this version" not in capsys.readouterr().out
-
-
-def test_serve_refuses_http_transport_for_now(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
-    monkeypatch.setenv("SECRET", "s" * 32)
-    assert main(["serve", "--config", str(_write(tmp_path, HTTP_CONFIG))]) == 2
-    assert "'streamable-http' is not available in this version yet" in capsys.readouterr().err
 
 
 def test_serve_validates_http_rules_first(
