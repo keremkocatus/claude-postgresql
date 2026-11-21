@@ -11,7 +11,7 @@ from pydantic import Field
 
 from ratatoskr.auth.principal import Principal
 from ratatoskr.backends.base import Backend, HealthResult
-from ratatoskr.backends.errors import BackendError
+from ratatoskr.backends.errors import BackendError, BackendUnavailableError
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.models import Access
 from ratatoskr.tools.runtime import ToolOutput, ToolRuntime
@@ -49,8 +49,12 @@ async def _check(registry: BackendRegistry, name: str) -> HealthResult:
     except BackendError as exc:
         return HealthResult(ok=False, latency_ms=None, version=None, error=str(exc))
     except TimeoutError:
-        error = f"no answer within {HEALTH_TIMEOUT_SECONDS:.0f}s"
-        return HealthResult(ok=False, latency_ms=None, version=None, error=error)
+        return _no_answer()
+
+
+def _no_answer() -> HealthResult:
+    error = f"no answer within {HEALTH_TIMEOUT_SECONDS:.0f}s"
+    return HealthResult(ok=False, latency_ms=None, version=None, error=error)
 
 
 def register_common_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
@@ -86,11 +90,25 @@ def register_common_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
             name = connection
 
             async def call_one(backend: Backend, access: Access) -> ToolOutput:
-                async with asyncio.timeout(HEALTH_TIMEOUT_SECONDS):
-                    health = await backend.health()
+                try:
+                    async with asyncio.timeout(HEALTH_TIMEOUT_SECONDS):
+                        health = await backend.health()
+                except TimeoutError:
+                    health = _no_answer()
                 return ToolOutput(text=_health_table([_health_row(name, backend.kind, health)]), rows=1)
 
-            return await runtime.run(tool="connection_health", connection=name, need=Access.READ, call=call_one)
+            def unavailable(exc: BackendUnavailableError) -> ToolOutput:
+                # Opening failed (or is backing off): the same row the no-argument form shows.
+                down = HealthResult(ok=False, latency_ms=None, version=None, error=str(exc))
+                return ToolOutput(text=_health_table([_health_row(name, runtime.registry.describe(name).kind, down)]))
+
+            return await runtime.run(
+                tool="connection_health",
+                connection=name,
+                need=Access.READ,
+                call=call_one,
+                on_unavailable=unavailable,
+            )
 
         async def call_all(principal: Principal) -> ToolOutput:
             names = [name for name, _ in runtime.policy.visible_connections(principal)]
@@ -105,7 +123,7 @@ def register_common_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
 
         return await runtime.run_global(tool="connection_health", call=call_all)
 
-    read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+    read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
     mcp.add_tool(
         list_connections,
         description=LIST_CONNECTIONS,

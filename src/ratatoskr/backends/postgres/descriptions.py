@@ -7,8 +7,12 @@ CONNECTION = (
     "Name of a PostgreSQL connection exactly as returned by list_connections. "
     "Call list_connections first if you do not know the names."
 )
-SCHEMA = "Schema name (default 'public'). Use pg_list_schemas to see the schemas."
-TABLE = "Table, view or materialized view name without the schema prefix."
+SCHEMA = "Exact schema name, case-sensitive (default 'public'). Use pg_list_schemas to see the schemas."
+TABLE = "Exact table, view or materialized view name, case-sensitive, without the schema prefix."
+NAME_LIKE = (
+    "Optional case-insensitive filter on relation names (SQL ILIKE: % matches any text, _ one character), "
+    "e.g. 'order%'. Use it to narrow large schemas."
+)
 SQL_READ = "One SQL statement (no trailing second statement). Use $1, $2, ... placeholders for values."
 PARAMS = (
     "Values for $1, $2, ... in order, as JSON values. Dates, timestamps and UUIDs can be passed as strings "
@@ -21,8 +25,10 @@ PG_LIST_SCHEMAS = (
     "allowed_schemas, only those are listed (this limits discovery tools only, not pg_query)."
 )
 PG_LIST_TABLES = (
-    "List the tables, views, materialized views and foreign tables of one schema with type, estimated row count, "
-    "total size and comment. Use it to find table names before pg_describe_table or pg_query."
+    "List the tables, views, materialized views, foreign tables and partitions of one schema with type, estimated "
+    "row count, total size and comment, sorted by name. Shows the total count and at most the connection's row "
+    "limit; pass name_like to narrow a large schema. Use it to find table names before pg_describe_table or "
+    "pg_query."
 )
 PG_DESCRIBE_TABLE = (
     "Describe one table in a single call: columns (type, nullable, default, comment), constraints (primary key, "
@@ -59,10 +65,10 @@ PG_ACTIVITY = (
 )
 PG_TABLE_STATS = (
     "Table statistics from pg_stat_user_tables: size (table, indexes, total), live and dead rows, sequential vs "
-    "index scans, insert/update/delete counts and last vacuum/analyze times. Without `table`, summarises every "
-    "table of the schema, largest first."
+    "index scans, insert/update/delete counts and last vacuum/analyze times. Without `table`, summarises the "
+    "tables of the schema, largest first (narrow with name_like); with `table`, shows every counter of that table."
 )
-PG_TABLE_STATS_TABLE = "Optional table name for the full set of counters of one table."
+PG_TABLE_STATS_TABLE = "Optional exact, case-sensitive table name for the full set of counters of one table."
 PG_SERVER_INFO = (
     "Show PostgreSQL server facts: version, current database, user and size, uptime, max_connections, "
     "time zone, and the list of databases with owner, encoding and size."

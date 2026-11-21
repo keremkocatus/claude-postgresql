@@ -21,6 +21,7 @@ SchemaArg = Annotated[str, Field(description=d.SCHEMA)]
 TableArg = Annotated[str, Field(description=d.TABLE)]
 SqlArg = Annotated[str, Field(description=d.SQL_READ)]
 ParamsArg = Annotated[list[Any] | None, Field(description=d.PARAMS)]
+NameLikeArg = Annotated[str | None, Field(description=d.NAME_LIKE)]
 
 
 class Statement(BaseModel):
@@ -31,7 +32,9 @@ class Statement(BaseModel):
 
 
 def _read_only(title: str) -> ToolAnnotations:
-    return ToolAnnotations(title=title, readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+    return ToolAnnotations(
+        title=title, readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    )
 
 
 def _postgres(backend: Backend) -> PostgresBackend:
@@ -47,9 +50,11 @@ def register_postgres_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
 
         return await runtime.run(tool="pg_list_schemas", connection=connection, need=Access.READ, call=call)
 
-    async def pg_list_tables(connection: ConnectionArg, schema: SchemaArg = "public") -> str:
+    async def pg_list_tables(
+        connection: ConnectionArg, schema: SchemaArg = "public", name_like: NameLikeArg = None
+    ) -> str:
         async def call(backend: Backend, access: Access) -> ToolOutput:
-            return await introspection.list_tables(_postgres(backend), schema)
+            return await introspection.list_tables(_postgres(backend), schema, name_like)
 
         return await runtime.run(tool="pg_list_tables", connection=connection, need=Access.READ, call=call)
 
@@ -67,7 +72,7 @@ def register_postgres_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
 
     async def pg_execute(
         connection: ConnectionArg,
-        statements: Annotated[list[Statement], Field(description=d.PG_EXECUTE_STATEMENTS)],
+        statements: Annotated[list[Statement], Field(description=d.PG_EXECUTE_STATEMENTS, min_length=1)],
     ) -> str:
         async def call(backend: Backend, access: Access) -> ToolOutput:
             pairs = [(statement.sql, statement.params) for statement in statements]
@@ -102,9 +107,10 @@ def register_postgres_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
         connection: ConnectionArg,
         schema: SchemaArg = "public",
         table: Annotated[str | None, Field(description=d.PG_TABLE_STATS_TABLE)] = None,
+        name_like: NameLikeArg = None,
     ) -> str:
         async def call(backend: Backend, access: Access) -> ToolOutput:
-            return await introspection.table_stats(_postgres(backend), schema, table)
+            return await introspection.table_stats(_postgres(backend), schema, table, name_like)
 
         return await runtime.run(tool="pg_table_stats", connection=connection, need=Access.READ, call=call)
 
@@ -114,7 +120,13 @@ def register_postgres_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
 
         return await runtime.run(tool="pg_server_info", connection=connection, need=Access.READ, call=call)
 
-    write = ToolAnnotations(title="Execute SQL (writes)", readOnlyHint=False, destructiveHint=True, openWorldHint=False)
+    write = ToolAnnotations(
+        title="Execute SQL (writes)",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
     tools = (
         (pg_list_schemas, d.PG_LIST_SCHEMAS, _read_only("List schemas")),
         (pg_list_tables, d.PG_LIST_TABLES, _read_only("List tables")),

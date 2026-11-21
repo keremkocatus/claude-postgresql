@@ -43,9 +43,11 @@ async def test_annotations() -> None:
         if tool.name == "pg_execute":
             assert tool.annotations.readOnlyHint is False
             assert tool.annotations.destructiveHint is True
+            assert tool.annotations.idempotentHint is False
         else:
             assert tool.annotations.readOnlyHint is True, tool.name
             assert tool.annotations.destructiveHint is False, tool.name
+            assert tool.annotations.idempotentHint is True, tool.name
 
 
 @pytest.mark.parametrize("name", PG_TOOLS)
@@ -63,6 +65,29 @@ async def test_pg_execute_statement_schema() -> None:
     statement = tools["pg_execute"].inputSchema["$defs"]["Statement"]
     assert statement["required"] == ["sql"]
     assert set(statement["properties"]) == {"sql", "params"}
+    assert tools["pg_execute"].inputSchema["properties"]["statements"]["minItems"] == 1
+
+
+async def test_pg_execute_rejects_an_empty_statement_list() -> None:
+    with pytest.raises(Exception, match="at least 1 item"):
+        await _mcp().call_tool("pg_execute", {"connection": "main", "statements": []})
+
+
+@pytest.mark.parametrize("name", ["pg_list_tables", "pg_table_stats"])
+async def test_listing_tools_take_an_optional_name_like(name: str) -> None:
+    tools = {tool.name: tool for tool in await _mcp().list_tools()}
+    schema = tools[name].inputSchema
+    assert "name_like" in schema["properties"]
+    assert "name_like" not in schema.get("required", [])
+    assert "ILIKE" in schema["properties"]["name_like"]["description"]
+    assert "name_like" in (tools[name].description or "")
+
+
+async def test_names_are_described_as_exact_and_case_sensitive() -> None:
+    tools = {tool.name: tool for tool in await _mcp().list_tools()}
+    properties = tools["pg_describe_table"].inputSchema["properties"]
+    assert "case-sensitive" in properties["schema"]["description"]
+    assert "case-sensitive" in properties["table"]["description"]
 
 
 async def test_non_postgres_backend_is_rejected() -> None:

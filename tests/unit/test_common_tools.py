@@ -69,3 +69,24 @@ async def test_health_of_one_connection() -> None:
 async def test_health_of_forbidden_connection_is_not_found() -> None:
     mcp, _, _ = _app()
     assert await _call(mcp, "connection_health", connection="secret") == "Error: Connection 'secret' not found."
+
+
+async def test_health_of_one_unreachable_connection_is_an_unavailable_row() -> None:
+    mcp, factory, sink = _app()
+    factory.backends["prod"].fail_open = OSError(LEAKY_MESSAGE)
+    for _ in range(2):  # the first call fails to open, the second hits the registry's back-off
+        text = await _call(mcp, "connection_health", connection="prod")
+        assert text.startswith("| connection | kind | status | latency | version | error |")
+        assert "| prod | postgres | unavailable | - | - | Connection 'prod' is unavailable" in text
+        assert "Error:" not in text
+        assert "hunter2" not in text
+    audited = [(event.tool, event.connection, event.result, event.error_class) for event in sink.events]
+    assert audited == [("connection_health", "prod", "error", "BackendUnavailableError")] * 2
+
+
+async def test_common_tools_are_read_only_and_idempotent() -> None:
+    mcp, _, _ = _app()
+    for tool in await mcp.list_tools():
+        assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is True
+        assert tool.annotations.idempotentHint is True

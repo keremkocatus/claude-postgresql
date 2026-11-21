@@ -6,7 +6,7 @@ from ratatoskr.auth.policy import Policy
 from ratatoskr.auth.principal import Principal
 from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.backends.base import Backend
-from ratatoskr.backends.errors import BackendQueryError, BackendTimeoutError
+from ratatoskr.backends.errors import BackendQueryError, BackendTimeoutError, BackendUnavailableError
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.models import Access, ConnectionConfig
 from ratatoskr.tools.runtime import ToolOutput, ToolRuntime
@@ -378,4 +378,74 @@ async def test_permission_error_from_the_resolver_is_denied_in_run_global() -> N
 
 
 async def _never() -> ToolOutput:
+    raise AssertionError("must not be called")
+
+
+class _UnavailableHandler:
+    """Records the errors it is given and renders them as a fixed text."""
+
+    def __init__(self, text: str = "unavailable row", rows: int | None = 1) -> None:
+        self.text = text
+        self.rows = rows
+        self.errors: list[BackendUnavailableError] = []
+
+    def __call__(self, exc: BackendUnavailableError) -> ToolOutput:
+        self.errors.append(exc)
+        return ToolOutput(text=self.text, rows=self.rows)
+
+
+async def test_on_unavailable_renders_open_failures_and_back_off() -> None:
+    runtime, sink, factory = _runtime()
+    factory.backends["dev"].fail_open = OSError(LEAKY_MESSAGE)
+    handler = _UnavailableHandler()
+    for _ in range(2):  # the first call fails to open, the second hits the registry's back-off
+        text = await runtime.run(
+            tool="connection_health", connection="dev", need=Access.READ, call=_never_call, on_unavailable=handler
+        )
+        assert text == "unavailable row"
+    assert [str(error).startswith("Connection 'dev' is unavailable") for error in handler.errors] == [True, True]
+    assert [(e.tool, e.connection, e.result, e.error_class, e.rows) for e in sink.events] == [
+        ("connection_health", "dev", "error", "BackendUnavailableError", 1),
+    ] * 2
+
+
+async def test_on_unavailable_is_not_used_for_errors_inside_the_call() -> None:
+    runtime, sink, _ = _runtime()
+    handler = _UnavailableHandler()
+
+    async def call(backend: Backend, access: Access) -> ToolOutput:
+        raise BackendUnavailableError("Connection 'dev' is closed.")
+
+    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call, on_unavailable=handler)
+    assert text == "Error: Connection 'dev' is closed."
+    assert handler.errors == []
+    assert (sink.events[0].result, sink.events[0].error_class) == ("error", "BackendUnavailableError")
+
+
+async def test_on_unavailable_is_not_used_for_denials() -> None:
+    runtime, sink, factory = _runtime(role=None)
+    factory.backends["dev"].fail_open = OSError(LEAKY_MESSAGE)
+    handler = _UnavailableHandler()
+    text = await runtime.run(
+        tool="connection_health", connection="dev", need=Access.READ, call=_never_call, on_unavailable=handler
+    )
+    assert text == "Error: Connection 'dev' not found."
+    assert handler.errors == []
+    assert factory.backends["dev"].open_calls == 0
+    assert sink.events[0].result == "denied"
+
+
+async def test_on_unavailable_output_is_redacted_and_clamped() -> None:
+    runtime, _, factory = _runtime()
+    factory.backends["prod"].fail_open = OSError(LEAKY_MESSAGE)
+    handler = _UnavailableHandler(text="see postgresql://a:hunter2@h/db " + "y" * 10_000)
+    text = await runtime.run(
+        tool="connection_health", connection="prod", need=Access.READ, call=_never_call, on_unavailable=handler
+    )
+    assert "hunter2" not in text
+    assert len(text.encode("utf-8")) <= 1024
+    assert "[Response truncated: it exceeded 1024 bytes." in text
+
+
+async def _never_call(backend: Backend, access: Access) -> ToolOutput:
     raise AssertionError("must not be called")

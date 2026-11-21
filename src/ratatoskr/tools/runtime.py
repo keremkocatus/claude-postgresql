@@ -12,7 +12,7 @@ from ratatoskr.auth.policy import ConnectionNotFoundError, InsufficientAccessErr
 from ratatoskr.auth.principal import Principal
 from ratatoskr.auth.resolver import PrincipalResolver
 from ratatoskr.backends.base import Backend
-from ratatoskr.backends.errors import BackendError, BackendTimeoutError
+from ratatoskr.backends.errors import BackendError, BackendTimeoutError, BackendUnavailableError
 from ratatoskr.backends.limits import clamp_text
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.models import Access
@@ -55,8 +55,14 @@ class ToolRuntime:
         call: Callable[[Backend, Access], Awaitable[ToolOutput]],
         query_text: str | None = None,
         timeout: float | None = None,
+        on_unavailable: Callable[[BackendUnavailableError], ToolOutput] | None = None,
     ) -> str:
-        """resolve -> authorize -> registry.get -> deadline -> clamp -> audit; errors become safe text."""
+        """resolve -> authorize -> registry.get -> deadline -> clamp -> audit; errors become safe text.
+
+        ``on_unavailable``: when opening the backend (``registry.get``) raises ``BackendUnavailableError``, render
+        that as the tool's output instead of an ``Error:`` text. It is audited as an error and goes through the
+        same redact-and-clamp step. Authorization runs first, and errors raised inside ``call`` never reach it.
+        """
         started = time.perf_counter()
         outcome = _Outcome()
         principal: Principal | None = None
@@ -64,8 +70,15 @@ class ToolRuntime:
             principal = self._resolver.resolve()
             access = self.policy.authorize(principal, connection, need)
             async with asyncio.timeout(timeout):
-                backend = await self.registry.get(connection)
-                output = await call(backend, access)
+                try:
+                    backend = await self.registry.get(connection)
+                except BackendUnavailableError as exc:
+                    if on_unavailable is None:
+                        raise
+                    output = on_unavailable(exc)
+                    outcome.result, outcome.error_class = "error", type(exc).__name__
+                else:
+                    output = await call(backend, access)
             outcome.rows = output.rows
             text = output.text
         except asyncio.CancelledError:

@@ -1,107 +1,182 @@
-"""Catalog queries for discovery and monitoring tools. All SQL is fixed; user input only travels as $n."""
+"""Catalog queries for discovery and monitoring tools. All SQL is fixed; user input only travels as $n.
+
+Every catalog session first pins ``search_path`` to ``pg_catalog`` for its (rolled-back) transaction, and every
+catalog function and relation is schema-qualified. Without that, a user who can create objects in a schema on
+the search path could shadow a catalog function (CVE-2018-1058 pattern, e.g. ``public.obj_description(oid,
+text)`` beats the built-in for an untyped literal) or an operator. As a side effect, ``regclass`` output and
+``pg_get_constraintdef`` name every non-catalog relation with its schema.
+"""
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator, Mapping
+from typing import Any
+
 from ratatoskr.backends.errors import InvalidRequestError
-from ratatoskr.backends.postgres.backend import PostgresBackend
+from ratatoskr.backends.limits import clamp_text
+from ratatoskr.backends.postgres.backend import PostgresBackend, ReadSession
 from ratatoskr.backends.postgres.formatting import key_value_list, records_table
 from ratatoskr.tools.runtime import ToolOutput
 
-# $1 is the connection's allowed_schemas (empty array = no restriction), applied in SQL so a restricted
-# connection only counts the relations of its own schemas.
+SEARCH_PATH_SQL = "SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)"
+
+ACTIVITY_LIMIT = 200
+NAME_LIKE_HINT = "Pass name_like (e.g. 'order%') to list fewer relations."
+
+# $1: allowed_schemas (empty array = no restriction), applied in SQL so a restricted connection only counts the
+# relations of its own schemas.
 LIST_SCHEMAS_SQL = """
 SELECT n.nspname AS schema,
-       pg_get_userbyid(n.nspowner) AS owner,
-       count(c.oid) FILTER (WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')) AS relations,
-       obj_description(n.oid, 'pg_namespace') AS comment
-FROM pg_namespace n
-LEFT JOIN pg_class c ON c.relnamespace = n.oid
+       pg_catalog.pg_get_userbyid(n.nspowner) AS owner,
+       pg_catalog.count(c.oid) FILTER (WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')) AS relations,
+       pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment
+FROM pg_catalog.pg_namespace n
+LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
   AND n.nspname NOT LIKE 'pg_temp_%' AND n.nspname NOT LIKE 'pg_toast_temp_%'
-  AND (cardinality($1::text[]) = 0 OR n.nspname = ANY($1::text[]))
+  AND (pg_catalog.cardinality($1::text[]) = 0 OR n.nspname = ANY ($1::text[]))
 GROUP BY n.oid, n.nspname, n.nspowner
 ORDER BY n.nspname
 """
 
+# $1 schema, $2 name_like (NULL = all), $3 row cap. Always returns at least one row: schema_found and total are
+# repeated on every row, and an empty page comes back as one row whose name is NULL. Sizes and comments are only
+# computed for the page.
 LIST_TABLES_SQL = """
-SELECT c.relname AS name,
-       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' WHEN 'v' THEN 'view'
-                      WHEN 'm' THEN 'materialized view' WHEN 'f' THEN 'foreign table' END AS type,
-       CASE WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END AS estimated_rows,
-       pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
-       obj_description(c.oid, 'pg_class') AS comment
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-ORDER BY c.relname
+WITH ns AS (
+    SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1
+), rel AS MATERIALIZED (
+    SELECT c.oid, c.relname, c.relkind, c.relispartition, c.reltuples
+    FROM pg_catalog.pg_class c
+    WHERE c.relnamespace IN (SELECT ns.oid FROM ns)
+      AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND ($2::text IS NULL OR c.relname ILIKE $2::text)
+), page AS (
+    SELECT rel.* FROM rel ORDER BY rel.relname LIMIT $3
+)
+SELECT (SELECT pg_catalog.count(*) FROM ns) > 0 AS schema_found,
+       (SELECT pg_catalog.count(*) FROM rel) AS total,
+       p.relname AS name,
+       CASE WHEN p.relispartition THEN 'partition'
+            ELSE CASE p.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' WHEN 'v' THEN 'view'
+                                WHEN 'm' THEN 'materialized view' WHEN 'f' THEN 'foreign table' END
+       END AS type,
+       CASE WHEN p.reltuples < 0 THEN NULL ELSE p.reltuples::bigint END AS estimated_rows,
+       pg_catalog.pg_size_pretty(pg_catalog.pg_total_relation_size(p.oid)) AS total_size,
+       pg_catalog.obj_description(p.oid, 'pg_class') AS comment
+FROM (VALUES (1)) AS one (x)
+LEFT JOIN page p ON true
+ORDER BY p.relname
 """
 
 FIND_RELATION_SQL = """
 SELECT c.oid, c.relkind::text AS relkind
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
 """
 
 COLUMNS_SQL = """
 SELECT a.attname AS column,
-       format_type(a.atttypid, a.atttypmod) AS type,
+       pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
        CASE WHEN a.attnotnull THEN 'no' ELSE 'yes' END AS nullable,
-       pg_get_expr(d.adbin, d.adrelid) AS default,
-       col_description(a.attrelid, a.attnum) AS comment
-FROM pg_attribute a
-LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+       CASE WHEN a.attidentity = 'a' THEN 'generated always as identity'
+            WHEN a.attidentity = 'd' THEN 'generated by default as identity'
+            WHEN a.attgenerated = 's'
+                THEN 'generated always as (' || pg_catalog.pg_get_expr(d.adbin, d.adrelid) || ') stored'
+            WHEN a.attgenerated = 'v'
+                THEN 'generated always as (' || pg_catalog.pg_get_expr(d.adbin, d.adrelid) || ') virtual'
+            ELSE pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+       END AS default,
+       pg_catalog.col_description(a.attrelid, a.attnum) AS comment
+FROM pg_catalog.pg_attribute a
+LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum
 """
 
+# Foreign keys to or from partitioned tables are cloned once per partition; only the user-visible one is shown.
 CONSTRAINTS_SQL = """
-SELECT conname AS name,
-       CASE contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'u' THEN 'UNIQUE'
-                    WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE' ELSE contype::text END AS type,
-       pg_get_constraintdef(oid) AS definition
-FROM pg_constraint
-WHERE conrelid = $1
-ORDER BY CASE contype WHEN 'p' THEN 0 WHEN 'f' THEN 1 WHEN 'u' THEN 2 ELSE 3 END, conname
+SELECT c.conname AS name,
+       CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'u' THEN 'UNIQUE'
+                      WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE' ELSE c.contype::text END AS type,
+       pg_catalog.pg_get_constraintdef(c.oid) AS definition
+FROM pg_catalog.pg_constraint c
+WHERE c.conrelid = $1
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_constraint p WHERE p.oid = c.conparentid AND p.conrelid = c.conrelid
+  )
+ORDER BY CASE c.contype WHEN 'p' THEN 0 WHEN 'f' THEN 1 WHEN 'u' THEN 2 ELSE 3 END, c.conname
 """
 
 REFERENCED_BY_SQL = """
-SELECT conrelid::regclass::text AS from_table, conname AS name, pg_get_constraintdef(oid) AS definition
-FROM pg_constraint
-WHERE confrelid = $1 AND contype = 'f'
+SELECT c.conrelid::regclass::text AS from_table, c.conname AS name,
+       pg_catalog.pg_get_constraintdef(c.oid) AS definition
+FROM pg_catalog.pg_constraint c
+WHERE c.confrelid = $1 AND c.contype = 'f' AND c.conparentid = 0
 ORDER BY 1, 2
 """
 
 INDEXES_SQL = """
-SELECT i.relname AS name, pg_get_indexdef(x.indexrelid) AS definition
-FROM pg_index x
-JOIN pg_class i ON i.oid = x.indexrelid
+SELECT i.relname AS name, pg_catalog.pg_get_indexdef(x.indexrelid) AS definition
+FROM pg_catalog.pg_index x
+JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid
 WHERE x.indrelid = $1
 ORDER BY i.relname
 """
 
+# $1 schema, $2 exact table (NULL = all), $3 name_like (NULL = all), $4 row cap; same row shape as LIST_TABLES_SQL.
 TABLE_STATS_SQL = """
-SELECT s.relname AS table,
-       pg_size_pretty(pg_total_relation_size(s.relid)) AS total_size,
-       pg_size_pretty(pg_relation_size(s.relid)) AS table_size,
-       pg_size_pretty(pg_indexes_size(s.relid)) AS index_size,
-       s.n_live_tup AS live_rows,
-       s.n_dead_tup AS dead_rows,
-       s.seq_scan,
-       s.idx_scan,
-       s.n_tup_ins AS inserts,
-       s.n_tup_upd AS updates,
-       s.n_tup_del AS deletes,
-       s.last_vacuum,
-       s.last_autovacuum,
-       s.last_analyze,
-       s.last_autoanalyze
-FROM pg_stat_user_tables s
-WHERE s.schemaname = $1 AND ($2::text IS NULL OR s.relname::text = $2::text)
-ORDER BY pg_total_relation_size(s.relid) DESC, s.relname
+WITH ns AS (
+    SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = $1
+), stats AS MATERIALIZED (
+    SELECT s.relid, s.relname, c.relkind, c.relispartition,
+           pg_catalog.pg_total_relation_size(s.relid) AS total_bytes,
+           s.n_live_tup, s.n_dead_tup, s.seq_scan, s.idx_scan, s.n_tup_ins, s.n_tup_upd, s.n_tup_del,
+           s.last_vacuum, s.last_autovacuum, s.last_analyze, s.last_autoanalyze
+    FROM pg_catalog.pg_stat_user_tables s
+    JOIN pg_catalog.pg_class c ON c.oid = s.relid
+    WHERE s.schemaname = $1
+      AND ($2::name IS NULL OR s.relname = $2::name)
+      AND ($3::text IS NULL OR s.relname ILIKE $3::text)
+), page AS (
+    SELECT stats.* FROM stats ORDER BY stats.total_bytes DESC, stats.relname LIMIT $4
+)
+SELECT (SELECT pg_catalog.count(*) FROM ns) > 0 AS schema_found,
+       (SELECT pg_catalog.count(*) FROM stats) AS total,
+       p.relname AS table,
+       CASE WHEN p.relispartition THEN 'partition' WHEN p.relkind = 'p' THEN 'partitioned table'
+            WHEN p.relkind = 'm' THEN 'materialized view' WHEN p.relkind IS NOT NULL THEN 'table' END AS type,
+       pg_catalog.pg_size_pretty(p.total_bytes) AS total_size,
+       pg_catalog.pg_size_pretty(pg_catalog.pg_relation_size(p.relid)) AS table_size,
+       pg_catalog.pg_size_pretty(pg_catalog.pg_indexes_size(p.relid)) AS index_size,
+       p.n_live_tup AS live_rows,
+       p.n_dead_tup AS dead_rows,
+       p.seq_scan,
+       p.idx_scan,
+       p.n_tup_ins AS inserts,
+       p.n_tup_upd AS updates,
+       p.n_tup_del AS deletes,
+       p.last_vacuum,
+       p.last_autovacuum,
+       p.last_analyze,
+       p.last_autoanalyze
+FROM (VALUES (1)) AS one (x)
+LEFT JOIN page p ON true
+ORDER BY p.total_bytes DESC, p.relname
 """
 
-SCHEMA_STATS_COLUMNS = ("table", "total_size", "live_rows", "dead_rows", "seq_scan", "idx_scan", "last_autovacuum")
+SCHEMA_STATS_COLUMNS = (
+    "table",
+    "type",
+    "total_size",
+    "live_rows",
+    "dead_rows",
+    "seq_scan",
+    "idx_scan",
+    "last_autovacuum",
+)
 
 ACTIVITY_SQL = """
 SELECT a.pid,
@@ -110,13 +185,13 @@ SELECT a.pid,
        a.state,
        a.wait_event_type,
        a.wait_event,
-       date_trunc('second', now() - a.query_start) AS running_for,
-       pg_blocking_pids(a.pid) AS blocked_by,
-       left(a.query, 300) AS query
-FROM pg_stat_activity a
-WHERE a.state IS DISTINCT FROM 'idle' AND a.pid <> pg_backend_pid() AND a.backend_type = 'client backend'
+       pg_catalog.date_trunc('second', pg_catalog.now() - a.query_start) AS running_for,
+       pg_catalog.pg_blocking_pids(a.pid) AS blocked_by,
+       pg_catalog.left(a.query, 300) AS query
+FROM pg_catalog.pg_stat_activity a
+WHERE a.state IS DISTINCT FROM 'idle' AND a.pid <> pg_catalog.pg_backend_pid() AND a.backend_type = 'client backend'
 ORDER BY a.query_start NULLS LAST
-LIMIT 200
+LIMIT 201
 """
 
 WAITING_LOCKS_SQL = """
@@ -124,67 +199,110 @@ SELECT l.pid,
        l.locktype,
        l.mode,
        l.relation::regclass::text AS relation,
-       date_trunc('second', now() - a.query_start) AS waiting_for,
-       left(a.query, 200) AS query
-FROM pg_locks l
-JOIN pg_stat_activity a ON a.pid = l.pid
+       pg_catalog.date_trunc('second', pg_catalog.now() - a.query_start) AS waiting_for,
+       pg_catalog.left(a.query, 200) AS query
+FROM pg_catalog.pg_locks l
+JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
 WHERE NOT l.granted
 ORDER BY a.query_start NULLS LAST
-LIMIT 200
+LIMIT 201
 """
 
 SERVER_INFO_SQL = """
-SELECT version() AS version,
-       current_database() AS current_database,
+SELECT pg_catalog.version() AS version,
+       pg_catalog.current_database() AS current_database,
        current_user AS current_user,
-       pg_size_pretty(pg_database_size(current_database())) AS current_database_size,
-       date_trunc('second', now() - pg_postmaster_start_time()) AS uptime,
-       current_setting('max_connections') AS max_connections,
-       current_setting('TimeZone') AS timezone
+       pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(pg_catalog.current_database())) AS current_database_size,
+       pg_catalog.date_trunc('second', pg_catalog.now() - pg_catalog.pg_postmaster_start_time()) AS uptime,
+       pg_catalog.current_setting('max_connections') AS max_connections,
+       pg_catalog.current_setting('TimeZone') AS timezone
 """
 
 DATABASES_SQL = """
-SELECT datname AS database,
-       pg_get_userbyid(datdba) AS owner,
-       pg_encoding_to_char(encoding) AS encoding,
-       CASE WHEN has_database_privilege(datname, 'CONNECT') THEN pg_size_pretty(pg_database_size(datname)) END AS size
-FROM pg_database
-WHERE NOT datistemplate
-ORDER BY datname
+SELECT d.datname AS database,
+       pg_catalog.pg_get_userbyid(d.datdba) AS owner,
+       pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
+       CASE WHEN pg_catalog.has_database_privilege(d.datname, 'CONNECT')
+            THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) END AS size
+FROM pg_catalog.pg_database d
+WHERE NOT d.datistemplate
+ORDER BY d.datname
 """
+
+_PAGE_KEYS = ("schema_found", "total")
+
+
+@contextlib.asynccontextmanager
+async def catalog_session(backend: PostgresBackend) -> AsyncIterator[ReadSession]:
+    """A read session whose transaction resolves names in ``pg_catalog`` only (undone by the rollback)."""
+    async with backend.read_session() as session:
+        await session.fetch(SEARCH_PATH_SQL)
+        yield session
+
+
+def _schema_not_found(backend: PostgresBackend, schema: str) -> InvalidRequestError:
+    return InvalidRequestError(
+        f"Schema '{schema}' not found on connection '{backend.name}'. Schema names are exact and case-sensitive; "
+        "use pg_list_schemas to see them."
+    )
 
 
 def check_schema_allowed(backend: PostgresBackend, schema: str) -> None:
+    """A schema outside ``allowed_schemas`` gets the same answer as one that does not exist."""
     allowed = backend.config.allowed_schemas
     if allowed and schema not in allowed:
-        raise InvalidRequestError(
-            f"Schema '{schema}' is not available on connection '{backend.name}'. "
-            f"Discovery tools are limited to: {', '.join(allowed)}."
-        )
+        raise _schema_not_found(backend, schema)
+
+
+def _page(
+    backend: PostgresBackend, schema: str, rows: list[dict[str, Any]], key: str
+) -> tuple[int, list[dict[str, Any]]]:
+    """Split a paged catalog result into (total, rows without the paging columns); raise if the schema is missing."""
+    if not rows or not rows[0]["schema_found"]:
+        raise _schema_not_found(backend, schema)
+    total = int(rows[0]["total"])
+    page = [{k: v for k, v in row.items() if k not in _PAGE_KEYS} for row in rows if row[key] is not None]
+    return total, page
+
+
+def _filter_note(name_like: str | None) -> str:
+    return f" matching name_like '{name_like}'" if name_like is not None else ""
+
+
+def _clamp(backend: PostgresBackend, text: str) -> str:
+    """Clamp here so a long listing ends with a name_like hint rather than the generic one."""
+    return clamp_text(text, backend.config.limits.max_response_bytes, NAME_LIKE_HINT).text
 
 
 async def list_schemas(backend: PostgresBackend) -> ToolOutput:
-    async with backend.read_session() as session:
+    async with catalog_session(backend) as session:
         rows = await session.fetch(LIST_SCHEMAS_SQL, list(backend.config.allowed_schemas))
     return ToolOutput(text=f"Schemas on '{backend.name}':\n\n{records_table(rows)}", rows=len(rows))
 
 
-async def list_tables(backend: PostgresBackend, schema: str) -> ToolOutput:
+async def list_tables(backend: PostgresBackend, schema: str, name_like: str | None = None) -> ToolOutput:
     check_schema_allowed(backend, schema)
-    async with backend.read_session() as session:
-        rows = await session.fetch(LIST_TABLES_SQL, schema)
-    if not rows:
-        return ToolOutput(text=f"No tables or views in schema '{schema}' on '{backend.name}'.", rows=0)
-    return ToolOutput(text=f"Relations in '{schema}' on '{backend.name}':\n\n{records_table(rows)}", rows=len(rows))
+    limit = backend.config.limits.max_rows
+    async with catalog_session(backend) as session:
+        rows = await session.fetch(LIST_TABLES_SQL, schema, name_like, limit)
+    total, relations = _page(backend, schema, rows, "name")
+    where = f"{_filter_note(name_like)} in schema '{schema}' on '{backend.name}'"
+    if not relations:
+        return ToolOutput(text=f"No tables or views{where}.", rows=0)
+    header = f"{total} relation(s){where}"
+    if total > len(relations):
+        header += f"; showing the first {len(relations)} by name. {NAME_LIKE_HINT}"
+    return ToolOutput(text=_clamp(backend, f"{header}:\n\n{records_table(relations)}"), rows=len(relations))
 
 
 async def describe_table(backend: PostgresBackend, schema: str, table: str) -> ToolOutput:
     check_schema_allowed(backend, schema)
-    async with backend.read_session() as session:
+    async with catalog_session(backend) as session:
         found = await session.fetch(FIND_RELATION_SQL, schema, table)
         if not found:
             raise InvalidRequestError(
-                f"Table '{schema}.{table}' not found on '{backend.name}'. Use pg_list_tables to see what exists."
+                f"Table '{schema}.{table}' not found on '{backend.name}'. Names are exact and case-sensitive; "
+                "use pg_list_tables to see what exists."
             )
         oid = found[0]["oid"]
         columns = await session.fetch(COLUMNS_SQL, oid)
@@ -201,34 +319,44 @@ async def describe_table(backend: PostgresBackend, schema: str, table: str) -> T
     return ToolOutput(text="\n".join(parts), rows=len(columns))
 
 
-async def table_stats(backend: PostgresBackend, schema: str, table: str | None) -> ToolOutput:
+async def table_stats(
+    backend: PostgresBackend, schema: str, table: str | None, name_like: str | None = None
+) -> ToolOutput:
     check_schema_allowed(backend, schema)
-    async with backend.read_session() as session:
-        rows = await session.fetch(TABLE_STATS_SQL, schema, table)
-    if not rows:
-        target = f"table '{schema}.{table}'" if table else f"schema '{schema}'"
+    limit = backend.config.limits.max_rows
+    async with catalog_session(backend) as session:
+        rows = await session.fetch(TABLE_STATS_SQL, schema, table, name_like, limit)
+    total, tables = _page(backend, schema, rows, "table")
+    if not tables:
+        target = f"table '{schema}.{table}'" if table else f"schema '{schema}'{_filter_note(name_like)}"
         return ToolOutput(text=f"No statistics for {target} on '{backend.name}'.", rows=0)
     if table is not None:
-        return ToolOutput(text=f"## Statistics: {schema}.{table}\n\n{key_value_list(rows[0])}", rows=1)
-    summary = [{column: row[column] for column in SCHEMA_STATS_COLUMNS} for row in rows]
-    text = (
-        f"Table statistics for schema '{schema}' on '{backend.name}' (largest first). "
-        f"Pass `table` for the full set of counters.\n\n{records_table(summary)}"
-    )
-    return ToolOutput(text=text, rows=len(rows))
+        return ToolOutput(text=f"## Statistics: {schema}.{table}\n\n{key_value_list(tables[0])}", rows=1)
+    summary: list[Mapping[str, Any]] = [{column: row[column] for column in SCHEMA_STATS_COLUMNS} for row in tables]
+    header = f"{total} table(s){_filter_note(name_like)} in schema '{schema}' on '{backend.name}'"
+    if total > len(tables):
+        header += f"; showing the {len(tables)} largest. {NAME_LIKE_HINT}"
+    else:
+        header += ", largest first."
+    text = f"{header} Pass `table` for the full set of counters.\n\n{records_table(summary)}"
+    return ToolOutput(text=_clamp(backend, text), rows=len(tables))
+
+
+def _capped(rows: list[dict[str, Any]], title: str) -> list[str]:
+    count = f"first {ACTIVITY_LIMIT} shown; there are more" if len(rows) > ACTIVITY_LIMIT else str(len(rows))
+    return [f"## {title} ({count})", "", records_table(rows[:ACTIVITY_LIMIT])]
 
 
 async def activity(backend: PostgresBackend) -> ToolOutput:
-    async with backend.read_session() as session:
+    async with catalog_session(backend) as session:
         sessions = await session.fetch(ACTIVITY_SQL)
         locks = await session.fetch(WAITING_LOCKS_SQL)
-    parts = [f"## Active sessions on '{backend.name}' ({len(sessions)})", "", records_table(sessions)]
-    parts += ["", f"## Waiting locks ({len(locks)})", "", records_table(locks)]
-    return ToolOutput(text="\n".join(parts), rows=len(sessions))
+    parts = _capped(sessions, f"Active sessions on '{backend.name}'") + [""] + _capped(locks, "Waiting locks")
+    return ToolOutput(text="\n".join(parts), rows=min(len(sessions), ACTIVITY_LIMIT))
 
 
 async def server_info(backend: PostgresBackend) -> ToolOutput:
-    async with backend.read_session() as session:
+    async with catalog_session(backend) as session:
         info = await session.fetch(SERVER_INFO_SQL)
         databases = await session.fetch(DATABASES_SQL)
     parts = [f"## Server: {backend.name}", "", key_value_list(info[0])]
