@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable
 
@@ -39,6 +40,7 @@ class BackendRegistry:
         self._opened: set[str] = set()
         self._failed_at: dict[str, tuple[float, str]] = {}
         self._locks: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in self._backends}
+        self._closed = False
 
     def names(self) -> list[str]:
         return sorted(self._backends)
@@ -54,12 +56,20 @@ class BackendRegistry:
         return config.limits.max_response_bytes if config is not None else DEFAULT_MAX_RESPONSE_BYTES
 
     async def get(self, name: str) -> Backend:
+        """Return the opened backend, opening it on first use.
+
+        A failed open is remembered and not retried for 10 seconds. A cancelled open (the caller's deadline
+        expired or the client cancelled) is deliberately *not* a failure: it says nothing about the backend, so
+        the next call tries again at once. After ``close_all`` has started, every call is refused.
+        """
         backend = self._backends.get(name)
         if backend is None:
             raise ConnectionNotFoundError(name)
+        self._raise_if_closed(name)
         if name in self._opened:
             return backend
         async with self._locks[name]:
+            self._raise_if_closed(name)  # close_all may have started while this call waited for the lock
             if name in self._opened:
                 return backend
             self._raise_if_backing_off(name)
@@ -70,11 +80,15 @@ class BackendRegistry:
                 logger.warning("opening connection %s failed", name, exc_info=True)
                 raise BackendUnavailableError(
                     f"Connection '{name}' is unavailable: opening it failed ({type(exc).__name__}). "
-                    f"It will be retried in {RETRY_INTERVAL_SECONDS:.0f}s; details are in the server log."
+                    f"Try again in {math.ceil(RETRY_INTERVAL_SECONDS)}s; details are in the server log."
                 ) from None
             self._failed_at.pop(name, None)
             self._opened.add(name)
             return backend
+
+    def _raise_if_closed(self, name: str) -> None:
+        if self._closed:
+            raise BackendUnavailableError(f"Connection '{name}' is unavailable: the server is shutting down.")
 
     def _raise_if_backing_off(self, name: str) -> None:
         failure = self._failed_at.get(name)
@@ -84,12 +98,16 @@ class BackendRegistry:
         wait = RETRY_INTERVAL_SECONDS - (self._clock() - failed_at)
         if wait > 0:
             raise BackendUnavailableError(
-                f"Connection '{name}' is unavailable: the last attempt failed ({error_class}). Retry in {wait:.0f}s."
+                f"Connection '{name}' is unavailable: the last attempt failed ({error_class}). "
+                f"Try again in {math.ceil(wait)}s."
             )
 
     async def close_all(self) -> None:
-        # Under each connection's lock: an open in progress finishes first and is then closed, and a get that
-        # arrives during close waits and reopens instead of receiving a backend that is being closed.
+        """Close every opened backend. Final: afterwards (and while it runs) ``get`` refuses every call.
+
+        Each backend is closed under its lock, so an open in progress finishes first and is then closed.
+        """
+        self._closed = True
         for name in sorted(self._backends):
             async with self._locks[name]:
                 if name not in self._opened:

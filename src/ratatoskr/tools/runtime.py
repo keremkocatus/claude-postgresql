@@ -67,15 +67,15 @@ class ToolRuntime:
                 backend = await self.registry.get(connection)
                 output = await call(backend, access)
             outcome.rows = output.rows
-            text = clamp_text(output.text, self.registry.max_response_bytes(connection), TRUNCATION_HINT).text
+            text = output.text
         except asyncio.CancelledError:
             outcome.result, outcome.error_class = "error", "CancelledError"
             self._record(tool, connection, principal, query_text, started, outcome)
             raise
         except Exception as exc:
-            text = self._error_text(exc, tool=tool, connection=connection, outcome=outcome)
+            text = self._error_text(exc, tool=tool, connection=connection, outcome=outcome, identified=principal)
         self._record(tool, connection, principal, query_text, started, outcome)
-        return redact(text)
+        return self._finish(text, connection)
 
     async def run_global(
         self,
@@ -93,20 +93,30 @@ class ToolRuntime:
             async with asyncio.timeout(timeout):
                 output = await call(principal)
             outcome.rows = output.rows
-            text = clamp_text(output.text, self.registry.max_response_bytes(None), TRUNCATION_HINT).text
+            text = output.text
         except asyncio.CancelledError:
             outcome.result, outcome.error_class = "error", "CancelledError"
             self._record(tool, None, principal, None, started, outcome)
             raise
         except Exception as exc:
-            text = self._error_text(exc, tool=tool, connection=None, outcome=outcome)
+            text = self._error_text(exc, tool=tool, connection=None, outcome=outcome, identified=principal)
         self._record(tool, None, principal, None, started, outcome)
-        return redact(text)
+        return self._finish(text, None)
+
+    def _finish(self, text: str, connection: str | None) -> str:
+        """Every returned text, success or error: redact first, then clamp, so the byte limit always holds."""
+        return clamp_text(redact(text), self.registry.max_response_bytes(connection), TRUNCATION_HINT).text
 
     @staticmethod
-    def _error_text(exc: Exception, *, tool: str, connection: str | None, outcome: _Outcome) -> str:
+    def _error_text(
+        exc: Exception, *, tool: str, connection: str | None, outcome: _Outcome, identified: Principal | None
+    ) -> str:
+        """Map *exc* to user text and audit result. ``identified`` is None while the principal is unresolved."""
         outcome.error_class = type(exc).__name__
-        if isinstance(exc, ConnectionNotFoundError | InsufficientAccessError | PermissionError):
+        # PermissionError means "no identity" only when the resolver raised it; from a backend call it is an
+        # ordinary OS error (e.g. an unreadable key file) whose message may carry a path, so it is hidden below.
+        no_identity = identified is None and isinstance(exc, PermissionError)
+        if no_identity or isinstance(exc, ConnectionNotFoundError | InsufficientAccessError):
             outcome.result = "denied"
             return f"Error: {exc}"
         if isinstance(exc, BackendTimeoutError):

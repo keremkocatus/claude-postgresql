@@ -97,6 +97,7 @@ class PostgresBackend:
         self._read_pool: Any = None
         self._write_pool: Any = None
         self._write_lock = asyncio.Lock()
+        self._closed = False
         self._client_timeout = config.statement_timeout.total_seconds() + CLIENT_TIMEOUT_GRACE_SECONDS
 
     # -- lifecycle ---------------------------------------------------------
@@ -116,24 +117,36 @@ class PostgresBackend:
             kwargs["ssl"] = ssl
         return kwargs
 
+    def _raise_if_closed(self) -> None:
+        if self._closed:
+            raise BackendUnavailableError(f"Connection '{self.name}' is closed.")
+
+    async def _keep_unless_closed(self, pool: Any) -> Any:
+        """Return *pool*, or close it and refuse if ``close()`` ran while it was being created."""
+        if self._closed:
+            await _close_pool(pool)
+            self._raise_if_closed()
+        return pool
+
     async def open(self) -> None:
+        self._raise_if_closed()
         if self._read_pool is not None:
             return
-        self._read_pool = await asyncpg.create_pool(
+        pool = await asyncpg.create_pool(
             min_size=self.config.pool.min_size,
             max_size=self.config.pool.max_size,
             **self._pool_kwargs(read_only=True),
         )
+        self._read_pool = await self._keep_unless_closed(pool)
 
     async def close(self) -> None:
+        """Close both pools. Final: afterwards nothing opens again, and a pool still being created is closed."""
+        self._closed = True
         pools = [pool for pool in (self._write_pool, self._read_pool) if pool is not None]
         self._read_pool = None
         self._write_pool = None
         for pool in pools:
-            try:
-                await asyncio.wait_for(pool.close(), CLOSE_TIMEOUT_SECONDS)
-            except TimeoutError:
-                pool.terminate()
+            await _close_pool(pool)
 
     async def health(self) -> HealthResult:
         started = time.perf_counter()
@@ -176,6 +189,7 @@ class PostgresBackend:
     @contextlib.asynccontextmanager
     async def read_session(self) -> AsyncIterator[ReadSession]:
         """Yield a session on the read pool inside ``BEGIN READ ONLY``; always rolled back."""
+        self._raise_if_closed()
         if self._read_pool is None:
             raise BackendUnavailableError(f"Connection '{self.name}' is not open.")
         async with self._guarded(), self._read_pool.acquire() as connection:
@@ -190,13 +204,15 @@ class PostgresBackend:
         if self.config.mode != "write":
             raise InvalidRequestError(f"Connection '{self.name}' is configured read-only (mode: read).")
         async with self._write_lock:
+            self._raise_if_closed()
             if self._write_pool is None:
-                self._write_pool = await asyncpg.create_pool(
+                pool = await asyncpg.create_pool(
                     min_size=0,
                     max_size=self.config.pool.write_max_size,
                     **self._pool_kwargs(read_only=False),
                 )
-        return self._write_pool
+                self._write_pool = await self._keep_unless_closed(pool)
+            return self._write_pool
 
     # -- operations --------------------------------------------------------
 
@@ -253,6 +269,14 @@ class PostgresBackend:
                 finally:
                     await _rollback_quietly(transaction)
         return [str(record["QUERY PLAN"]) for record in records]
+
+
+async def _close_pool(pool: Any) -> None:
+    """Close gracefully; terminate if connections are still busy after the timeout."""
+    try:
+        await asyncio.wait_for(pool.close(), CLOSE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        pool.terminate()
 
 
 async def _rollback_quietly(transaction: Any) -> None:

@@ -8,9 +8,9 @@ from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.backends.base import Backend
 from ratatoskr.backends.errors import BackendQueryError, BackendTimeoutError
 from ratatoskr.backends.registry import BackendRegistry
-from ratatoskr.config.models import Access
+from ratatoskr.config.models import Access, ConnectionConfig
 from ratatoskr.tools.runtime import ToolOutput, ToolRuntime
-from tests.fakes import LEAKY_MESSAGE, FakeFactory, RecordingSink, make_config
+from tests.fakes import LEAKY_MESSAGE, FakeBackend, FakeFactory, RecordingSink, make_config
 
 CONFIG = make_config(
     connections={"prod": {"mode": "read", "limits": {"max_response_bytes": 1024}}, "dev": {"mode": "write"}},
@@ -70,6 +70,7 @@ async def test_missing_identity_is_denied() -> None:
     text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok)
     assert text == "Error: no authenticated user"
     assert sink.events[0].result == "denied"
+    assert sink.events[0].error_class == "PermissionError"
     assert sink.events[0].subject == "anonymous"
 
 
@@ -231,3 +232,150 @@ async def test_cancelled_call_is_still_audited_once() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert [(event.result, event.error_class) for event in sink.events] == [("error", "CancelledError")]
+
+
+async def test_cancelled_global_call_is_still_audited_once() -> None:
+    runtime, sink, _ = _runtime()
+    started = asyncio.Event()
+
+    async def call(principal: Principal) -> ToolOutput:
+        started.set()
+        await asyncio.sleep(5)
+        return ToolOutput(text="late")
+
+    task = asyncio.create_task(runtime.run_global(tool="list_connections", call=call))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [(event.connection, event.result, event.error_class) for event in sink.events] == [
+        (None, "error", "CancelledError")
+    ]
+
+
+class _SlowFirstOpen(FakeBackend):
+    """Opening takes 5 s the first time and is instant afterwards."""
+
+    async def open(self) -> None:
+        await super().open()
+        if self.open_calls == 1:
+            await asyncio.sleep(5)
+
+
+async def test_timeout_during_open_is_audited_as_timeout_without_back_off() -> None:
+    sink = RecordingSink()
+    backends: dict[str, FakeBackend] = {}
+
+    def factory(name: str, config: ConnectionConfig) -> FakeBackend:
+        backends[name] = _SlowFirstOpen(name, config)
+        return backends[name]
+
+    runtime = ToolRuntime(
+        Policy(CONFIG), BackendRegistry(CONFIG, factory=factory), StdioPrincipalResolver("team"), sink
+    )
+    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok, timeout=0.05)
+    assert text == "Error: pg_query timed out."
+    assert (sink.events[0].result, sink.events[0].error_class) == ("timeout", "TimeoutError")
+    # A cancelled open is not an open failure: the next call tries again at once instead of backing off.
+    assert await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok) == "dev:WRITE"
+    assert backends["dev"].open_calls == 2
+
+
+# -- output size and redaction -------------------------------------------------
+
+
+async def test_long_error_is_clamped_to_connection_limit() -> None:
+    runtime, sink, _ = _runtime()
+
+    async def call(backend: Backend, access: Access) -> ToolOutput:
+        raise BackendQueryError("PostgreSQL error 42601: " + "x" * 10_000)
+
+    text = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    assert text.startswith("Error: PostgreSQL error 42601: ")
+    assert len(text.encode("utf-8")) <= 1024
+    assert "[Response truncated: it exceeded 1024 bytes." in text
+    assert sink.events[0].result == "error"
+
+
+async def test_long_global_error_is_clamped_to_default_limit() -> None:
+    runtime, _, _ = _runtime()
+
+    async def call(principal: Principal) -> ToolOutput:
+        raise BackendQueryError("y" * 100_000)
+
+    text = await runtime.run_global(tool="list_connections", call=call)
+    assert len(text.encode("utf-8")) <= 65536
+    assert "[Response truncated: it exceeded 65536 bytes." in text
+
+
+async def test_redaction_that_grows_the_text_still_respects_the_limit() -> None:
+    runtime, _, _ = _runtime()
+    payload = "pwd=x " * 200  # 1200 bytes; every "pwd=x" becomes "pwd=***"
+
+    async def call(backend: Backend, access: Access) -> ToolOutput:
+        return ToolOutput(text=payload, rows=1)
+
+    async def failing(backend: Backend, access: Access) -> ToolOutput:
+        raise BackendQueryError(payload)
+
+    for tool_call in (call, failing):
+        text = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=tool_call)
+        assert len(text.encode("utf-8")) <= 1024
+        assert "pwd=x" not in text
+        assert "pwd=***" in text
+
+
+async def test_secret_cut_by_the_byte_limit_is_still_masked() -> None:
+    runtime, _, _ = _runtime()
+    secret_url = "postgresql://admin:hunter2@db.internal:5432/app"
+
+    async def call(backend: Backend, access: Access) -> ToolOutput:
+        # The URL straddles the byte limit; no part of its credentials may survive redaction plus clamping.
+        return ToolOutput(text="a" * 900 + secret_url + "b" * 500, rows=1)
+
+    text = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    assert "admin" not in text
+    assert "hunter" not in text
+    assert len(text.encode("utf-8")) <= 1024
+
+
+# -- denied versus backend PermissionError -------------------------------------
+
+
+async def test_permission_error_from_the_backend_is_a_backend_error() -> None:
+    runtime, sink, _ = _runtime()
+
+    async def call(backend: Backend, access: Access) -> ToolOutput:
+        raise PermissionError(13, "Permission denied", "/etc/ratatoskr/client-key.pem")
+
+    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    assert text == "Error: pg_query failed on connection 'dev' (PermissionError). Details are in the server log."
+    assert "/etc/ratatoskr" not in text
+    assert (sink.events[0].result, sink.events[0].error_class) == ("error", "PermissionError")
+
+
+async def test_permission_error_from_a_global_call_is_a_backend_error() -> None:
+    runtime, sink, _ = _runtime()
+
+    async def call(principal: Principal) -> ToolOutput:
+        raise PermissionError(13, "Permission denied", "/etc/ratatoskr/client-key.pem")
+
+    text = await runtime.run_global(tool="list_connections", call=call)
+    assert text == "Error: list_connections failed (PermissionError). Details are in the server log."
+    assert sink.events[0].result == "error"
+
+
+async def test_permission_error_from_the_resolver_is_denied_in_run_global() -> None:
+    sink = RecordingSink()
+    runtime = ToolRuntime(Policy(CONFIG), BackendRegistry(CONFIG, factory=FakeFactory()), _NoIdentity(), sink)
+    text = await runtime.run_global(tool="list_connections", call=lambda principal: _never())
+    assert text == "Error: no authenticated user"
+    assert (sink.events[0].result, sink.events[0].error_class, sink.events[0].subject) == (
+        "denied",
+        "PermissionError",
+        "anonymous",
+    )
+
+
+async def _never() -> ToolOutput:
+    raise AssertionError("must not be called")

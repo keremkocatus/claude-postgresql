@@ -56,8 +56,11 @@ async def test_failed_open_is_retried_after_ten_seconds() -> None:
     assert "db.internal" not in str(first.value)
     assert "OSError" in str(first.value)
 
+    assert "Try again in 10s" in str(first.value)
+    assert "retried" not in str(first.value)
+
     clock.now += 5
-    with pytest.raises(BackendUnavailableError, match="Retry in 5s"):
+    with pytest.raises(BackendUnavailableError, match=r"Try again in 5s\."):
         await registry.get("a")
     assert factory.backends["a"].open_calls == 1  # throttled: no new attempt
 
@@ -67,14 +70,35 @@ async def test_failed_open_is_retried_after_ten_seconds() -> None:
     assert factory.backends["a"].open_calls == 2
 
 
-async def test_close_all_closes_opened_and_allows_reopen() -> None:
+async def test_close_all_closes_opened_and_is_final() -> None:
     registry, factory, _ = _registry()
     await registry.get("a")
     await registry.close_all()
     assert factory.backends["a"].close_calls == 1
     assert factory.backends["b"].close_calls == 0
-    await registry.get("a")
-    assert factory.backends["a"].open_calls == 2
+    for name in ("a", "b"):
+        with pytest.raises(BackendUnavailableError, match=f"Connection '{name}' is unavailable: .*shutting down"):
+            await registry.get(name)
+    assert (factory.backends["a"].open_calls, factory.backends["b"].open_calls) == (1, 0)
+    await registry.close_all()  # idempotent
+    assert factory.backends["a"].close_calls == 1
+
+
+async def test_unknown_connection_after_close_is_still_not_found() -> None:
+    registry, _, _ = _registry()
+    await registry.close_all()
+    with pytest.raises(ConnectionNotFoundError):
+        await registry.get("ghost")
+
+
+async def test_back_off_rounds_the_wait_up() -> None:
+    registry, factory, clock = _registry()
+    factory.backends["a"].fail_open = OSError(LEAKY_MESSAGE)
+    with pytest.raises(BackendUnavailableError):
+        await registry.get("a")
+    clock.now += 9.5
+    with pytest.raises(BackendUnavailableError, match=r"Try again in 1s\."):
+        await registry.get("a")
 
 
 # -- concurrency ---------------------------------------------------------------
@@ -150,7 +174,7 @@ async def test_failed_connection_does_not_affect_others() -> None:
     with pytest.raises(BackendUnavailableError):
         await registry.get("a")
     assert await registry.get("b") is factory.backends["b"]
-    with pytest.raises(BackendUnavailableError, match="Retry in"):
+    with pytest.raises(BackendUnavailableError, match="Try again in"):
         await registry.get("a")
     assert factory.backends["a"].open_calls == 1
 
@@ -167,21 +191,75 @@ async def test_close_all_waits_for_an_open_in_progress_and_closes_it() -> None:
     await opening
     await closing
     assert backend.close_calls == 1  # not left open after close_all returned
-    await registry.get("a")
-    assert backend.open_calls == 2
+    with pytest.raises(BackendUnavailableError, match="shutting down"):
+        await registry.get("a")
+    assert backend.open_calls == 1
 
 
-async def test_get_during_close_waits_and_reopens() -> None:
+async def test_get_during_close_is_refused_and_never_reopens() -> None:
     registry, factory, _ = _gated()
     backend = factory.backends["a"]
     await registry.get("a")
     backend.close_gate.clear()
     closing = asyncio.create_task(registry.close_all())
     await backend.close_started.wait()
-    getting = asyncio.create_task(registry.get("a"))
-    await asyncio.sleep(0)
-    assert not getting.done()  # a backend that is being closed is never handed out
+    with pytest.raises(BackendUnavailableError, match="shutting down"):
+        async with asyncio.timeout(1):  # refused at once, not after close finishes
+            await registry.get("a")  # a backend that is being closed is never handed out
     backend.close_gate.set()
     await closing
-    assert await getting is backend
-    assert (backend.open_calls, backend.close_calls) == (2, 1)
+    assert (backend.open_calls, backend.close_calls) == (1, 1)
+
+
+async def test_get_waiting_on_the_lock_when_close_starts_does_not_reopen() -> None:
+    registry, factory, _ = _gated()
+    backend = factory.backends["a"]
+    backend.open_gate.clear()
+    opening = asyncio.create_task(registry.get("a"))
+    await backend.open_started.wait()
+    waiting = asyncio.create_task(registry.get("a"))  # queued on the lock behind the open in progress
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(registry.close_all())
+    await asyncio.sleep(0)
+    opening.cancel()  # releases the lock without opening and without recording a failure
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+    backend.open_gate.set()  # had the waiter tried to open, it would now succeed
+    with pytest.raises(BackendUnavailableError, match="shutting down"):
+        await waiting
+    await closing
+    assert (backend.open_calls, backend.close_calls) == (0, 0)
+
+
+async def test_cancelled_waiter_leaves_the_registry_consistent() -> None:
+    registry, factory, _ = _gated()
+    backend = factory.backends["a"]
+    backend.open_gate.clear()
+    opening = asyncio.create_task(registry.get("a"))
+    await backend.open_started.wait()
+    waiter = asyncio.create_task(registry.get("a"))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    backend.open_gate.set()
+    assert await opening is backend
+    assert await registry.get("a") is backend
+    assert backend.open_calls == 1
+    assert not registry._locks["a"].locked()
+
+
+async def test_cancelled_open_is_not_a_failure_and_is_retried_at_once() -> None:
+    registry, factory, _ = _gated()
+    backend = factory.backends["a"]
+    backend.open_gate.clear()
+    opening = asyncio.create_task(registry.get("a"))
+    await backend.open_started.wait()
+    opening.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+    assert not registry._locks["a"].locked()
+    backend.open_gate.set()
+    assert await registry.get("a") is backend  # no back-off: a cancelled open did not fail
+    assert backend.open_calls == 1  # GatedBackend counts after its gate, so the cancelled attempt is not counted
+    assert registry._failed_at == {}
