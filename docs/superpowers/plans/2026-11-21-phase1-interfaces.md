@@ -366,3 +366,5 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Task 13/16 (Q6a): per-IP anahtarı `rate_limit_address(client_ip(scope, parse_trusted_proxies(...)))`; CSRF çerezi
   `csrf.cookie_name` ile okunur; OIDC callback için Lax çerez Task 13'te kurulur. `serve` LocalIdentityProvider'ı
   preconditions'ta bir kez kurar — tekrar kurmak yerine aynı örneği kullan (çift argon2 maliyeti ve çift uyarı logu).
+- Task 16/18/19: `config.example.yaml` ve README'ye `auth.session_max_age` (varsayılan 30d) eklenmeli; saatlik temizlik
+  log satırı `CleanupStats.clients` ve `.families` sayılarını da göstermeli (`state/maintenance.py`).
