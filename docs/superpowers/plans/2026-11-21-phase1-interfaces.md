@@ -376,3 +376,6 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   için `rate_limit_address(client_ip(...))`. `secure_cookies = public_url.startswith("https://")` kalsın; `csrf.verify`
   `load_pending` ve rate limiter'dan önce çalışsın. `HttpSettings.local_provider` yeniden kullanılsın.
 - Task 18: HSTS reverse proxy'de (Caddy) ayarlanır; rehberde belirtilsin.
+- Task 18 (Q5 re-review): `server.secret_key` değiştirmek bütün local oturumları kapatır (acil durum anahtarı);
+  refresh'ten sonraki 5 sn içinde eski refresh token ile `/revoke` oturumu kapatmaz (nadir istemci deseni); parola
+  parmak izi login anında değil kod değişiminde alınır.
