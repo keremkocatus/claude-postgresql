@@ -6,7 +6,7 @@ import asyncio
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ToolAnnotations
 from pydantic import Field
 
 from ratatoskr.auth.principal import Principal
@@ -58,7 +58,7 @@ def _no_answer() -> HealthResult:
 
 
 def register_common_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
-    async def list_connections() -> str:
+    async def list_connections() -> CallToolResult:
         async def call(principal: Principal) -> ToolOutput:
             visible = runtime.policy.visible_connections(principal)
             if not visible:
@@ -81,11 +81,12 @@ def register_common_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
                 lines.append(f"| {name} | {info.kind} | {access.name.lower()} | {description} |")
             return ToolOutput(text="\n".join(lines), rows=len(visible))
 
-        return await runtime.run_global(tool="list_connections", call=call)
+        result = await runtime.run_global(tool="list_connections", call=call)
+        return result.to_call_tool_result()
 
     async def connection_health(
         connection: Annotated[str | None, Field(description=HEALTH_CONNECTION_ARG)] = None,
-    ) -> str:
+    ) -> CallToolResult:
         if connection is not None:
             name = connection
 
@@ -100,15 +101,17 @@ def register_common_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
             def unavailable(exc: BackendUnavailableError) -> ToolOutput:
                 # Opening failed (or is backing off): the same row the no-argument form shows.
                 down = HealthResult(ok=False, latency_ms=None, version=None, error=str(exc))
-                return ToolOutput(text=_health_table([_health_row(name, runtime.registry.describe(name).kind, down)]))
+                row = _health_row(name, runtime.registry.describe(name).kind, down)
+                return ToolOutput(text=_health_table([row]), rows=1)
 
-            return await runtime.run(
+            result = await runtime.run(
                 tool="connection_health",
                 connection=name,
                 need=Access.READ,
                 call=call_one,
                 on_unavailable=unavailable,
             )
+            return result.to_call_tool_result()
 
         async def call_all(principal: Principal) -> ToolOutput:
             names = [name for name, _ in runtime.policy.visible_connections(principal)]
@@ -121,7 +124,8 @@ def register_common_tools(mcp: FastMCP[Any], runtime: ToolRuntime) -> None:
             ]
             return ToolOutput(text=_health_table(rows), rows=len(rows))
 
-        return await runtime.run_global(tool="connection_health", call=call_all)
+        result = await runtime.run_global(tool="connection_health", call=call_all)
+        return result.to_call_tool_result()
 
     read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
     mcp.add_tool(

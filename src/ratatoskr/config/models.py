@@ -144,11 +144,14 @@ class PgTlsSettings(BaseModel):
         return self
 
 
+DEFAULT_MAX_RESPONSE_BYTES = 65536
+
+
 class PgLimits(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_rows: int = Field(default=500, ge=1)
-    max_response_bytes: int = Field(default=65536, ge=1024)
+    max_response_bytes: int = Field(default=DEFAULT_MAX_RESPONSE_BYTES, ge=1024)
     max_query_length: int = Field(default=20000, ge=1)
 
 
@@ -159,6 +162,8 @@ class PostgresConnection(BaseModel):
     description: str = ""
     mode: GrantLevel = "read"
     dsn: SecretStr
+    # Optional login for the write pool (pg_execute, write-level EXPLAIN ANALYZE); the read pool always uses dsn.
+    write_dsn: SecretStr | None = None
     pool: PoolSettings = PoolSettings()
     statement_timeout: timedelta = timedelta(seconds=30)
     allowed_schemas: list[str] = []
@@ -176,6 +181,12 @@ class PostgresConnection(BaseModel):
         if value < timedelta(milliseconds=1):
             raise ValueError("statement_timeout must be greater than zero")
         return value
+
+    @model_validator(mode="after")
+    def _check_write_dsn(self) -> Self:
+        if self.write_dsn is not None and self.mode != "write":
+            raise ValueError("write_dsn is only allowed with mode: write")
+        return self
 
 
 ConnectionConfig = Annotated[PostgresConnection, Field(discriminator="kind")]

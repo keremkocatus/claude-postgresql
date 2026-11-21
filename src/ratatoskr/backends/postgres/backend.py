@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from ratatoskr.backends.errors import (
     BackendUnavailableError,
     InvalidRequestError,
 )
+from ratatoskr.backends.postgres.formatting import markdown_header, markdown_row
 from ratatoskr.backends.postgres.guard import leading_keyword
 from ratatoskr.backends.postgres.tls import build_ssl
 from ratatoskr.config.models import PostgresConnection
@@ -53,16 +55,22 @@ _DML_VERBS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})
 # WITH) has already run to completion, so the count is the number of rows the statement changed.
 _COUNTED_TO_END_VERBS = _DML_VERBS | {"WITH"}
 _MOVE_ALL = 2**31 - 1  # MOVE takes a 32-bit count
+# asyncpg could not encode a Python argument: "<position>: <repr, cut at 40 chars> (<Python exception text>)".
+_INVALID_ARGUMENT_RE = re.compile(r"invalid input for query argument (\$\d+)[^:]*: (.*?) \((.*)\)\Z", re.DOTALL)
 
 logger = logging.getLogger("ratatoskr.backends.postgres")
 
 
 @dataclass(frozen=True)
 class RowSet:
+    """``truncated``: more rows exist than were kept. ``oversized``: the one kept row alone is over the byte
+    budget (the response will be cut); whether more rows exist is unknown because reading stopped there."""
+
     columns: list[str]
     rows: list[tuple[Any, ...]]
     truncated: bool
     elapsed_ms: float
+    oversized: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +79,14 @@ class StatementResult:
     columns: list[str]
     rows: list[tuple[Any, ...]]
     truncated: bool = False
+
+
+@dataclass(frozen=True)
+class _Capped:
+    rows: list[tuple[Any, ...]]
+    consumed: int  # rows taken from the cursor, including any that were dropped
+    truncated: bool
+    oversized: bool = False
 
 
 class _SessionResettingConnection(asyncpg.Connection):  # type: ignore[misc]  # asyncpg is untyped
@@ -98,8 +114,26 @@ def _postgres_text(exc: Any) -> str:
     return text
 
 
+def _invalid_argument_text(exc: BaseException) -> str | None:
+    """asyncpg's "invalid input for query argument $1: <repr> (<Python error>)" without the Python part."""
+    if not isinstance(exc, asyncpg.PostgresError | asyncpg.InterfaceError):
+        return None
+    match = _INVALID_ARGUMENT_RE.match(str(exc))
+    if match is None:
+        return None
+    position, value = match.group(1), match.group(2)
+    return (
+        f"Invalid query parameters: the value for {position} ({value}) does not match the parameter's type. "
+        f"Pass a value of that type, or cast through text, e.g. {position}::text::date."
+    )
+
+
 def translate_error(exc: BaseException, *, connection: str | None = None) -> BackendError | None:
     """Map asyncpg errors to user-safe errors; None means "not a query error" (caller hides details)."""
+    invalid_argument = _invalid_argument_text(exc)
+    if invalid_argument is not None:
+        logger.debug("invalid query argument: %s", exc)
+        return BackendQueryError(invalid_argument)
     if _is_connection_error(exc):
         logger.warning("connection %s is unavailable: %s: %s", connection, type(exc).__name__, exc)
         target = f"Connection '{connection}'" if connection else "The connection"
@@ -133,9 +167,15 @@ class ReadSession:
         statement = await self._connection.prepare(sql)
         columns = [attribute.name for attribute in statement.get_attributes()]
         cursor = await statement.cursor(*args)
-        rows, _, truncated = await _read_capped(cursor, max_rows, max_bytes)
+        capped = await _read_capped(cursor, columns, max_rows, max_bytes)
         elapsed_ms = (time.perf_counter() - started) * 1000
-        return RowSet(columns=columns, rows=rows, truncated=truncated, elapsed_ms=elapsed_ms)
+        return RowSet(
+            columns=columns,
+            rows=capped.rows,
+            truncated=capped.truncated,
+            elapsed_ms=elapsed_ms,
+            oversized=capped.oversized,
+        )
 
 
 class PostgresBackend:
@@ -152,13 +192,19 @@ class PostgresBackend:
 
     # -- lifecycle ---------------------------------------------------------
 
+    def _dsn(self, *, read_only: bool) -> str:
+        """The read pool always logs in with ``dsn``; the write pool with ``write_dsn`` when it is set."""
+        if not read_only and self.config.write_dsn is not None:
+            return self.config.write_dsn.get_secret_value()
+        return self.config.dsn.get_secret_value()
+
     def _pool_kwargs(self, *, read_only: bool) -> dict[str, Any]:
         timeout_ms = max(1, int(self.config.statement_timeout.total_seconds() * 1000))
         server_settings = {"statement_timeout": str(timeout_ms), "application_name": "ratatoskr"}
         if read_only:
             server_settings["default_transaction_read_only"] = "on"
         kwargs: dict[str, Any] = {
-            "dsn": self.config.dsn.get_secret_value(),
+            "dsn": self._dsn(read_only=read_only),
             "server_settings": server_settings,
             "timeout": CONNECT_TIMEOUT_SECONDS,
             "statement_cache_size": 0,
@@ -339,15 +385,17 @@ async def _run_statement(
         await statement.fetch(*args)
         return StatementResult(status=statement.get_statusmsg() or "", columns=[], rows=[])
     cursor = await statement.cursor(*args)
-    rows, consumed, truncated = await _read_capped(cursor, max_rows, max_bytes)
+    capped = await _read_capped(cursor, columns, max_rows, max_bytes)
     # A cursor does not expose the command tag, so build one. DML ... RETURNING and WITH ... have already run
     # their data changes to completion: count the rows left with MOVE (no transfer). A SELECT is not read to
     # the end.
     verb = leading_keyword(sql)
-    count = len(rows)
-    if truncated and verb in _COUNTED_TO_END_VERBS:
-        count = consumed + await cursor.forward(_MOVE_ALL)
-    return StatementResult(status=_command_tag(verb, count), columns=columns, rows=rows, truncated=truncated)
+    count = len(capped.rows)
+    truncated = capped.truncated
+    if (capped.truncated or capped.oversized) and verb in _COUNTED_TO_END_VERBS:
+        count = capped.consumed + await cursor.forward(_MOVE_ALL)
+        truncated = count > len(capped.rows)
+    return StatementResult(status=_command_tag(verb, count), columns=columns, rows=capped.rows, truncated=truncated)
 
 
 def _command_tag(verb: str, count: int) -> str:
@@ -358,23 +406,29 @@ def _command_tag(verb: str, count: int) -> str:
     return f"ROWS {count}"
 
 
-def _approximate_size(row: tuple[Any, ...]) -> int:
-    return sum(len(str(value)) for value in row)
+def _rendered_size(line: str) -> int:
+    """UTF-8 bytes of one rendered Markdown line plus its newline."""
+    return len(line.encode("utf-8")) + 1
 
 
-async def _read_capped(cursor: Any, max_rows: int, max_bytes: int | None) -> tuple[list[tuple[Any, ...]], int, bool]:
-    """Read at most *max_rows* rows (and, with *max_bytes*, about that many bytes) from *cursor*.
+async def _read_capped(cursor: Any, columns: Sequence[str], max_rows: int, max_bytes: int | None) -> _Capped:
+    """Read at most *max_rows* rows and, with *max_bytes*, only rows whose Markdown table fits that budget.
 
-    Returns the rows kept, the number of rows taken from the cursor and whether rows were left out.
+    Rows are measured as they will be rendered (``formatting.markdown_row``, UTF-8, with the table header
+    counted up front). The row that would cross the budget is dropped, so ``truncated`` always means "more
+    rows exist". At least one row is kept: a first row that alone exceeds the budget is returned with
+    ``oversized`` set and reading stops (the response is then cut by the runtime's byte clamp).
 
     With a byte budget the first fetch takes one row; each later chunk doubles (at most ``MAX_CHUNK_ROWS``) and
     never asks for more rows than the remaining budget holds at the size of the largest row seen so far. A
-    chunk can still overshoot when rows grow beyond anything seen before, and a single huge value cannot be
-    bounded on the client side at all: asyncpg receives each row whole.
+    chunk can still overshoot when rows grow beyond anything seen before (the extra rows are fetched and
+    dropped), and a single huge value cannot be bounded on the client side at all: asyncpg receives each row
+    whole.
     """
     if max_bytes is None:
         records = await cursor.fetch(max_rows + 1)
-        return [tuple(record) for record in records[:max_rows]], len(records), len(records) > max_rows
+        return _Capped([tuple(record) for record in records[:max_rows]], len(records), len(records) > max_rows)
+    budget = max_bytes - _rendered_size(markdown_header(columns))
     rows: list[tuple[Any, ...]] = []
     consumed = 0
     size = 0
@@ -386,18 +440,20 @@ async def _read_capped(cursor: Any, max_rows: int, max_bytes: int | None) -> tup
         consumed += len(records)
         for record in records:
             if len(rows) == max_rows:
-                return rows, consumed, True
+                return _Capped(rows, consumed, truncated=True)
             row = tuple(record)
+            row_size = _rendered_size(markdown_row(row))
+            if size + row_size > budget:
+                if rows:
+                    return _Capped(rows, consumed, truncated=True)
+                return _Capped([row], consumed, truncated=False, oversized=True)
             rows.append(row)
-            row_size = _approximate_size(row)
             largest = max(largest, row_size)
             size += row_size
-            if size > max_bytes:
-                return rows, consumed, True
         if len(records) < want:
-            return rows, consumed, False
+            return _Capped(rows, consumed, truncated=False)
         chunk = min(chunk * 2, MAX_CHUNK_ROWS)
-        want = max(1, min(chunk, max_rows + 1 - len(rows), (max_bytes - size) // largest))
+        want = max(1, min(chunk, max_rows + 1 - len(rows), (budget - size) // largest))
 
 
 async def _close_pool(pool: Any) -> None:

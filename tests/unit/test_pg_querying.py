@@ -5,7 +5,7 @@ import pytest
 
 from ratatoskr.backends.errors import InvalidRequestError
 from ratatoskr.backends.postgres.backend import PostgresBackend, RowSet, StatementResult
-from ratatoskr.backends.postgres.querying import affected_rows, run_execute, run_explain, run_query
+from ratatoskr.backends.postgres.querying import HEADLINE_RESERVE_BYTES, run_execute, run_explain, run_query
 from ratatoskr.config.models import Access
 from tests.fakes import make_config
 
@@ -53,8 +53,10 @@ class StubBackend(PostgresBackend):
 @pytest.mark.parametrize(
     ("status", "expected"), [("UPDATE 3", 3), ("INSERT 0 1", 1), ("DELETE 0", 0), ("CREATE TABLE", 0)]
 )
-def test_affected_rows(status: str, expected: int) -> None:
-    assert affected_rows(status) == expected
+async def test_execute_counts_affected_rows_from_the_status(status: str, expected: int) -> None:
+    results = [StatementResult(status=status, columns=[], rows=[])]
+    output = await run_execute(StubBackend(results=results), [("UPDATE t SET a = 1", [])])
+    assert output.rows == expected
 
 
 async def test_query_guard_runs_before_database() -> None:
@@ -104,11 +106,6 @@ async def test_execute_guard_runs_before_database() -> None:
         await run_execute(_backend(), [("UPDATE t SET a = 1", []), ("COMMIT", [])])
 
 
-async def test_execute_with_no_statements() -> None:
-    output = await run_execute(_backend(), [])
-    assert output.text == "Nothing to do: `statements` is empty."
-
-
 async def test_explain_rejects_explain_prefix() -> None:
     with pytest.raises(InvalidRequestError, match="without EXPLAIN"):
         await run_explain(_backend(), Access.READ, "EXPLAIN SELECT 1", [], analyze=False, buffers=False)
@@ -122,7 +119,8 @@ async def test_write_level_explain_analyze_applies_write_guard() -> None:
 async def test_query_passes_row_and_byte_limits() -> None:
     backend = StubBackend()
     await run_query(backend, "SELECT 1", [])
-    assert backend.calls == [("fetch_rows", 3, 1024)]
+    # the headline above the table is reserved, so the rendered table plus headline fit the response limit
+    assert backend.calls == [("fetch_rows", 3, 1024 - HEADLINE_RESERVE_BYTES)]
 
 
 async def test_query_cut_by_the_row_limit() -> None:
@@ -136,8 +134,33 @@ async def test_query_cut_by_the_response_size_limit() -> None:
     rowset = RowSet(columns=["a"], rows=[("x" * 600,), ("y" * 600,)], truncated=True, elapsed_ms=1.0)
     output = await run_query(StubBackend(rowset=rowset), "SELECT a FROM t", [])
     assert "Showing the first 2 rows" in output.text
-    assert "response size limit (~1024 bytes)" in output.text
+    assert "the rest did not fit the response size limit (~1024 bytes)" in output.text
     assert "row limit" not in output.text
+
+
+async def test_query_that_fits_does_not_claim_more_rows() -> None:
+    rowset = RowSet(columns=["a"], rows=[("x",), ("y",)], truncated=False, elapsed_ms=1.0)
+    output = await run_query(StubBackend(rowset=rowset), "SELECT a FROM t", [])
+    assert output.text.startswith("2 row(s) in 1.0 ms.")
+    assert "did not fit" not in output.text
+
+
+async def test_query_with_one_oversized_row_says_it_is_cut() -> None:
+    rowset = RowSet(columns=["doc"], rows=[("x" * 5000,)], truncated=False, elapsed_ms=1.0, oversized=True)
+    output = await run_query(StubBackend(rowset=rowset), "SELECT doc FROM t", [])
+    assert output.text.startswith(
+        "Showing 1 row; it alone is larger than the response size limit (~1024 bytes), so it is cut off below."
+    )
+    assert "the rest did not fit" not in output.text
+    assert output.rows == 1
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_headlines_fit_the_reserve(oversized: bool) -> None:
+    rowset = RowSet(columns=["a"], rows=[(1,)] * 3, truncated=not oversized, elapsed_ms=123456.7, oversized=oversized)
+    output = await run_query(StubBackend(rowset=rowset), "SELECT a FROM t", [])
+    headline = output.text.split("\n\n", 1)[0]
+    assert len(headline.encode("utf-8")) + 2 <= HEADLINE_RESERVE_BYTES
 
 
 async def test_execute_passes_limits_and_notes_truncated_statements() -> None:
@@ -147,7 +170,7 @@ async def test_execute_passes_limits_and_notes_truncated_statements() -> None:
     ]
     backend = StubBackend(results=results)
     output = await run_execute(backend, [("CREATE TABLE t (id int)", []), ("UPDATE t SET id = id RETURNING id", [])])
-    assert backend.calls == [("execute", 3, 1024)]
+    assert backend.calls == [("execute", 3, 1024 - HEADLINE_RESERVE_BYTES)]
     assert "2. UPDATE 7" in output.text
     assert "showing the first 2 returned rows; more were returned" in output.text
     assert output.rows == 7

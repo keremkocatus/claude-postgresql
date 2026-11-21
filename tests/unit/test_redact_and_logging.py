@@ -50,6 +50,16 @@ def test_setup_logging_writes_json_to_stream() -> None:
     assert entry["tool"] == "pg_query"
 
 
+@pytest.mark.parametrize(("level", "shown"), [("INFO", False), ("DEBUG", True)])
+def test_setup_logging_hides_per_request_mcp_lines_at_info(level: str, shown: bool) -> None:
+    stream = io.StringIO()
+    setup_logging(level, stream=stream)
+    logging.getLogger("mcp.server.lowlevel.server").info("Processing request of type %s", "CallToolRequest")
+    logging.getLogger("mcp.server.lowlevel.server").warning("still visible")
+    assert ("Processing request" in stream.getvalue()) is shown
+    assert "still visible" in stream.getvalue()
+
+
 # --- review fixes: wider redaction, structured extras, root logger ---
 
 SECRET_URL = "postgresql://u:hunter2@h/d"
@@ -59,6 +69,15 @@ def test_redacts_authorization_headers() -> None:
     assert redact("Authorization: Bearer abc.def.ghi") == "Authorization: Bearer ***"
     assert redact("authorization=Basic dXNlcjpwYXNz rest") == "authorization=Basic *** rest"
     assert redact('{"Authorization": "Bearer abc.def-ghi_0"}') == '{"Authorization": "Bearer ***"}'
+    assert redact("{'authorization': 'Basic dXNlcjpwYXNz'}") == "{'authorization': 'Basic ***'}"
+
+
+def test_bearer_needs_a_token_like_value() -> None:
+    assert redact("sent Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc here") == "sent Bearer *** here"
+    assert redact("bearer abcdefghij0123456789+/==") == "bearer ***"
+    assert redact("The Ring Bearer of bad news") == "The Ring Bearer of bad news"
+    assert redact("Bearer Frodo Baggins") == "Bearer Frodo Baggins"
+    assert redact("bearer short.token") == "bearer short.token"  # under 16 characters: not token-like
 
 
 @pytest.mark.parametrize("key", ["token", "access_token", "refresh_token", "secret", "client_secret", "api_key"])

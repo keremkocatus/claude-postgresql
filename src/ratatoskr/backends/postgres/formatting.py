@@ -35,10 +35,19 @@ def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> str
     """Render *rows* (one value per column) as a Markdown table; ``_No rows._`` when empty."""
     if not rows:
         return "_No rows._"
+    return "\n".join([markdown_header(columns), *(markdown_row(row) for row in rows)])
+
+
+def markdown_header(columns: Sequence[str]) -> str:
+    """The header and separator lines of a Markdown table."""
     header = "| " + " | ".join(_escape(column) for column in columns) + " |"
     separator = "|" + "|".join(" --- " for _ in columns) + "|"
-    body = ["| " + " | ".join(_escape(format_cell(value)) for value in row) + " |" for row in rows]
-    return "\n".join([header, separator, *body])
+    return f"{header}\n{separator}"
+
+
+def markdown_row(row: Sequence[Any]) -> str:
+    """One Markdown table line for *row* (one value per column)."""
+    return "| " + " | ".join(_escape(format_cell(value)) for value in row) + " |"
 
 
 def records_table(records: Sequence[Mapping[str, Any]]) -> str:

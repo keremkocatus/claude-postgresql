@@ -2,6 +2,7 @@ from typing import Any
 
 import pytest
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 from ratatoskr.auth.policy import Policy
 from ratatoskr.auth.resolver import StdioPrincipalResolver
@@ -43,6 +44,11 @@ async def test_annotations() -> None:
         if tool.name == "pg_execute":
             assert tool.annotations.readOnlyHint is False
             assert tool.annotations.destructiveHint is True
+            assert tool.annotations.idempotentHint is False
+        elif tool.name == "pg_explain":
+            # analyze=true under write access runs DML (rolled back; sequences still advance)
+            assert tool.annotations.readOnlyHint is False
+            assert tool.annotations.destructiveHint is False
             assert tool.annotations.idempotentHint is False
         else:
             assert tool.annotations.readOnlyHint is True, tool.name
@@ -92,4 +98,21 @@ async def test_names_are_described_as_exact_and_case_sensitive() -> None:
 
 async def test_non_postgres_backend_is_rejected() -> None:
     result = await _mcp().call_tool("pg_list_schemas", {"connection": "main"})
-    assert result[0].text == "Error: Connection 'main' is not a PostgreSQL connection."  # type: ignore[index, union-attr]
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert result.content == [TextContent(type="text", text="Error: Connection 'main' is not a PostgreSQL connection.")]
+
+
+@pytest.mark.parametrize("name", PG_TOOLS)
+async def test_every_tool_returns_a_call_tool_result_with_is_error(name: str) -> None:
+    arguments: dict[str, Any] = {"connection": "ghost"}
+    if name in ("pg_query", "pg_explain"):
+        arguments["sql"] = "SELECT 1"
+    if name == "pg_describe_table":
+        arguments["table"] = "t"
+    if name == "pg_execute":
+        arguments["statements"] = [{"sql": "SELECT 1"}]
+    result = await _mcp().call_tool(name, arguments)
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert result.content == [TextContent(type="text", text="Error: Connection 'ghost' not found.")]

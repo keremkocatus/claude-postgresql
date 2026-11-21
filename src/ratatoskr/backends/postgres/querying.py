@@ -13,6 +13,9 @@ from ratatoskr.config.models import Access
 from ratatoskr.tools.runtime import ToolOutput
 
 _BACKTICK_RUN_RE = re.compile(r"`+")
+# Bytes kept free for the headline above a result table, so the table the backend sized to the rest of the
+# budget plus the headline fit the response limit and the runtime's clamp rarely cuts again.
+HEADLINE_RESERVE_BYTES = 320
 
 
 def _status_count(status: str) -> int | None:
@@ -21,24 +24,29 @@ def _status_count(status: str) -> int | None:
     return int(last) if last.isdigit() else None
 
 
-def affected_rows(status: str) -> int:
-    """Rows affected according to a command tag such as ``UPDATE 3`` or ``INSERT 0 1``."""
-    return _status_count(status) or 0
-
-
 def _fence(text: str) -> str:
     """A Markdown code fence longer than any backtick run in *text*, so the plan cannot close it early."""
     longest = max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0)
     return "`" * max(3, longest + 1)
 
 
+def _table_budget(max_response_bytes: int) -> int:
+    return max_response_bytes - HEADLINE_RESERVE_BYTES
+
+
 async def run_query(backend: PostgresBackend, sql: str, params: Sequence[Any]) -> ToolOutput:
     limits = backend.config.limits
     check_read_sql(sql, max_length=limits.max_query_length)  # defence in depth; the DB role is the boundary
-    result = await backend.fetch_rows(sql, params, limits.max_rows, max_bytes=limits.max_response_bytes)
+    budget = _table_budget(limits.max_response_bytes)
+    result = await backend.fetch_rows(sql, params, limits.max_rows, max_bytes=budget)
     shown = len(result.rows)
     header = f"{shown} row(s) in {result.elapsed_ms:.1f} ms."
-    if result.truncated and shown >= limits.max_rows:
+    if result.oversized:
+        header = (
+            f"Showing 1 row; it alone is larger than the response size limit (~{limits.max_response_bytes} "
+            "bytes), so it is cut off below. Select fewer or narrower columns (e.g. left(col, 200))."
+        )
+    elif result.truncated and shown >= limits.max_rows:
         header = (
             f"Showing the first {shown} rows; the query returned more (row limit {limits.max_rows}). "
             "Add WHERE, LIMIT or aggregation to narrow it."
@@ -55,11 +63,9 @@ async def run_query(backend: PostgresBackend, sql: str, params: Sequence[Any]) -
 
 async def run_execute(backend: PostgresBackend, statements: Sequence[tuple[str, Sequence[Any]]]) -> ToolOutput:
     limits = backend.config.limits
-    if not statements:
-        return ToolOutput(text="Nothing to do: `statements` is empty.", rows=0)
-    for sql, _ in statements:
+    for sql, _ in statements:  # the tool schema guarantees at least one statement
         check_write_sql(sql, max_length=limits.max_query_length)
-    results = await backend.execute(statements, limits.max_rows, max_bytes=limits.max_response_bytes)
+    results = await backend.execute(statements, limits.max_rows, max_bytes=_table_budget(limits.max_response_bytes))
     lines = [f"Transaction committed ({len(results)} statement(s))."]
     total = 0
     for index, result in enumerate(results, start=1):

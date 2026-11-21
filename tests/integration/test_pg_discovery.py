@@ -152,11 +152,17 @@ async def test_principal_without_role_sees_nothing(seeded: str, make_harness: Ma
 
 async def test_one_audit_event_per_call_with_its_result(seeded: str, make_harness: MakeHarness) -> None:
     harness = make_harness(make_pg_config(seeded, mode="read", statement_timeout="0.5s"))
-    await harness.call("pg_query", sql="SELECT 1")
-    await harness.call("pg_query", sql="SELECT * FROM ghost")
-    await harness.call("pg_execute", statements=[{"sql": "DELETE FROM items"}])
-    await harness.call("pg_query", sql="SELECT pg_sleep(5)")
-    await harness.call("pg_list_tables")
+    results = [
+        await harness.call_result("pg_query", sql="SELECT 1"),
+        await harness.call_result("pg_query", sql="SELECT * FROM ghost"),
+        await harness.call_result("pg_execute", statements=[{"sql": "DELETE FROM items"}]),
+        await harness.call_result("pg_query", sql="SELECT pg_sleep(5)"),
+        await harness.call_result("pg_list_tables"),
+        await harness.call_result("pg_query", sql="COPY items TO STDOUT"),
+        await harness.call_result("pg_query", connection="ghost", sql="SELECT 1"),
+    ]
+    # MCP isError: hosts see failures as failures (PG error, insufficient access, timeout, guard, not found)
+    assert [result.is_error for result in results] == [False, True, True, True, False, True, True]
     events = harness.sink.events
     assert [(event.tool, event.result, event.error_class) for event in events] == [
         ("pg_query", "ok", None),
@@ -164,7 +170,10 @@ async def test_one_audit_event_per_call_with_its_result(seeded: str, make_harnes
         ("pg_execute", "denied", "InsufficientAccessError"),
         ("pg_query", "timeout", "BackendTimeoutError"),
         ("pg_list_tables", "ok", None),
+        ("pg_query", "error", "InvalidRequestError"),
+        ("pg_query", "denied", "ConnectionNotFoundError"),
     ]
+    events = events[:5]
     assert all((event.subject, event.auth_source, event.connection) == ("stdio", "stdio", "db") for event in events)
     assert events[0].rows == 1 and events[0].query_sha256 is not None
     assert events[2].query_text == "DELETE FROM items"
@@ -188,4 +197,5 @@ async def test_unreachable_connection_reports_without_leaking(make_harness: Make
         assert "hunter2" not in output
         assert "127.0.0.1" not in output
         assert "ratatoskr" not in output
-    assert [event.result for event in harness.sink.events] == ["error", "error", "ok"]
+    # the health reports rendered, so they are "ok" even though the connection is down
+    assert [event.result for event in harness.sink.events] == ["error", "ok", "ok"]

@@ -170,3 +170,24 @@ def test_secret_file_problem_does_not_leak_contents(tmp_path: Path) -> None:
 def test_env_value_is_not_interpolated_again(tmp_path: Path) -> None:
     config = load_config(_write(tmp_path, BASE), env={"MAIN_DSN": "${OTHER}", "OTHER": "postgresql://other/db"})
     assert config.connections["main"].dsn.get_secret_value() == "${OTHER}"
+
+
+def test_write_dsn_is_interpolated(tmp_path: Path) -> None:
+    secret = tmp_path / "write_dsn"
+    secret.write_text("postgresql://writer:w@db/app\n", encoding="utf-8")
+    text = BASE + f"    write_dsn: ${{file:{secret.as_posix()}}}\n"
+    config = load_config(_write(tmp_path, text), env={"MAIN_DSN": "postgresql://reader:r@db/app"})
+    write_dsn = config.connections["main"].write_dsn
+    assert write_dsn is not None and write_dsn.get_secret_value() == "postgresql://writer:w@db/app"
+    assert config.connections["main"].dsn.get_secret_value() == "postgresql://reader:r@db/app"
+
+
+def test_write_dsn_on_a_read_connection_is_a_config_error_without_the_value(tmp_path: Path) -> None:
+    text = BASE.replace("mode: write", "mode: read") + "    write_dsn: ${WRITE_DSN}\n"
+    env = {"MAIN_DSN": "postgresql://db/app", "WRITE_DSN": "postgresql://writer:topsecret@db/app"}
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(_write(tmp_path, text), env=env)
+    message = str(excinfo.value)
+    assert "connections.main: write_dsn is only allowed with mode: write" in message
+    assert "topsecret" not in message
+    assert "writer" not in message

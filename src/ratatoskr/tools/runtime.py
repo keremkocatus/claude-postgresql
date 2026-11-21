@@ -8,6 +8,8 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from mcp.types import CallToolResult, TextContent
+
 from ratatoskr.auth.policy import ConnectionNotFoundError, InsufficientAccessError, Policy
 from ratatoskr.auth.principal import Principal
 from ratatoskr.auth.resolver import PrincipalResolver
@@ -28,6 +30,17 @@ logger = logging.getLogger("ratatoskr.tools")
 class ToolOutput:
     text: str
     rows: int | None = None
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """What a tool call returns: the text for the client and whether it reports a failure (MCP ``isError``)."""
+
+    text: str
+    is_error: bool
+
+    def to_call_tool_result(self) -> CallToolResult:
+        return CallToolResult(content=[TextContent(type="text", text=self.text)], isError=self.is_error)
 
 
 @dataclass
@@ -56,12 +69,13 @@ class ToolRuntime:
         query_text: str | None = None,
         timeout: float | None = None,
         on_unavailable: Callable[[BackendUnavailableError], ToolOutput] | None = None,
-    ) -> str:
-        """resolve -> authorize -> registry.get -> deadline -> clamp -> audit; errors become safe text.
+    ) -> ToolResult:
+        """resolve -> authorize -> registry.get -> deadline -> clamp -> audit; errors become safe ``Error:`` text.
 
         ``on_unavailable``: when opening the backend (``registry.get``) raises ``BackendUnavailableError``, render
-        that as the tool's output instead of an ``Error:`` text. It is audited as an error and goes through the
-        same redact-and-clamp step. Authorization runs first, and errors raised inside ``call`` never reach it.
+        that as the tool's output instead of an ``Error:`` text. That output is the tool's answer (for example a
+        health report that says the connection is down): it is audited as ``ok`` and is not an error result.
+        Authorization runs first, and errors raised inside ``call`` never reach it.
         """
         started = time.perf_counter()
         outcome = _Outcome()
@@ -76,19 +90,19 @@ class ToolRuntime:
                     if on_unavailable is None:
                         raise
                     output = on_unavailable(exc)
-                    outcome.result, outcome.error_class = "error", type(exc).__name__
                 else:
                     output = await call(backend, access)
             outcome.rows = output.rows
-            text = output.text
+            result = self._success(output.text, connection)
         except asyncio.CancelledError:
             outcome.result, outcome.error_class = "error", "CancelledError"
             self._record(tool, connection, principal, query_text, started, outcome)
             raise
         except Exception as exc:
             text = self._error_text(exc, tool=tool, connection=connection, outcome=outcome, identified=principal)
+            result = self._failure(text, connection)
         self._record(tool, connection, principal, query_text, started, outcome)
-        return self._finish(text, connection)
+        return result
 
     async def run_global(
         self,
@@ -96,7 +110,7 @@ class ToolRuntime:
         tool: str,
         call: Callable[[Principal], Awaitable[ToolOutput]],
         timeout: float | None = None,
-    ) -> str:
+    ) -> ToolResult:
         """Same wrapper for tools that are not bound to one connection (list_connections, health of all)."""
         started = time.perf_counter()
         outcome = _Outcome()
@@ -106,19 +120,27 @@ class ToolRuntime:
             async with asyncio.timeout(timeout):
                 output = await call(principal)
             outcome.rows = output.rows
-            text = output.text
+            result = self._success(output.text, None)
         except asyncio.CancelledError:
             outcome.result, outcome.error_class = "error", "CancelledError"
             self._record(tool, None, principal, None, started, outcome)
             raise
         except Exception as exc:
             text = self._error_text(exc, tool=tool, connection=None, outcome=outcome, identified=principal)
+            result = self._failure(text, None)
         self._record(tool, None, principal, None, started, outcome)
-        return self._finish(text, None)
+        return result
 
-    def _finish(self, text: str, connection: str | None) -> str:
-        """Every returned text, success or error: redact first, then clamp, so the byte limit always holds."""
-        return clamp_text(redact(text), self.registry.max_response_bytes(connection), TRUNCATION_HINT).text
+    def _success(self, text: str, connection: str | None) -> ToolResult:
+        """Successful output is the user's data: it is clamped but never redacted (that would corrupt rows)."""
+        return ToolResult(text=self._clamp(text, connection), is_error=False)
+
+    def _failure(self, text: str, connection: str | None) -> ToolResult:
+        """Error text is redacted first, then clamped, so the byte limit always holds."""
+        return ToolResult(text=self._clamp(redact(text), connection), is_error=True)
+
+    def _clamp(self, text: str, connection: str | None) -> str:
+        return clamp_text(text, self.registry.max_response_bytes(connection), TRUNCATION_HINT).text
 
     @staticmethod
     def _error_text(

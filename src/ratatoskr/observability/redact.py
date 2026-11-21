@@ -1,4 +1,7 @@
-"""Mask connection strings, passwords and tokens before text leaves the process (tool output, logs)."""
+"""Mask connection strings, passwords and tokens in error text, logs and audit query text.
+
+Successful tool output (row data, definitions) is never passed through here: masking would corrupt it.
+"""
 
 from __future__ import annotations
 
@@ -15,10 +18,13 @@ _SECRET_KEYS = r"password|passwd|pwd|token|secret|api[_-]?key"
 _QUOTED_VALUE = r"\"(?:[^\"\\]|\\.){0,512}\"|'(?:[^'\\]|\\.){0,512}'|[\"'][^\n]*"
 
 _URL_RE = re.compile(r"\b(postgres(?:ql)?(?:\+\w+)?)://[^\s'\"<>\\]+", re.IGNORECASE)
+# Header lines (``Authorization: Bearer x``) and JSON / dict entries (``"Authorization": "Basic x"``).
 _AUTH_HEADER_RE = re.compile(
-    r"\b(authorization\s*[:=]\s*)(?:(bearer|basic|digest|negotiate)\s+)?[^\s,;'\"\\]+", re.IGNORECASE
+    r"\b(authorization[\"']?\s*[:=]\s*[\"']?)(?:(bearer|basic|digest|negotiate)\s+)?[^\s,;'\"\\]+", re.IGNORECASE
 )
-_BEARER_RE = re.compile(r"\b(bearer)\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE)
+# A bare "Bearer <token>" only when the value looks like a token (16+ token characters), so prose such as
+# "Bearer of bad news" stays readable in logs.
+_BEARER_RE = re.compile(r"\b(bearer)\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE)
 # Key, closing quote, colon, value: JSON objects and Python dict reprs (``"db_password": "x"``).
 _QUOTED_KEY_RE = re.compile(rf"({_SECRET_KEYS})([\"'])(\s*:\s*)(?:{_QUOTED_VALUE}|[^\s,;}}\]]+)", re.IGNORECASE)
 _KEYVALUE_RE = re.compile(rf"({_SECRET_KEYS})\s*([=:])\s*(?:{_QUOTED_VALUE}|[^\s,;'\"]+)", re.IGNORECASE)

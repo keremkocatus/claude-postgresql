@@ -34,4 +34,6 @@ connections:
   #   kind: postgres
   #   description: "Staging database (writable)"
   #   mode: write
-  #   dsn: ${STAGING_DB_DSN}    # use a separate DB role from any read connection to the same server
+  #   dsn: ${STAGING_DB_DSN}              # read pool login (a read-only role)
+  #   write_dsn: ${STAGING_DB_WRITE_DSN}  # optional, mode: write only: write pool login (pg_execute and
+  #                                       # write-level EXPLAIN ANALYZE); recommended, see README "Security model"

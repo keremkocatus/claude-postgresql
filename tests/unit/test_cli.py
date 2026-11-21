@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+import ratatoskr
 from ratatoskr import cli
 from ratatoskr.cli import DEFAULT_CONFIG_PATH, main, resolve_config_path
 
@@ -121,6 +122,25 @@ def test_check_config_uses_env_path(
     monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
     monkeypatch.setenv("RATATOSKR_CONFIG", str(_write(tmp_path, STDIO_CONFIG)))
     assert main(["check-config"]) == 0
+
+
+def test_check_config_accepts_http_but_says_serve_will_refuse_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
+    monkeypatch.setenv("SECRET", "s" * 32)
+    assert main(["check-config", "--config", str(_write(tmp_path, HTTP_CONFIG))]) == 0
+    out = capsys.readouterr().out
+    assert "Config OK" in out
+    assert "streamable-http is validated but not available in this version; serve will refuse it" in out
+
+
+def test_check_config_stdio_has_no_transport_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
+    assert main(["check-config", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 0
+    assert "not available in this version" not in capsys.readouterr().out
 
 
 def test_serve_refuses_http_transport_for_now(
@@ -258,7 +278,9 @@ def test_serve_stdio_subprocess_speaks_json_rpc_without_leaking(tmp_path: Path) 
                 },
             }
         )
-        assert _read_message(lines, 30)["id"] == 1
+        initialized = _read_message(lines, 30)
+        assert initialized["id"] == 1
+        assert initialized["result"]["serverInfo"] == {"name": "ratatoskr", "version": ratatoskr.__version__}
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = _read_message(lines, 30)
@@ -268,6 +290,7 @@ def test_serve_stdio_subprocess_speaks_json_rpc_without_leaking(tmp_path: Path) 
         called = _read_message(lines, 30)
         assert called["id"] == 3
         assert "| main | postgres |" in called["result"]["content"][0]["text"]
+        assert called["result"]["isError"] is False
         process.stdin.close()
         assert process.wait(timeout=30) == 0
     finally:
@@ -282,3 +305,29 @@ def test_serve_stdio_subprocess_speaks_json_rpc_without_leaking(tmp_path: Path) 
             assert json.loads(raw)["jsonrpc"] == "2.0"
     output = "".join(stdout_lines) + "".join(stderr_chunks)
     assert password not in output
+    assert "Processing request" not in "".join(stderr_chunks)  # log_level INFO keeps the SDK's per-request lines out
+
+
+def test_check_config_says_whether_writes_use_a_separate_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = STDIO_CONFIG + (
+        "    mode: write\n"
+        "  other:\n"
+        "    kind: postgres\n"
+        "    mode: write\n"
+        "    dsn: ${MAIN_DSN}\n"
+        "    write_dsn: ${WRITE_DSN}\n"
+        "  reports:\n"
+        "    kind: postgres\n"
+        "    dsn: ${MAIN_DSN}\n"
+    )
+    monkeypatch.setenv("MAIN_DSN", "postgresql://reader:r-secret@db.internal/app")
+    monkeypatch.setenv("WRITE_DSN", "postgresql://writer:w-secret@db.internal/app")
+    assert main(["check-config", "--config", str(_write(tmp_path, config))]) == 0
+    out = capsys.readouterr().out
+    assert "  - main: postgres, mode=write, separate write role: no  Main database" in out
+    assert "  - other: postgres, mode=write, separate write role: yes" in out
+    assert "  - reports: postgres, mode=read\n" in out
+    for secret in ("r-secret", "w-secret", "writer", "reader", "db.internal"):
+        assert secret not in out

@@ -14,6 +14,8 @@ from ratatoskr.observability.redact import SECRET_KEY_RE, redact
 _STANDARD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
 
 
+MCP_REQUEST_LOGGER = "mcp.server.lowlevel.server"
+
 _MAX_DEPTH = 20
 _CUT = "<...>"
 
@@ -122,3 +124,6 @@ def setup_logging(level: str = "INFO", stream: TextIO | None = None) -> None:
         logger.removeHandler(existing)
     logger.setLevel(level.upper())
     logger.propagate = True
+    # The MCP SDK logs "Processing request of type ..." at INFO for every request; keep that for DEBUG only.
+    quiet = level.upper() == "INFO"
+    logging.getLogger(MCP_REQUEST_LOGGER).setLevel(logging.WARNING if quiet else logging.NOTSET)

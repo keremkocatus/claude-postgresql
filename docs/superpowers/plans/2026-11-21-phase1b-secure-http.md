@@ -6310,7 +6310,7 @@ git commit -m "Serve streamable-HTTP from the CLI and add ratatoskr hash-passwor
 ### Task 17: Container image
 
 **Files:**
-- Modify (rewrite): `Dockerfile`
+- Create: `Dockerfile` (the stale 0.1 Dockerfile was deleted at the end of Plan 1a)
 - Create: `.dockerignore`
 
 Multi-stage: the builder installs the package into `/opt/ratatoskr` (a venv) and byte-compiles it; the runtime

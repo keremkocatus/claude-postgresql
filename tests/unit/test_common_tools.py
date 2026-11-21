@@ -1,6 +1,7 @@
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 from ratatoskr.auth.policy import Policy
 from ratatoskr.auth.resolver import StdioPrincipalResolver
@@ -28,9 +29,18 @@ def _app(role: str | None = "team") -> tuple[FastMCP[Any], FakeFactory, Recordin
     return mcp, factory, sink
 
 
-async def _call(mcp: FastMCP[Any], name: str, **arguments: Any) -> str:
+async def _call_result(mcp: FastMCP[Any], name: str, **arguments: Any) -> tuple[str, bool]:
     result = await mcp.call_tool(name, arguments)
-    return result[0].text  # type: ignore[index, union-attr]
+    assert isinstance(result, CallToolResult), result
+    [block] = result.content
+    assert isinstance(block, TextContent)
+    return block.text, result.isError
+
+
+async def _call(mcp: FastMCP[Any], name: str, **arguments: Any) -> str:
+    text, is_error = await _call_result(mcp, name, **arguments)
+    assert is_error == text.startswith("Error:"), text
+    return text
 
 
 async def test_list_connections_shows_only_visible() -> None:
@@ -81,7 +91,27 @@ async def test_health_of_one_unreachable_connection_is_an_unavailable_row() -> N
         assert "Error:" not in text
         assert "hunter2" not in text
     audited = [(event.tool, event.connection, event.result, event.error_class) for event in sink.events]
-    assert audited == [("connection_health", "prod", "error", "BackendUnavailableError")] * 2
+    # The health report rendered, so the call is "ok" even though the connection is down.
+    assert audited == [("connection_health", "prod", "ok", None)] * 2
+
+
+async def test_health_reports_are_audited_ok_even_when_connections_are_down() -> None:
+    mcp, factory, sink = _app()
+    factory.backends["prod"].fail_open = OSError(LEAKY_MESSAGE)
+    factory.backends["dev"].health_result = HealthResult(ok=False, latency_ms=None, version=None, error="down")
+    _, is_error = await _call_result(mcp, "connection_health")
+    assert is_error is False
+    await _call(mcp, "connection_health", connection="dev")
+    assert [event.result for event in sink.events] == ["ok", "ok"]
+
+
+async def test_health_of_forbidden_connection_is_an_error_result() -> None:
+    mcp, _, sink = _app()
+    assert await _call_result(mcp, "connection_health", connection="secret") == (
+        "Error: Connection 'secret' not found.",
+        True,
+    )
+    assert sink.events[0].result == "denied"
 
 
 async def test_common_tools_are_read_only_and_idempotent() -> None:

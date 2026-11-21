@@ -12,6 +12,17 @@ from typing import Literal, Protocol
 from ratatoskr.observability.redact import redact
 
 AuditResult = Literal["ok", "denied", "error", "timeout"]
+"""Outcome of one tool call, decided by ``ToolRuntime`` (``error_class`` is set for every result but ``ok``):
+
+- ``ok``: the tool produced its answer. A health report counts as ``ok`` even when it says connections are down.
+- ``denied``: no identity, an unknown or forbidden connection, or insufficient access; the backend was not used.
+- ``error``: the tool failed: a backend or PostgreSQL error, a guard rejection, an unexpected exception, or the
+  client cancelled the call (``error_class="CancelledError"``).
+- ``timeout``: the tool's deadline expired or PostgreSQL cancelled the statement (``statement_timeout``).
+
+Arguments that fail FastMCP's schema validation are rejected by the MCP layer before the runtime runs, so they
+produce no audit event.
+"""
 
 MAX_AUDIT_QUERY_CHARS = 4096
 

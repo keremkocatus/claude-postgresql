@@ -12,6 +12,7 @@ from ratatoskr.backends.errors import (
     InvalidRequestError,
 )
 from ratatoskr.backends.postgres.backend import PostgresBackend, ReadSession, translate_error
+from ratatoskr.backends.postgres.formatting import markdown_table
 from tests.fakes import make_config
 
 
@@ -96,6 +97,45 @@ def test_translate_statement_timeout() -> None:
     translated = translate_error(asyncpg.QueryCanceledError("canceling statement due to statement timeout"))
     assert isinstance(translated, BackendTimeoutError)
     assert "statement timeout" in str(translated)
+
+
+class _ClientDataError(asyncpg.InterfaceError, ValueError):
+    """Shape of asyncpg's client-side DataError (an InterfaceError and a ValueError)."""
+
+
+@pytest.mark.parametrize(
+    ("message", "position", "value"),
+    [
+        (
+            "invalid input for query argument $1: '2024-01-01' ('str' object has no attribute 'toordinal')",
+            "$1",
+            "'2024-01-01'",
+        ),
+        (
+            "invalid input for query argument $2: 'abc' (an integer is required (got type str))",
+            "$2",
+            "'abc'",
+        ),
+    ],
+)
+@pytest.mark.parametrize("error_class", [asyncpg.exceptions.DataError, _ClientDataError])
+def test_translate_invalid_argument_hides_python_internals(
+    error_class: type[Exception], message: str, position: str, value: str
+) -> None:
+    # asyncpg raises its PostgresError-derived DataError (SQLSTATE 22000) for arguments it cannot encode.
+    translated = translate_error(error_class(message))
+    assert isinstance(translated, BackendQueryError)
+    text = str(translated)
+    assert text.startswith(f"Invalid query parameters: the value for {position} ({value})")
+    assert f"cast through text, e.g. {position}::text::date" in text
+    assert "toordinal" not in text
+    assert "'str' object" not in text
+    assert "integer is required" not in text
+
+
+def test_translate_other_data_errors_keep_their_message() -> None:
+    translated = translate_error(_ClientDataError("query argument $1: invalid input for type uuid"))
+    assert str(translated) == "Invalid query parameters: query argument $1: invalid input for type uuid"
 
 
 def test_translate_unknown_error_returns_none() -> None:
@@ -269,43 +309,65 @@ async def test_fetch_limited_stops_at_the_byte_budget() -> None:
     statement = _FakeStatement(["big"], rows)
     session = ReadSession(_FakeConnection({"SELECT big": statement}))
     result = await session.fetch_limited("SELECT big", [], 5000, max_bytes=2500)
-    assert (len(result.rows), result.truncated) == (3, True)
+    # each row renders as "| x...x |" plus a newline (1005 bytes); the third would cross the budget: dropped
+    assert (len(result.rows), result.truncated, result.oversized) == (2, True, False)
     assert statement.cursor_obj.requests == [1, 1, 1]  # the budget left never fits more than one such row
 
 
 async def _capped_requests(
-    rows: list[tuple[object, ...]], max_rows: int, max_bytes: int
-) -> tuple[int, bool, list[int]]:
-    statement = _FakeStatement(["v"], rows)
+    rows: list[tuple[object, ...]], max_rows: int, max_bytes: int, columns: list[str] | None = None
+) -> tuple[int, bool, bool, list[int]]:
+    statement = _FakeStatement(columns or ["v"], rows)
     result = await ReadSession(_FakeConnection({"SELECT v": statement})).fetch_limited(
         "SELECT v", [], max_rows, max_bytes=max_bytes
     )
-    return len(result.rows), result.truncated, statement.cursor_obj.requests
+    return len(result.rows), result.truncated, result.oversized, statement.cursor_obj.requests
 
 
 async def test_byte_budget_chunks_start_at_one_and_double_up_to_32() -> None:
-    assert await _capped_requests(_numbers(100), 500, 65536) == (100, False, [1, 2, 4, 8, 16, 32, 32, 32])
+    assert await _capped_requests(_numbers(100), 500, 65536) == (100, False, False, [1, 2, 4, 8, 16, 32, 32, 32])
 
 
 async def test_byte_budget_chunks_also_stop_at_the_row_limit() -> None:
-    assert await _capped_requests(_numbers(100), 5, 65536) == (5, True, [1, 2, 3])
+    assert await _capped_requests(_numbers(100), 5, 65536) == (5, True, False, [1, 2, 3])
 
 
-async def test_byte_budget_uniform_huge_rows_fetch_one_row() -> None:
+async def test_byte_budget_uniform_huge_rows_keep_only_the_first_row() -> None:
     rows: list[tuple[object, ...]] = [("x" * 100_000,) for _ in range(10)]
-    assert await _capped_requests(rows, 500, 65536) == (1, True, [1])
+    # the first row alone is over the budget: it is kept (never zero rows) and nothing more is read
+    assert await _capped_requests(rows, 500, 65536) == (1, False, True, [1])
+
+
+async def test_byte_budget_single_huge_row_is_oversized_not_truncated() -> None:
+    assert await _capped_requests([("x" * 100_000,)], 500, 65536) == (1, False, True, [1])
 
 
 async def test_byte_budget_chunk_is_sized_by_the_largest_row_seen() -> None:
     rows: list[tuple[object, ...]] = [("x" * 1000,) for _ in range(100)]
-    # 1 row (1000 B), then room for 4 but doubling allows 2, then room for 2, then never less than 1
-    assert await _capped_requests(rows, 500, 5500) == (6, True, [1, 2, 2, 1])
+    # 1005-byte rendered rows, 5486 bytes after the header: 1 row, then 2 (doubling), then 2 (room for 2),
+    # then 1 more that crosses the budget and is dropped
+    assert await _capped_requests(rows, 500, 5500) == (5, True, False, [1, 2, 2, 1])
 
 
 async def test_byte_budget_small_then_large_rows_overshoot_at_most_one_chunk() -> None:
     rows: list[tuple[object, ...]] = [("x",) for _ in range(10)] + [("x" * 1000,) for _ in range(1000)]
-    # the 4th chunk (8 rows) was sized while only tiny rows had been seen: it is the most that can overshoot
-    assert await _capped_requests(rows, 5000, 2500) == (13, True, [1, 2, 4, 8])
+    # the 4th chunk (8 rows) was sized while only tiny rows had been seen; rows past the budget are dropped
+    assert await _capped_requests(rows, 5000, 2500) == (12, True, False, [1, 2, 4, 8])
+
+
+async def test_kept_rows_render_within_the_byte_budget() -> None:
+    columns = ["id", "name", "note", "flag"]
+    rows: list[tuple[object, ...]] = [(n, f"ad|ı-ş-{n}", "a\nb" * (n % 7), n % 2 == 0) for n in range(2000)]
+    statement = _FakeStatement(columns, rows)
+    result = await ReadSession(_FakeConnection({"SELECT v": statement})).fetch_limited(
+        "SELECT v", [], 5000, max_bytes=4096
+    )
+    assert result.truncated is True
+    rendered = markdown_table(result.columns, result.rows)
+    assert len(rendered.encode("utf-8")) <= 4096
+    # and the budget is used: one more row would not have fitted
+    bigger = markdown_table(result.columns, rows[: len(result.rows) + 1])
+    assert len(bigger.encode("utf-8")) > 4096
 
 
 async def test_fetch_rows_passes_the_byte_budget() -> None:
@@ -383,7 +445,21 @@ async def test_execute_byte_budget_marks_truncated() -> None:
     sql = "SELECT big FROM t"
     statement = _FakeStatement(["big"], [("x" * 1000,) for _ in range(100)])
     [result] = await _write_backend(_FakeConnection({sql: statement})).execute([(sql, [])], max_rows=50, max_bytes=2500)
-    assert (len(result.rows), result.truncated) == (3, True)
+    assert (result.status, len(result.rows), result.truncated) == ("SELECT 2", 2, True)
+
+
+async def test_execute_oversized_returning_row_still_counts_every_row() -> None:
+    sql = "UPDATE t SET doc = doc RETURNING doc"
+    statement = _FakeStatement(["doc"], [("x" * 100_000,) for _ in range(4)])
+    [result] = await _write_backend(_FakeConnection({sql: statement})).execute([(sql, [])], max_rows=50, max_bytes=2500)
+    assert (result.status, len(result.rows), result.truncated) == ("UPDATE 4", 1, True)
+
+
+async def test_execute_single_oversized_returning_row_is_not_truncated() -> None:
+    sql = "UPDATE t SET doc = doc RETURNING doc"
+    statement = _FakeStatement(["doc"], [("x" * 100_000,)])
+    [result] = await _write_backend(_FakeConnection({sql: statement})).execute([(sql, [])], max_rows=50, max_bytes=2500)
+    assert (result.status, len(result.rows), result.truncated) == ("UPDATE 1", 1, False)
 
 
 async def test_execute_stops_when_a_statement_ends_the_transaction() -> None:
@@ -417,11 +493,13 @@ class _FakeCreatePool:
 
     def __init__(self) -> None:
         self.pools: list[_FakePool] = []
+        self.kwargs: list[dict[str, object]] = []
         self.gate = asyncio.Event()
         self.gate.set()
         self.started = asyncio.Event()
 
     async def __call__(self, **kwargs: object) -> _FakePool:
+        self.kwargs.append(kwargs)
         self.started.set()
         await self.gate.wait()
         pool = _FakePool()
@@ -434,6 +512,25 @@ def create_pool(monkeypatch: pytest.MonkeyPatch) -> _FakeCreatePool:
     fake = _FakeCreatePool()
     monkeypatch.setattr(asyncpg, "create_pool", fake)
     return fake
+
+
+async def test_write_pool_uses_write_dsn_and_read_pool_uses_dsn(create_pool: _FakeCreatePool) -> None:
+    backend = _backend(mode="write", write_dsn="postgresql://writer:w@db.internal/main", tls={"mode": "disable"})
+    await backend.open()
+    await backend._ensure_write_pool()
+    read_kwargs, write_kwargs = create_pool.kwargs
+    assert read_kwargs["dsn"] == "postgresql://u:secret@db.internal/main"
+    assert write_kwargs["dsn"] == "postgresql://writer:w@db.internal/main"
+    assert read_kwargs["ssl"] == write_kwargs["ssl"] == "disable"  # TLS settings apply to both pools
+    assert read_kwargs["server_settings"]["default_transaction_read_only"] == "on"  # type: ignore[index]
+    assert "default_transaction_read_only" not in write_kwargs["server_settings"]  # type: ignore[operator]
+
+
+async def test_write_pool_falls_back_to_dsn(create_pool: _FakeCreatePool) -> None:
+    backend = _backend(mode="write")
+    await backend.open()
+    await backend._ensure_write_pool()
+    assert [kwargs["dsn"] for kwargs in create_pool.kwargs] == ["postgresql://u:secret@db.internal/main"] * 2
 
 
 async def test_close_closes_both_pools_and_is_final(create_pool: _FakeCreatePool) -> None:

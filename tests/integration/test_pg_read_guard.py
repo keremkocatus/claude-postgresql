@@ -155,8 +155,20 @@ async def test_bad_parameter_type_is_explained(seeded: str, make_harness: MakeHa
     harness = make_harness(make_pg_config(seeded))
     text = await harness.call("pg_query", sql="SELECT * FROM items WHERE id = $1", params=["abc"])
     assert text.startswith("Error: "), text
-    assert "invalid input for query argument $1: 'abc'" in text
+    assert text.startswith("Error: Invalid query parameters: the value for $1 ('abc')"), text
+    assert "cast through text, e.g. $1::text::date" in text
     assert harness.sink.events[-1].result == "error"
+
+
+async def test_date_parameter_as_text_is_explained_without_python_internals(
+    seeded: str, make_harness: MakeHarness
+) -> None:
+    harness = make_harness(make_pg_config(seeded))
+    result = await harness.call_result("pg_query", sql="SELECT $1::date AS d", params=["2024-01-01"])
+    assert result.is_error is True
+    assert result.text.startswith("Error: Invalid query parameters: the value for $1 ('2024-01-01')"), result.text
+    assert "toordinal" not in result.text
+    assert "| 2024-01-01 |" in await harness.call("pg_query", sql="SELECT $1::text::date AS d", params=["2024-01-01"])
 
 
 async def test_statement_timeout(seeded: str, make_harness: MakeHarness) -> None:
@@ -166,3 +178,48 @@ async def test_statement_timeout(seeded: str, make_harness: MakeHarness) -> None
     assert harness.sink.events[-1].result == "timeout"
     assert harness.sink.events[-1].error_class == "BackendTimeoutError"
     assert "| 1 |" in await harness.call("pg_query", sql="SELECT 1")  # the connection is still usable
+
+
+# -- output fidelity and size ------------------------------------------------------------------------------------
+
+
+async def test_row_data_that_looks_secret_is_returned_verbatim(seeded: str, make_harness: MakeHarness) -> None:
+    harness = make_harness(make_pg_config(seeded))
+    sql = (
+        "SELECT 'The Ring Bearer Frodo' AS title, '{\"token\": \"abc123\"}'::jsonb AS doc, "
+        "'postgresql://reporting:pw@warehouse/app' AS dsn, 'api_key=xyz password=changeme' AS note"
+    )
+    text = await harness.call("pg_query", sql=sql)
+    assert '| The Ring Bearer Frodo | {"token": "abc123"} | postgresql://reporting:pw@warehouse/app |' in text
+    assert "api_key=xyz password=changeme" in text
+    assert "***" not in text
+    # the audit copy of the SQL is still masked
+    assert "pw@warehouse" not in (harness.sink.events[-1].query_text or "")
+
+
+async def test_rows_past_the_byte_budget_are_dropped_without_a_second_cut(
+    seeded: str, make_harness: MakeHarness
+) -> None:
+    harness = make_harness(make_pg_config(seeded, limits={"max_response_bytes": 2048}))
+    text = await harness.call(
+        "pg_query", sql="SELECT g AS n, repeat('ş', g % 40) AS pad FROM generate_series(1, 1000) AS g"
+    )
+    assert text.startswith("Showing the first "), text
+    assert "the rest did not fit the response size limit (~2048 bytes)" in text
+    assert "[Response truncated" not in text
+    assert len(text.encode("utf-8")) <= 2048
+
+
+async def test_one_huge_row_is_shown_cut_with_a_clear_note(seeded: str, make_harness: MakeHarness) -> None:
+    harness = make_harness(make_pg_config(seeded, limits={"max_response_bytes": 2048}))
+    text = await harness.call("pg_query", sql="SELECT repeat('x', 10000) AS big")
+    assert text.startswith("Showing 1 row; it alone is larger than the response size limit (~2048 bytes)"), text
+    assert "the rest did not fit" not in text
+    assert "[Response truncated: it exceeded 2048 bytes." in text
+    assert len(text.encode("utf-8")) <= 2048
+
+
+async def test_rows_that_fit_say_nothing_about_the_rest(seeded: str, make_harness: MakeHarness) -> None:
+    harness = make_harness(make_pg_config(seeded, limits={"max_response_bytes": 2048}))
+    text = await harness.call("pg_query", sql="SELECT name FROM items ORDER BY id")
+    assert text.startswith("3 row(s) in "), text

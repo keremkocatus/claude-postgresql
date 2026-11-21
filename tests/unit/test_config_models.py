@@ -172,3 +172,29 @@ def test_oidc_block_requires_client_secret() -> None:
     data["auth"] = {"mode": "oidc", "oidc": {"issuer": "https://id.example.com", "client_id": "ratatoskr"}}
     with pytest.raises(ValidationError, match="client_secret"):
         RatatoskrConfig.model_validate(data)
+
+
+# -- write_dsn ---------------------------------------------------------------------------------------------------
+
+
+def _pg(**values: Any) -> dict[str, Any]:
+    return _config(connections={"main": {"kind": "postgres", "dsn": "postgresql://reader@h/db", **values}})
+
+
+def test_write_dsn_defaults_to_none() -> None:
+    assert RatatoskrConfig.model_validate(_pg(mode="write")).connections["main"].write_dsn is None
+
+
+def test_write_dsn_is_a_secret_on_write_connections() -> None:
+    connection = RatatoskrConfig.model_validate(
+        _pg(mode="write", write_dsn="postgresql://writer:w-secret@h/db")
+    ).connections["main"]
+    assert connection.write_dsn is not None
+    assert connection.write_dsn.get_secret_value() == "postgresql://writer:w-secret@h/db"
+    assert "w-secret" not in repr(connection)
+
+
+def test_write_dsn_is_rejected_on_read_connections() -> None:
+    with pytest.raises(ValidationError, match="write_dsn is only allowed with mode: write") as excinfo:
+        RatatoskrConfig.model_validate(_pg(mode="read", write_dsn="postgresql://writer:w-secret@h/db"))
+    assert "w-secret" not in str(excinfo.value.errors(include_input=False, include_url=False))

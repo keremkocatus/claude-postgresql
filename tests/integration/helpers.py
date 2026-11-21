@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Any
 
 import asyncpg
-from mcp.types import TextContent
+from mcp.types import CallToolResult, TextContent
 
 from ratatoskr.app import build_app
 from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.models import RatatoskrConfig
+from ratatoskr.tools.runtime import ToolResult
 from tests.fakes import RecordingSink
 
 SEED_SQL = """
@@ -82,15 +83,24 @@ class ToolHarness:
         self.registry = BackendRegistry(config)  # owned here, so the test closes it (build_app's ownership rule)
         self.app = build_app(config, resolver=StdioPrincipalResolver(role), audit=self.sink, registry=self.registry)
 
-    async def call(self, tool: str, **arguments: Any) -> str:
-        """Call *tool*; connection tools default to ``connection='db'``. Returns the single text block."""
+    async def call_result(self, tool: str, **arguments: Any) -> ToolResult:
+        """Call *tool*; connection tools default to ``connection='db'``. Returns the text and MCP ``isError``.
+
+        Every call also checks that ``isError`` is set exactly when the text is an ``Error:`` message.
+        """
         if tool not in ("list_connections", "connection_health"):
             arguments = {"connection": "db", **arguments}
         result = await self.app.call_tool(tool, arguments)
-        assert isinstance(result, Sequence) and len(result) == 1, result
-        block = result[0]
+        assert isinstance(result, CallToolResult), result
+        assert len(result.content) == 1, result
+        block = result.content[0]
         assert isinstance(block, TextContent), block
-        return block.text
+        assert result.isError == block.text.startswith("Error:"), (result.isError, block.text)
+        return ToolResult(text=block.text, is_error=result.isError)
+
+    async def call(self, tool: str, **arguments: Any) -> str:
+        """Like :meth:`call_result`, returning only the text."""
+        return (await self.call_result(tool, **arguments)).text
 
 
 MakeHarness = Callable[..., ToolHarness]

@@ -20,3 +20,4 @@ def _restore_logging() -> Iterator[None]:
         logger.removeHandler(handler)
     logger.propagate = True
     logger.setLevel(logging.NOTSET)
+    logging.getLogger("mcp.server.lowlevel.server").setLevel(logging.NOTSET)

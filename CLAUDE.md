@@ -3,8 +3,8 @@
 Multi-connection MCP server (`src/ratatoskr`, PyPI `ratatoskr-mcp`, CLI `ratatoskr`). Design:
 `docs/superpowers/specs/2026-11-21-multi-backend-redesign-design.md`; shared interfaces for stage 1:
 `docs/superpowers/plans/2026-11-21-phase1-interfaces.md` (read its notes sections at the end too).
-Current state: stdio only (Plan 1a). HTTP transport, OAuth and the new Docker image are Plan 1b; `Dockerfile` and
-`docker-compose.yml` are still the old ones until then.
+Current state: stdio only (Plan 1a). HTTP transport, OAuth and the Docker image are Plan 1b; there is no `Dockerfile`
+until then, and `docker-compose.yml` is still the old one.
 
 ## Commands (Windows, repo root)
 
@@ -41,12 +41,16 @@ database.
 - Python 3.12+, `from __future__ import annotations`, full type hints; `ruff` (line length 120) and
   `mypy --strict` must stay clean. One responsibility per file; keep files small.
 - Every tool call goes through `ToolRuntime.run` / `run_global`: identity, policy, deadline, clamping and audit
-  live there and nowhere else.
+  live there and nowhere else. They return `ToolResult(text, is_error)`; every registered tool returns
+  `result.to_call_tool_result()` (an MCP `CallToolResult`, so hosts see `isError=true` on failures). Error texts
+  keep the `Error:` prefix.
+- Successful tool output is the user's data: it is clamped but never redacted. Error text, logs and the audit
+  `query_text` are redacted.
 - Unknown and forbidden connections must produce the identical `ConnectionNotFoundError` message.
 - No secrets in errors or logs. Text shown to the client may only come from `BackendError` subclasses, policy
   errors or PostgreSQL server messages; anything else becomes a generic message and the details go to the log.
-  Never put a DSN, host or password in a message; `observability.redact` is a last line of defence, not the
-  mechanism.
+  Never put a DSN, host or password in a message; `observability.redact` is a last line of defence for errors and
+  logs, not the mechanism.
 - Logs go to **stderr** as JSON (stdout is the MCP stdio channel). Do not move them to stdout.
 - PostgreSQL read path: user SQL only through the read pool, inside `ReadSession` (READ ONLY transaction, always
   rolled back) and only via the extended protocol (`fetch`, `prepare`, cursors). Never pass user SQL to
@@ -55,7 +59,8 @@ database.
   reset query also restores role/authorization and drops prepared statements, temp tables and sequence state;
   keep it that way. Catalog queries pin `search_path` to `pg_catalog`.
 - The write pool is only for `mode: write` connections and only used by `pg_execute` and write-level
-  `pg_explain(analyze=true)` (always rolled back). `guard.py` is an early, readable check, not the security
+  `pg_explain(analyze=true)` (always rolled back). It logs in with `write_dsn` when set (else `dsn`); the read
+  pool always uses `dsn`. Never use the write pool (or `write_dsn`) for a read-level call. `guard.py` is an early, readable check, not the security
   boundary: the DB role's GRANTs are.
 - Minimum supported PostgreSQL is 12; catalog SQL must work there.
 - Tool descriptions in `descriptions.py` / `tools/common.py` are product UX for the LLM: short, say what comes

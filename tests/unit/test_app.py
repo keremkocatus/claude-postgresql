@@ -2,6 +2,7 @@ from typing import Any
 
 import pytest
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 from ratatoskr.app import build_app
 from ratatoskr.auth.resolver import StdioPrincipalResolver
@@ -30,7 +31,10 @@ async def test_instructions_point_to_list_connections() -> None:
 
 async def test_list_connections_works_without_database() -> None:
     result = await _app().call_tool("list_connections", {})
-    assert "| main | postgres | write |" in result[0].text  # type: ignore[index, union-attr]
+    assert isinstance(result, CallToolResult)
+    assert result.isError is False
+    assert isinstance(result.content[0], TextContent)
+    assert "| main | postgres | write |" in result.content[0].text
 
 
 async def test_lifespan_yields_state_and_closes_cleanly() -> None:

@@ -9,7 +9,7 @@ from ratatoskr.backends.base import Backend
 from ratatoskr.backends.errors import BackendQueryError, BackendTimeoutError, BackendUnavailableError
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.models import Access, ConnectionConfig
-from ratatoskr.tools.runtime import ToolOutput, ToolRuntime
+from ratatoskr.tools.runtime import ToolOutput, ToolResult, ToolRuntime
 from tests.fakes import LEAKY_MESSAGE, FakeBackend, FakeFactory, RecordingSink, make_config
 
 CONFIG = make_config(
@@ -35,8 +35,10 @@ async def _ok(backend: Backend, access: Access) -> ToolOutput:
 
 async def test_success_passes_access_and_audits() -> None:
     runtime, sink, _ = _runtime()
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok, query_text="SELECT 1")
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok, query_text="SELECT 1")
+    text = result.text
     assert text == "dev:WRITE"
+    assert result.is_error is False
     [event] = sink.events
     assert (event.tool, event.connection, event.result, event.rows) == ("pg_query", "dev", "ok", 3)
     assert event.subject == "stdio"
@@ -50,16 +52,16 @@ async def test_unknown_and_forbidden_look_the_same() -> None:
     runtime, sink, factory = _runtime(role=None)
     unknown = await runtime.run(tool="pg_query", connection="ghost", need=Access.READ, call=_ok)
     forbidden = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=_ok)
-    assert unknown == "Error: Connection 'ghost' not found."
-    assert forbidden == "Error: Connection 'prod' not found."
+    assert unknown == ToolResult("Error: Connection 'ghost' not found.", is_error=True)
+    assert forbidden == ToolResult("Error: Connection 'prod' not found.", is_error=True)
     assert [event.result for event in sink.events] == ["denied", "denied"]
     assert factory.backends["prod"].open_calls == 0
 
 
 async def test_write_on_read_connection_is_denied() -> None:
     runtime, sink, _ = _runtime()
-    text = await runtime.run(tool="pg_execute", connection="prod", need=Access.WRITE, call=_ok)
-    assert text == "Error: Write access required on connection 'prod'."
+    result = await runtime.run(tool="pg_execute", connection="prod", need=Access.WRITE, call=_ok)
+    assert result == ToolResult("Error: Write access required on connection 'prod'.", is_error=True)
     assert sink.events[0].result == "denied"
     assert sink.events[0].error_class == "InsufficientAccessError"
 
@@ -67,7 +69,8 @@ async def test_write_on_read_connection_is_denied() -> None:
 async def test_missing_identity_is_denied() -> None:
     sink = RecordingSink()
     runtime = ToolRuntime(Policy(CONFIG), BackendRegistry(CONFIG, factory=FakeFactory()), _NoIdentity(), sink)
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok)
+    text = result.text
     assert text == "Error: no authenticated user"
     assert sink.events[0].result == "denied"
     assert sink.events[0].error_class == "PermissionError"
@@ -80,8 +83,8 @@ async def test_backend_error_message_is_shown() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         raise BackendQueryError('PostgreSQL error 42P01: relation "nope" does not exist')
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
-    assert text == 'Error: PostgreSQL error 42P01: relation "nope" does not exist'
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    assert result == ToolResult('Error: PostgreSQL error 42P01: relation "nope" does not exist', is_error=True)
     assert sink.events[0].result == "error"
     assert sink.events[0].error_class == "BackendQueryError"
 
@@ -92,17 +95,21 @@ async def test_unexpected_error_hides_details() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         raise OSError(LEAKY_MESSAGE)
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    text = result.text
     assert "hunter2" not in text
     assert "db.internal" not in text
-    assert text == "Error: pg_query failed on connection 'dev' (OSError). Details are in the server log."
+    assert result == ToolResult(
+        "Error: pg_query failed on connection 'dev' (OSError). Details are in the server log.", is_error=True
+    )
     assert sink.events[0].result == "error"
 
 
 async def test_open_failure_hides_details() -> None:
     runtime, sink, factory = _runtime()
     factory.backends["dev"].fail_open = OSError(LEAKY_MESSAGE)
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok)
+    text = result.text
     assert "hunter2" not in text
     assert "db.internal" not in text
     assert "Connection 'dev' is unavailable" in text
@@ -116,7 +123,8 @@ async def test_dsn_inside_backend_error_is_redacted() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         raise BackendQueryError("PostgreSQL error 08001: could not connect using postgresql://a:hunter2@h/db")
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    text = result.text
     assert "hunter2" not in text
     assert "postgresql://***" in text
 
@@ -128,8 +136,8 @@ async def test_client_timeout() -> None:
         await asyncio.sleep(5)
         return ToolOutput(text="late")
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call, timeout=0.05)
-    assert text == "Error: pg_query timed out."
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call, timeout=0.05)
+    assert result == ToolResult("Error: pg_query timed out.", is_error=True)
     assert sink.events[0].result == "timeout"
 
 
@@ -139,7 +147,8 @@ async def test_backend_timeout_is_audited_as_timeout() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         raise BackendTimeoutError("PostgreSQL cancelled the statement: canceling statement due to statement timeout.")
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    text = result.text
     assert "statement timeout" in text
     assert sink.events[0].result == "timeout"
 
@@ -150,7 +159,8 @@ async def test_response_is_clamped_to_connection_limit() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         return ToolOutput(text="y" * 10_000, rows=1)
 
-    text = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    result = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    text = result.text
     assert len(text.encode("utf-8")) <= 1024
     assert "[Response truncated: it exceeded 1024 bytes." in text
 
@@ -161,7 +171,7 @@ async def test_run_global_audits_without_connection() -> None:
     async def call(principal: Principal) -> ToolOutput:
         return ToolOutput(text=f"hi {principal.subject}", rows=0)
 
-    assert await runtime.run_global(tool="list_connections", call=call) == "hi stdio"
+    assert await runtime.run_global(tool="list_connections", call=call) == ToolResult("hi stdio", is_error=False)
     assert sink.events[0].connection is None
     assert sink.events[0].result == "ok"
 
@@ -173,7 +183,7 @@ async def test_audit_sink_failure_does_not_break_the_call() -> None:
 
     registry = BackendRegistry(CONFIG, factory=FakeFactory())
     runtime = ToolRuntime(Policy(CONFIG), registry, StdioPrincipalResolver("team"), Exploding())
-    assert await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok) == "dev:WRITE"
+    assert (await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok)).text == "dev:WRITE"
 
 
 @pytest.mark.parametrize("tool", ["pg_query", "pg_execute"])
@@ -198,7 +208,8 @@ async def test_timeout_cancels_the_backend_call() -> None:
             raise
         return ToolOutput(text="late")
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call, timeout=0.05)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call, timeout=0.05)
+    text = result.text
     assert text == "Error: pg_query timed out."
     assert cancelled.is_set()
     assert [(event.result, event.error_class) for event in sink.events] == [("timeout", "TimeoutError")]
@@ -211,8 +222,8 @@ async def test_run_global_timeout_is_audited_as_timeout() -> None:
         await asyncio.sleep(5)
         return ToolOutput(text="late")
 
-    assert await runtime.run_global(tool="connection_health", call=call, timeout=0.05) == (
-        "Error: connection_health timed out."
+    assert await runtime.run_global(tool="connection_health", call=call, timeout=0.05) == ToolResult(
+        "Error: connection_health timed out.", is_error=True
     )
     assert sink.events[0].result == "timeout"
 
@@ -273,11 +284,12 @@ async def test_timeout_during_open_is_audited_as_timeout_without_back_off() -> N
     runtime = ToolRuntime(
         Policy(CONFIG), BackendRegistry(CONFIG, factory=factory), StdioPrincipalResolver("team"), sink
     )
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok, timeout=0.05)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok, timeout=0.05)
+    text = result.text
     assert text == "Error: pg_query timed out."
     assert (sink.events[0].result, sink.events[0].error_class) == ("timeout", "TimeoutError")
     # A cancelled open is not an open failure: the next call tries again at once instead of backing off.
-    assert await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok) == "dev:WRITE"
+    assert (await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=_ok)).text == "dev:WRITE"
     assert backends["dev"].open_calls == 2
 
 
@@ -290,7 +302,8 @@ async def test_long_error_is_clamped_to_connection_limit() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         raise BackendQueryError("PostgreSQL error 42601: " + "x" * 10_000)
 
-    text = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    result = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    text = result.text
     assert text.startswith("Error: PostgreSQL error 42601: ")
     assert len(text.encode("utf-8")) <= 1024
     assert "[Response truncated: it exceeded 1024 bytes." in text
@@ -303,40 +316,83 @@ async def test_long_global_error_is_clamped_to_default_limit() -> None:
     async def call(principal: Principal) -> ToolOutput:
         raise BackendQueryError("y" * 100_000)
 
-    text = await runtime.run_global(tool="list_connections", call=call)
+    result = await runtime.run_global(tool="list_connections", call=call)
+    text = result.text
     assert len(text.encode("utf-8")) <= 65536
     assert "[Response truncated: it exceeded 65536 bytes." in text
 
 
-async def test_redaction_that_grows_the_text_still_respects_the_limit() -> None:
+async def test_redaction_that_grows_an_error_still_respects_the_limit() -> None:
     runtime, _, _ = _runtime()
     payload = "pwd=x " * 200  # 1200 bytes; every "pwd=x" becomes "pwd=***"
-
-    async def call(backend: Backend, access: Access) -> ToolOutput:
-        return ToolOutput(text=payload, rows=1)
 
     async def failing(backend: Backend, access: Access) -> ToolOutput:
         raise BackendQueryError(payload)
 
-    for tool_call in (call, failing):
-        text = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=tool_call)
-        assert len(text.encode("utf-8")) <= 1024
-        assert "pwd=x" not in text
-        assert "pwd=***" in text
+    result = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=failing)
+    assert result.is_error is True
+    assert len(result.text.encode("utf-8")) <= 1024
+    assert "pwd=x" not in result.text
+    assert "pwd=***" in result.text
 
 
-async def test_secret_cut_by_the_byte_limit_is_still_masked() -> None:
+async def test_secret_cut_by_the_byte_limit_is_still_masked_in_errors() -> None:
     runtime, _, _ = _runtime()
     secret_url = "postgresql://admin:hunter2@db.internal:5432/app"
 
     async def call(backend: Backend, access: Access) -> ToolOutput:
         # The URL straddles the byte limit; no part of its credentials may survive redaction plus clamping.
-        return ToolOutput(text="a" * 900 + secret_url + "b" * 500, rows=1)
+        raise BackendQueryError("a" * 900 + secret_url + "b" * 500)
 
-    text = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
-    assert "admin" not in text
-    assert "hunter" not in text
-    assert len(text.encode("utf-8")) <= 1024
+    result = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    assert "admin" not in result.text
+    assert "hunter" not in result.text
+    assert len(result.text.encode("utf-8")) <= 1024
+
+
+TABLE = "| value |\n| --- |\n| {data} |"
+
+# Row data that merely looks like a secret: successful output must come back verbatim (only clamped).
+DATA_THAT_LOOKS_SECRET = [
+    "The Ring Bearer Frodo",
+    '{"token": "abc123", "user": "sam"}',
+    "postgresql://reporting:pw@warehouse/app",
+    "CHECK ((api_key <> ''::text)) DEFAULT 'password=changeme'",
+    "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+]
+
+
+@pytest.mark.parametrize("data", DATA_THAT_LOOKS_SECRET)
+async def test_successful_output_is_never_redacted(data: str) -> None:
+    runtime, sink, _ = _runtime()
+
+    async def call(backend: Backend, access: Access) -> ToolOutput:
+        return ToolOutput(text=TABLE.format(data=data), rows=1)
+
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    assert result == ToolResult(TABLE.format(data=data), is_error=False)
+    assert sink.events[0].result == "ok"
+
+
+async def test_successful_global_output_is_never_redacted() -> None:
+    runtime, _, _ = _runtime()
+
+    async def call(principal: Principal) -> ToolOutput:
+        return ToolOutput(text="pwd=x token: y", rows=0)
+
+    assert await runtime.run_global(tool="list_connections", call=call) == ToolResult("pwd=x token: y", is_error=False)
+
+
+async def test_successful_output_is_still_clamped() -> None:
+    runtime, _, _ = _runtime()
+
+    async def call(backend: Backend, access: Access) -> ToolOutput:
+        return ToolOutput(text="password=hunter2 " + "y" * 10_000, rows=1)
+
+    result = await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=call)
+    assert result.is_error is False
+    assert result.text.startswith("password=hunter2 ")
+    assert len(result.text.encode("utf-8")) <= 1024
 
 
 # -- denied versus backend PermissionError -------------------------------------
@@ -348,7 +404,8 @@ async def test_permission_error_from_the_backend_is_a_backend_error() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         raise PermissionError(13, "Permission denied", "/etc/ratatoskr/client-key.pem")
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call)
+    text = result.text
     assert text == "Error: pg_query failed on connection 'dev' (PermissionError). Details are in the server log."
     assert "/etc/ratatoskr" not in text
     assert (sink.events[0].result, sink.events[0].error_class) == ("error", "PermissionError")
@@ -360,7 +417,8 @@ async def test_permission_error_from_a_global_call_is_a_backend_error() -> None:
     async def call(principal: Principal) -> ToolOutput:
         raise PermissionError(13, "Permission denied", "/etc/ratatoskr/client-key.pem")
 
-    text = await runtime.run_global(tool="list_connections", call=call)
+    result = await runtime.run_global(tool="list_connections", call=call)
+    text = result.text
     assert text == "Error: list_connections failed (PermissionError). Details are in the server log."
     assert sink.events[0].result == "error"
 
@@ -368,7 +426,8 @@ async def test_permission_error_from_a_global_call_is_a_backend_error() -> None:
 async def test_permission_error_from_the_resolver_is_denied_in_run_global() -> None:
     sink = RecordingSink()
     runtime = ToolRuntime(Policy(CONFIG), BackendRegistry(CONFIG, factory=FakeFactory()), _NoIdentity(), sink)
-    text = await runtime.run_global(tool="list_connections", call=lambda principal: _never())
+    result = await runtime.run_global(tool="list_connections", call=lambda principal: _never())
+    text = result.text
     assert text == "Error: no authenticated user"
     assert (sink.events[0].result, sink.events[0].error_class, sink.events[0].subject) == (
         "denied",
@@ -399,13 +458,14 @@ async def test_on_unavailable_renders_open_failures_and_back_off() -> None:
     factory.backends["dev"].fail_open = OSError(LEAKY_MESSAGE)
     handler = _UnavailableHandler()
     for _ in range(2):  # the first call fails to open, the second hits the registry's back-off
-        text = await runtime.run(
+        result = await runtime.run(
             tool="connection_health", connection="dev", need=Access.READ, call=_never_call, on_unavailable=handler
         )
-        assert text == "unavailable row"
+        # The rendered report is the tool's answer, not a tool failure.
+        assert result == ToolResult("unavailable row", is_error=False)
     assert [str(error).startswith("Connection 'dev' is unavailable") for error in handler.errors] == [True, True]
     assert [(e.tool, e.connection, e.result, e.error_class, e.rows) for e in sink.events] == [
-        ("connection_health", "dev", "error", "BackendUnavailableError", 1),
+        ("connection_health", "dev", "ok", None, 1),
     ] * 2
 
 
@@ -416,7 +476,8 @@ async def test_on_unavailable_is_not_used_for_errors_inside_the_call() -> None:
     async def call(backend: Backend, access: Access) -> ToolOutput:
         raise BackendUnavailableError("Connection 'dev' is closed.")
 
-    text = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call, on_unavailable=handler)
+    result = await runtime.run(tool="pg_query", connection="dev", need=Access.READ, call=call, on_unavailable=handler)
+    text = result.text
     assert text == "Error: Connection 'dev' is closed."
     assert handler.errors == []
     assert (sink.events[0].result, sink.events[0].error_class) == ("error", "BackendUnavailableError")
@@ -426,25 +487,26 @@ async def test_on_unavailable_is_not_used_for_denials() -> None:
     runtime, sink, factory = _runtime(role=None)
     factory.backends["dev"].fail_open = OSError(LEAKY_MESSAGE)
     handler = _UnavailableHandler()
-    text = await runtime.run(
+    result = await runtime.run(
         tool="connection_health", connection="dev", need=Access.READ, call=_never_call, on_unavailable=handler
     )
+    text = result.text
     assert text == "Error: Connection 'dev' not found."
     assert handler.errors == []
     assert factory.backends["dev"].open_calls == 0
     assert sink.events[0].result == "denied"
 
 
-async def test_on_unavailable_output_is_redacted_and_clamped() -> None:
+async def test_on_unavailable_output_is_clamped() -> None:
     runtime, _, factory = _runtime()
     factory.backends["prod"].fail_open = OSError(LEAKY_MESSAGE)
-    handler = _UnavailableHandler(text="see postgresql://a:hunter2@h/db " + "y" * 10_000)
-    text = await runtime.run(
+    handler = _UnavailableHandler(text="report " + "y" * 10_000)
+    result = await runtime.run(
         tool="connection_health", connection="prod", need=Access.READ, call=_never_call, on_unavailable=handler
     )
-    assert "hunter2" not in text
-    assert len(text.encode("utf-8")) <= 1024
-    assert "[Response truncated: it exceeded 1024 bytes." in text
+    assert result.is_error is False
+    assert len(result.text.encode("utf-8")) <= 1024
+    assert "[Response truncated: it exceeded 1024 bytes." in result.text
 
 
 async def _never_call(backend: Backend, access: Access) -> ToolOutput:

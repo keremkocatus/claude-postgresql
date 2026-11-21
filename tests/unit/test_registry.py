@@ -6,7 +6,7 @@ from ratatoskr.auth.policy import ConnectionNotFoundError
 from ratatoskr.backends.errors import BackendUnavailableError
 from ratatoskr.backends.postgres.backend import PostgresBackend
 from ratatoskr.backends.registry import BackendRegistry
-from ratatoskr.config.models import ConnectionConfig
+from ratatoskr.config.models import ConnectionConfig, PgLimits
 from tests.fakes import LEAKY_MESSAGE, FakeBackend, FakeClock, FakeFactory, make_config
 
 CONFIG = make_config(connections={"a": {"description": "A"}, "b": {"limits": {"max_response_bytes": 2048}}})
@@ -29,6 +29,7 @@ def test_describe_and_limits_without_opening() -> None:
     assert registry.max_response_bytes("b") == 2048
     assert registry.max_response_bytes("a") == 65536
     assert registry.max_response_bytes(None) == 65536
+    assert registry.max_response_bytes(None) == PgLimits().max_response_bytes  # one default, not two
     assert factory.backends["a"].open_calls == 0
 
 

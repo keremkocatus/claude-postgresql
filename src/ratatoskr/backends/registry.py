@@ -12,10 +12,9 @@ from ratatoskr.auth.policy import ConnectionNotFoundError
 from ratatoskr.backends.base import Backend, ConnectionInfo
 from ratatoskr.backends.errors import BackendUnavailableError
 from ratatoskr.backends.postgres.backend import PostgresBackend
-from ratatoskr.config.models import ConnectionConfig, RatatoskrConfig
+from ratatoskr.config.models import DEFAULT_MAX_RESPONSE_BYTES, ConnectionConfig, RatatoskrConfig
 
 RETRY_INTERVAL_SECONDS = 10.0
-DEFAULT_MAX_RESPONSE_BYTES = 65536
 
 BackendFactory = Callable[[str, ConnectionConfig], Backend]
 

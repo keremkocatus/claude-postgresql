@@ -89,7 +89,8 @@ class PostgresConnection(BaseModel):
     kind: Literal["postgres"]
     description: str = ""
     mode: GrantLevel = "read"
-    dsn: SecretStr
+    dsn: SecretStr                       # read pool (ve write_dsn yoksa write pool)
+    write_dsn: SecretStr | None = None   # yalnız mode: write; lazy write pool'un login'i
     pool: PoolSettings = PoolSettings()
     statement_timeout: timedelta = timedelta(seconds=30)
     allowed_schemas: list[str] = []
@@ -155,6 +156,10 @@ access token'ı alır; token, `RatatoskrAccessToken(AccessToken)` alt sınıfıd
 
 ```python
 AuditResult = Literal["ok", "denied", "error", "timeout"]
+# ok: tool cevabını üretti (bağlantı kapalı diyen bir health raporu da ok); denied: kimlik yok, bilinmeyen/yasak
+# bağlantı veya yetersiz erişim (backend'e gidilmez); error: backend/PostgreSQL hatası, guard reddi, beklenmeyen
+# hata, istemci iptali (error_class="CancelledError"); timeout: deadline doldu veya statement_timeout.
+# FastMCP'nin argüman şeması doğrulaması runtime'dan önce reddeder: bu çağrılar audit edilmez.
 
 @dataclass(frozen=True)
 class AuditEvent:
@@ -229,15 +234,31 @@ class ToolRuntime:
 
     async def run(self, *, tool: str, connection: str, need: Access,
                   call: Callable[[Backend, Access], Awaitable[ToolOutput]],
-                  query_text: str | None = None, timeout: float | None = None) -> str: ...
-    # resolve → authorize → registry.get → asyncio.timeout → audit → ToolOutput.text döner.
-    # ConnectionNotFoundError / InsufficientAccessError / zaman aşımı / backend hatası → kullanıcıya
-    # anlaşılır metin (DSN, host, şifre sızdırmadan) ve uygun audit sonucu.
+                  query_text: str | None = None, timeout: float | None = None,
+                  on_unavailable: Callable[[BackendUnavailableError], ToolOutput] | None = None) -> ToolResult: ...
+    async def run_global(self, *, tool: str, call: Callable[[Principal], Awaitable[ToolOutput]],
+                         timeout: float | None = None) -> ToolResult: ...
+    # resolve → authorize → registry.get → asyncio.timeout → clamp → audit → ToolResult döner.
+    # ConnectionNotFoundError / InsufficientAccessError / zaman aşımı / backend hatası → `Error:` ile başlayan
+    # anlaşılır metin (DSN, host, şifre sızdırmadan), is_error=True ve uygun audit sonucu.
+    # on_unavailable: registry.get BackendUnavailableError fırlatırsa çıktıyı o üretir (connection_health'in
+    # "unavailable" satırı); bu bir hata değildir: is_error=False, audit "ok".
+    # Redaksiyon kuralı: başarılı çıktı kullanıcının verisidir, yalnız kırpılır (clamp), asla redact edilmez.
+    # Hata metni önce redact sonra clamp edilir. Log'lar ve audit query_text redact edilir.
 
 @dataclass(frozen=True)
 class ToolOutput:
     text: str
     rows: int | None = None
+
+@dataclass(frozen=True)
+class ToolResult:
+    text: str
+    is_error: bool
+    def to_call_tool_result(self) -> mcp.types.CallToolResult: ...   # TextContent + isError
+
+# Her kayıtlı tool `-> CallToolResult` döner: `return (await runtime.run(...)).to_call_tool_result()`.
+# Böylece host'lar hataları isError=true olarak görür.
 ```
 
 ## `ratatoskr.app` ve CLI
@@ -268,7 +289,15 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - 1a: `load_config(..., *, insecure_dev=False)`; `BackendRegistry(config, *, factory=..., clock=...)`,
   `describe(name)`, `max_response_bytes(name)`; `ToolRuntime.policy`, `.registry`, `run_global(...)`
   (bağlantı parametresi olmayan tool'lar için); `backends/errors.py`, `observability/redact.py`,
-  `observability/logging.py`, `audit.build_event`. Tool hataları `Error:` ile başlayan metin olarak döner.
+  `observability/logging.py`, `audit.build_event`. Tool hataları `Error:` ile başlayan metin ve MCP
+  `isError=true` olarak döner (`ToolRuntime.run/run_global -> ToolResult`, tool'lar `CallToolResult` döner).
+  Başarılı çıktı redact edilmez; yalnız hata metni, log'lar ve audit `query_text`. `serverInfo.version`
+  ratatoskr sürümüdür (FastMCP'de argüman yok; `app._mcp_server.version` atanır, protokol testi korur).
+  Sürüm tek kaynaktan: `src/ratatoskr/__init__.py` (hatch dynamic version).
+- 1a (sözleşmeye ek): `PostgresConnection.write_dsn: SecretStr | None = None`. Read pool her zaman `dsn` ile,
+  lazy write pool `write_dsn` varsa onunla (yoksa `dsn`) bağlanır; TLS ikisine de uygulanır. Yalnız `mode: write`
+  ile izinli (aksi config hatası, değer mesajda yer almaz); `${VAR}` / `${file:}` interpolasyonu `dsn` gibi
+  çalışır. `check-config` write bağlantılarında "separate write role: yes/no" yazar, DSN'i asla yazmaz.
   asyncpg pool'u bırakılan bağlantıda `RESET ALL` çalıştırdığı için `default_transaction_read_only` ve
   `statement_timeout` startup parametresi olarak verilir.
 - 1b: `ServerSettings.trusted_proxies: list[str] = []`, `ServerSettings.audit_retention: timedelta = 90d`;
@@ -291,8 +320,8 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Write seviyesindeki `EXPLAIN ANALYZE` ROLLBACK edilir, ama `nextval` ve `dblink` ile yapılan yazmalar geri alınmaz;
   "veri hiç değişmez" denmemeli.
 - Read ve write pool aynı DB kullanıcısını paylaşırsa read principal `pg_terminate_backend` ile write bağlantısını
-  öldürebilir. `docs/postgres-roles.md` write için ayrı rol önermeli. (Kullanıcıya sorulacak: config'e opsiyonel
-  `write_dsn` eklensin mi?)
+  öldürebilir. `docs/postgres-roles.md` write için ayrı rol önermeli. (Karar: opsiyonel `write_dsn` eklendi; README
+  güvenlik modeli bunu öneriyor.)
 - Python 3.13 `ssl.create_default_context` `VERIFY_X509_STRICT` açar; `keyUsage` içermeyen iç CA'lar reddedilir
   (libpq kabul eder). Docker imajı 3.12. Dokümante edilecek.
 - `tls.mode: require` + `ca_file` CA'yı yok sayar (libpq bunu verify-ca sayar). Dokümante edilecek.

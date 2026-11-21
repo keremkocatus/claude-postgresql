@@ -1,16 +1,34 @@
 [project]
 name = "ratatoskr-mcp"
-version = "1.0.0.dev0"
+dynamic = ["version"]
 description = "Ratatoskr: a secure, multi-connection MCP server that lets Claude query PostgreSQL."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Kerem Kocatuş" }]
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+]
 dependencies = [
-    "mcp[cli]>=1.28.0,<2",
+    "mcp>=1.30,<2",
     "asyncpg>=0.30.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/keremkocatus/claude-postgresql"
+Repository = "https://github.com/keremkocatus/claude-postgresql"
 
 [project.scripts]
 ratatoskr = "ratatoskr.cli:main"
@@ -18,6 +36,9 @@ ratatoskr = "ratatoskr.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/ratatoskr/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ratatoskr"]

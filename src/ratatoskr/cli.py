@@ -22,6 +22,10 @@ CONFIG_ENV_VAR = "RATATOSKR_CONFIG"
 EXIT_UNEXPECTED_ERROR = 1
 EXIT_CONFIG_ERROR = 2
 EXIT_INTERRUPTED = 130
+HTTP_NOT_AVAILABLE_NOTE = (
+    "Note: streamable-http is validated but not available in this version; serve will refuse it. "
+    "Use transport: stdio for now."
+)
 
 logger = logging.getLogger("ratatoskr.cli")
 
@@ -62,7 +66,10 @@ def summarize(config: RatatoskrConfig) -> str:
     for name in sorted(config.connections):
         connection = config.connections[name]
         description = f"  {connection.description}" if connection.description else ""
-        lines.append(f"  - {name}: {connection.kind}, mode={connection.mode}{description}")
+        separate = ""
+        if connection.mode == "write":
+            separate = f", separate write role: {'yes' if connection.write_dsn is not None else 'no'}"
+        lines.append(f"  - {name}: {connection.kind}, mode={connection.mode}{separate}{description}")
     return "\n".join(lines)
 
 
@@ -79,6 +86,8 @@ def _check_config(args: argparse.Namespace) -> int:
         return EXIT_UNEXPECTED_ERROR
     print(f"Config OK: {path}")
     print(summarize(config))
+    if config.server.transport != "stdio":
+        print(HTTP_NOT_AVAILABLE_NOTE)
     return 0
 
 

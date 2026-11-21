@@ -11,6 +11,7 @@ from mcp.server.auth.provider import OAuthAuthorizationServerProvider
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
+from ratatoskr import __version__
 from ratatoskr.auth.policy import Policy
 from ratatoskr.auth.resolver import PrincipalResolver
 from ratatoskr.backends.postgres.tools import register_postgres_tools
@@ -46,7 +47,7 @@ def build_app(
 ) -> FastMCP[AppState]:
     # Ownership rule: whoever creates the registry closes it. Over stdio the FastMCP lifespan runs once, so
     # build_app owns it. Over streamable-http the SDK enters this lifespan once per MCP session; the HTTP
-    # composition root (Plan 1b) then passes its own registry and closes it in the process-level lifespan.
+    # composition root then passes its own registry and closes it in the process-level lifespan.
     owns_registry = registry is None
     active_registry = registry if registry is not None else BackendRegistry(config)
     runtime = ToolRuntime(Policy(config), active_registry, resolver, audit)
@@ -66,6 +67,10 @@ def build_app(
         auth_server_provider=auth_server_provider,
         auth=auth_settings,
     )
+    # serverInfo.version: FastMCP (mcp 1.30) has no version argument and the low-level Server falls back to the
+    # *mcp* package version. Server.version is public on the low-level server; reaching it needs FastMCP's private
+    # _mcp_server. tests/unit/test_mcp_protocol.py checks the initialize result, so an SDK change fails loudly.
+    mcp._mcp_server.version = __version__
     register_common_tools(mcp, runtime)
     register_postgres_tools(mcp, runtime)
     return mcp

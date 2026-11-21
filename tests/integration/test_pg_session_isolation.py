@@ -154,16 +154,22 @@ async def test_execute_returning_counts_every_row_but_returns_few(backend: Postg
 async def test_byte_budget_bounds_huge_rows(backend: PostgresBackend) -> None:
     sql = "SELECT repeat('x', 5000000) AS big FROM generate_series(1, 50)"
     read = await backend.fetch_rows(sql, [], 500, max_bytes=65536)
-    assert (len(read.rows), read.truncated) == (1, True)
+    # the first row alone is over the budget: kept (never zero rows), flagged, and nothing more is read
+    assert (len(read.rows), read.truncated, read.oversized) == (1, False, True)
     [written] = await backend.execute([(sql, [])], max_rows=500, max_bytes=65536)
-    assert (len(written.rows), written.truncated) == (1, True)
+    assert (len(written.rows), written.status) == (1, "SELECT 1")
+    returning = "UPDATE isolation_t SET id = id RETURNING repeat('x', 5000000)"
+    await backend.execute([("INSERT INTO isolation_t SELECT g FROM generate_series(1, 3) AS g", [])], max_rows=10)
+    [updated] = await backend.execute([(returning, [])], max_rows=500, max_bytes=65536)
+    # an oversized RETURNING row still reports every changed row
+    assert (len(updated.rows), updated.truncated, updated.status) == (1, True, "UPDATE 3")
 
 
 async def test_byte_budget_small_then_large_rows(backend: PostgresBackend) -> None:
     sql = "SELECT CASE WHEN g <= 10 THEN 'x' ELSE repeat('x', 1000000) END FROM generate_series(1, 500) AS g"
     read = await backend.fetch_rows(sql, [], 500, max_bytes=65536)
-    # chunks of 1, 2, 4, 8 rows: rows 1-10 are tiny, row 11 (1 MB) crosses the budget
-    assert (len(read.rows), read.truncated) == (11, True)
+    # chunks of 1, 2, 4, 8 rows: rows 1-10 are tiny, row 11 (1 MB) would cross the budget and is dropped
+    assert (len(read.rows), read.truncated, read.oversized) == (10, True, False)
 
 
 async def _pg_execute(backend: PostgresBackend, statements: list[str]) -> list[str]:

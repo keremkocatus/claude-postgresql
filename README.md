@@ -16,9 +16,17 @@ planned.
 - Access per group: `read` or `write`, capped by each connection's `mode`. Unknown and forbidden connections look
   identical ("Connection 'x' not found.").
 - Read-only enforcement by PostgreSQL itself rather than by SQL pattern matching (see [Security model](#security-model)).
-- Every tool call is audited: one JSON log line with `event: audit` (SQL truncated to 4096 characters, plus its
-  SHA-256).
-- Responses are clamped (rows and bytes) with an explicit note on how to narrow the request.
+- Every tool call is audited: one JSON log line with `event: audit` (SQL with secrets masked and truncated to 4096
+  characters, plus the SHA-256 of the full text) and a `result` of `ok` (the tool answered; a health report that
+  shows a connection down is still `ok`), `denied` (no identity, unknown or forbidden connection, insufficient
+  access), `error` (PostgreSQL or backend error, guard rejection, unexpected failure, client cancellation) or
+  `timeout` (deadline or `statement_timeout`). Arguments that do not match a tool's schema are rejected by the
+  MCP layer before the call reaches Ratatoskr, so they are not audited.
+- Failed calls return an `Error: ...` text with MCP `isError: true`, so the host sees them as failures.
+- Responses are clamped (rows and bytes) with an explicit note on how to narrow the request. Rows that do not fit
+  are left out whole; only a single row that alone exceeds the limit is cut.
+- Query results are returned exactly as stored. Masking of DSNs, passwords and tokens applies to error messages,
+  logs and the audited SQL, never to your data.
 
 ## Quick start (stdio)
 
@@ -69,13 +77,14 @@ One YAML file; [`config.example.yaml`](config.example.yaml) is the annotated ref
 
 | Key | Default | Meaning |
 |---|---|---|
-| `server.transport` | `stdio` | Only `stdio` runs in this release. |
+| `server.transport` | `stdio` | Only `stdio` runs in this release; `check-config` validates a `streamable-http` config but notes that `serve` will refuse it. |
 | `server.stdio_role` | unset | Group you act as over stdio. Unset means you see no connection. |
 | `server.log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
 | `roles.<group>` | `{}` | `{ <connection> or "*": read \| write }`. |
 | `connections.<name>.kind` | required | `postgres`. Names: `^[a-z0-9][a-z0-9_-]{0,62}$`. |
 | `connections.<name>.dsn` | required | `postgresql://user:password@host:port/db`, via `${VAR}` / `${file:...}`. |
 | `connections.<name>.mode` | `read` | `write` enables `pg_execute` and write-level `pg_explain(analyze=true)`. |
+| `connections.<name>.write_dsn` | unset | `mode: write` only: login for the write pool (`pg_execute`, write-level `pg_explain`). Unset: the write pool uses `dsn`. Recommended (see below). |
 | `connections.<name>.description` | `""` | Shown to Claude in `list_connections`. |
 | `connections.<name>.statement_timeout` | `30s` | Server-side timeout of every statement. |
 | `connections.<name>.pool` | `min_size: 1, max_size: 5, write_max_size: 2` | Read pool; the write pool opens lazily. |
@@ -124,7 +133,7 @@ Read access is enforced in layers:
    (`pg_read_file`, `pg_ls_dir`, `pg_stat_file`, ...) before anything reaches the database. This is a
    convenience that catches the obvious cases, not a guarantee.
 
-Write connections: `pg_execute` runs all statements in one transaction and rejects `COPY` and transaction
+Write connections: `pg_execute` runs all statements in one transaction (on the `write_dsn` login when set) and rejects `COPY` and transaction
 control (`BEGIN`, `COMMIT`, `SAVEPOINT`, ...); a few dangerous operations (`pg_read_file`, `COPY ... PROGRAM`,
 `ALTER SYSTEM`, ...) are refused early, but that list is a convenience, not a guarantee. Write-level
 `pg_explain(analyze=true)` is rolled back, but **non-transactional effects persist**: sequence increments
@@ -136,8 +145,12 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
 - Give every connection a dedicated role with only the grants it needs. Never use a superuser or the table owner.
 - Do not grant `dblink`, `postgres_fdw` or membership in `pg_read_server_files`, `pg_write_server_files` or
   `pg_execute_server_program`.
-- Use a **separate role for write connections**. If a read connection and a write connection share one database
-  user, a read-only caller can still end the write sessions with `pg_terminate_backend`.
+- On a write connection, set **`write_dsn`** to a separate write role and keep `dsn` on a read-only role. Every
+  read (`pg_query`, discovery, read-level `pg_explain`) logs in with `dsn`, so readers never act as the write role;
+  only `pg_execute` and write-level `pg_explain(analyze=true)` use `write_dsn`. Without it both pools log in as
+  the same user, and PostgreSQL lets a session end any other session of its own user: a read-only caller could
+  then end in-flight writes with `pg_terminate_backend`. The same applies to separate connections that point at
+  one server with one user. TLS settings apply to both pools.
 - `allowed_schemas` filters the discovery tools only; it does not restrict SQL sent to `pg_query`. Use `GRANT`s.
 - Error messages never contain the DSN, host or password.
 
@@ -155,6 +168,26 @@ ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TAB
 GRANT pg_read_all_stats TO ratatoskr_read;
 ```
 
+And a separate write role for `write_dsn` (grant only what `pg_execute` should be able to change):
+
+```sql
+CREATE ROLE ratatoskr_write LOGIN PASSWORD 'change-me-too'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT CONNECT ON DATABASE app TO ratatoskr_write;
+GRANT USAGE ON SCHEMA public TO ratatoskr_write;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ratatoskr_write;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ratatoskr_write;
+```
+
+```yaml
+connections:
+  app-db:
+    kind: postgres
+    mode: write
+    dsn: ${APP_DB_READ_DSN}         # postgresql://ratatoskr_read:...@host/app
+    write_dsn: ${APP_DB_WRITE_DSN}  # postgresql://ratatoskr_write:...@host/app
+```
+
 ## Development
 
 ```bash
@@ -162,6 +195,7 @@ pip install --index-url https://pypi.org/simple -e ".[dev]"
 python -m pytest -q                     # unit tests, no network
 python -m pytest -m integration -q      # needs Docker: starts PostgreSQL with testcontainers
 python -m ruff check src tests
+python -m ruff format --check src tests
 python -m mypy src
 ```
 
@@ -169,4 +203,4 @@ See [`CLAUDE.md`](CLAUDE.md) for project conventions.
 
 ## License
 
-MIT
+MIT, see [`LICENSE`](LICENSE).
