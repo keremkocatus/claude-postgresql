@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 
-from ratatoskr.auth.ratelimit import LOGIN_RULE, REGISTER_RULE, RateLimiter, RateRule
+import pytest
+
+from ratatoskr.auth.ratelimit import LOGIN_RULE, REGISTER_RULE, RateLimiter, RateRule, Reservation
+from ratatoskr.state.records import RateLimitState
 from ratatoskr.state.sqlite import SqliteStore
 
 RULE = RateRule(limit=3, window=60.0, base_lockout=10.0, max_lockout=35.0)
@@ -197,3 +200,64 @@ async def test_refund_after_the_row_is_gone_is_harmless(store: SqliteStore, cloc
     await limiter.reset("ip")
     await limiter.refund(reservation)
     assert await store.get_rate_limit("ip") is None
+
+
+# ── review fixes: huge strike counts, single refund, no forged reservations ─────────────────
+
+
+async def test_huge_strike_counts_do_not_overflow_on_hit(store: SqliteStore, clock) -> None:
+    await store.save_rate_limit(
+        "k", RateLimitState(hits=(clock(),) * (RULE.limit - 1), strikes=1024, blocked_until=0.0), clock()
+    )
+    limiter = RateLimiter(store, RULE, clock)
+    assert await limiter.hit("k") == RULE.max_lockout
+    state = await store.get_rate_limit("k")
+    assert state is not None and state.strikes == 1025
+
+
+async def test_huge_strike_counts_do_not_overflow_on_reserve(store: SqliteStore, clock) -> None:
+    await store.save_rate_limit(
+        "k", RateLimitState(hits=(clock(),) * (RULE.limit - 1), strikes=1024, blocked_until=0.0), clock()
+    )
+    limiter = RateLimiter(store, RULE, clock)
+    assert (await limiter.reserve(["k"])).granted
+    assert await limiter.retry_after("k") == RULE.max_lockout
+
+
+async def test_a_reservation_is_refunded_at_most_once(store: SqliteStore, clock) -> None:
+    limiter = RateLimiter(store, RULE, clock)
+    first = await limiter.reserve(["ip"])
+    second = await limiter.reserve(["ip"])  # same clock tick: same timestamp as the first
+    await limiter.refund(first)
+    await limiter.refund(first)
+    state = await store.get_rate_limit("ip")
+    assert state is not None and state.hits == (clock(),)
+    await limiter.refund(second)
+    state = await store.get_rate_limit("ip")
+    assert state is not None and state.hits == ()
+
+
+async def test_refunding_a_lockout_twice_does_not_touch_a_later_identical_state(store: SqliteStore, clock) -> None:
+    limiter = RateLimiter(store, RULE, clock)
+    for _ in range(RULE.limit - 1):
+        await limiter.reserve(["ip"])
+    last = await limiter.reserve(["ip"])
+    await limiter.refund(last)
+    again = await limiter.reserve(["ip"])  # same tick: recreates exactly the state ``last`` saved
+    assert again.granted and await limiter.retry_after("ip") == RULE.base_lockout
+    await limiter.refund(last)
+    assert await limiter.retry_after("ip") == RULE.base_lockout
+
+
+async def test_reserve_needs_at_least_one_key(store: SqliteStore, clock) -> None:
+    with pytest.raises(ValueError, match="key"):
+        await RateLimiter(store, RULE, clock).reserve([])
+
+
+def test_a_granted_reservation_cannot_be_built_without_charges() -> None:
+    with pytest.raises(TypeError):
+        Reservation(0.0)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="granted"):
+        Reservation(0.0, ())
+    with pytest.raises(ValueError, match="blocked"):
+        Reservation(5.0, (object(),))  # type: ignore[arg-type]

@@ -6,7 +6,6 @@ import time
 from collections.abc import Callable
 from typing import Protocol
 
-from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from mcp.server.lowlevel.server import request_ctx
@@ -38,19 +37,20 @@ class StdioPrincipalResolver:
 
 
 def _current_access_token() -> AccessToken | None:
-    """Token of the HTTP request that carried this JSON-RPC message.
+    """Token of the HTTP request that carried this JSON-RPC message; ``None`` when there is no such request.
 
-    ``get_access_token()`` alone is not enough: its context variable is captured when the MCP session task starts,
-    so after a refresh it still returns the session's first token. The request object the SDK attaches to every
-    message always holds the token that was just verified.
+    ``get_access_token()`` is deliberately not used, not even as a fallback: its context variable is captured when
+    the MCP session task starts, so after a refresh or a revocation it still returns the session's first token.
+    Streamable-HTTP attaches the Starlette request to every message it delivers (``ServerMessageMetadata``), so
+    a missing request means the call did not arrive over authenticated HTTP and fails closed.
     """
     try:
         context = request_ctx.get()
     except LookupError:
-        return get_access_token()
+        return None
     request = context.request
     if not isinstance(request, HTTPConnection):
-        return get_access_token()
+        return None
     user = request.scope.get("user")
     return user.access_token if isinstance(user, AuthenticatedUser) else None
 
@@ -65,9 +65,8 @@ class TokenPrincipalResolver:
         token = _current_access_token()
         if not isinstance(token, RatatoskrAccessToken):
             raise PermissionError("Authentication required.")
-        # Same rule as the SDK's bearer middleware (expired when ``expires_at < now``); this also covers the
-        # context-variable fallback, which can hold a session's older token.
-        if token.expires_at is not None and token.expires_at < self._clock():
+        # Same rule as the SDK's bearer middleware: expired when ``expires_at < int(now)``.
+        if token.expires_at is not None and token.expires_at < int(self._clock()):
             raise PermissionError("Authentication required.")
         return Principal(
             subject=token.subject,

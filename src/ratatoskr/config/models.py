@@ -36,6 +36,27 @@ class Access(enum.IntEnum):
 GrantLevel = Literal["read", "write"]
 
 
+_DNS_NAME_RE = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)(?:\.(?!-)[a-z0-9-]{1,63}(?<!-))*")
+
+
+def _is_redirect_host(host: str) -> bool:
+    """A lower-case ASCII DNS name, an IPv4 address or a bracketed IPv6 address."""
+    if host.startswith("[") and host.endswith("]"):
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError:
+            return False
+        return True
+    if not host.isascii() or _DNS_NAME_RE.fullmatch(host) is None:
+        return False
+    if host.rsplit(".", 1)[-1].isdigit():  # no top-level domain is numeric: this must be an IPv4 address
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            return False
+    return True
+
+
 def _duration(value: Any) -> timedelta:
     if isinstance(value, str | int | float | timedelta):
         return parse_duration(value)
@@ -78,6 +99,21 @@ class ServerSettings(BaseModel):
         if value < timedelta(days=1):
             raise ValueError("audit_retention must be at least 1 day")
         return value
+
+    @field_validator("allowed_redirect_hosts")
+    @classmethod
+    def _check_allowed_redirect_hosts(cls, value: list[str]) -> list[str]:
+        # Exact host names only (no scheme, port, path or wildcard); the message never echoes the entry.
+        normalized: list[str] = []
+        for i, entry in enumerate(value):
+            host = entry.lower()
+            if not entry.isascii() or not _is_redirect_host(host):  # U+212A lower-cases to ASCII "k"
+                raise ValueError(
+                    f"entry {i} is not a host name, IPv4 address or bracketed IPv6 address like [::1]"
+                    " (no scheme, port, path or wildcard)"
+                )
+            normalized.append(host)
+        return normalized
 
     @field_validator("trusted_proxies")
     @classmethod

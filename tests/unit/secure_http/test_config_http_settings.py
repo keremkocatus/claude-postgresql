@@ -65,3 +65,53 @@ def test_invalid_trusted_proxy_value_is_never_echoed(tmp_path: Path) -> None:
     assert "s3cr3t" not in str(info.value)
     assert info.value.__cause__ is None
     assert info.value.__context__ is None
+
+
+def test_allowed_redirect_hosts_accept_hostnames_ipv4_and_bracketed_ipv6() -> None:
+    settings = ServerSettings.model_validate(
+        {"allowed_redirect_hosts": ["claude.ai", "Claude.COM", "localhost", "127.0.0.1", "[::1]", "my-host.example"]}
+    )
+    assert settings.allowed_redirect_hosts == [
+        "claude.ai",
+        "claude.com",
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+        "my-host.example",
+    ]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://claude.ai",
+        "claude.ai/cb",
+        "claude.ai:443",
+        "*.claude.ai",
+        "*",
+        ".claude.ai",
+        "claude.ai.",
+        "::1",
+        "[claude.ai]",
+        "[::1]:8080",
+        "999.1.1.1",
+        "1.2.3",
+        "user@claude.ai",
+        "\u212aerem.dev",
+        "cl\u0430ude.ai",
+        "",
+        " claude.ai",
+        "-claude.ai",
+    ],
+)
+def test_invalid_allowed_redirect_host_is_rejected(entry: str) -> None:
+    with pytest.raises(ValidationError, match="allowed_redirect_hosts"):
+        ServerSettings.model_validate({"allowed_redirect_hosts": [entry]})
+
+
+def test_invalid_allowed_redirect_host_value_is_never_echoed(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"server\.allowed_redirect_hosts: entry 1 is not a host name") as info:
+        _load(tmp_path, '  allowed_redirect_hosts: ["claude.ai", "https://s3cr3t-value"]')
+    assert "s3cr3t" not in str(info.value)
+    assert info.value.__cause__ is None
+    assert info.value.__context__ is None

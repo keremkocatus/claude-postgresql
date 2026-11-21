@@ -34,17 +34,32 @@ class _Charge:
     saved: RateLimitState
 
 
-@dataclass(frozen=True)
 class Reservation:
-    """Result of :meth:`RateLimiter.reserve`: granted (``retry_after == 0``) or blocked."""
+    """Result of :meth:`RateLimiter.reserve`: granted (``retry_after == 0``) or blocked.
 
-    retry_after: float
-    """Seconds until the blocked keys may try again; ``0.0`` when the attempt was granted and recorded."""
-    _charges: tuple[_Charge, ...] = ()
+    Only ``reserve`` builds these: a granted reservation always carries the attempts it recorded, a blocked one
+    none. It can be refunded at most once.
+    """
+
+    __slots__ = ("_charges", "_refunded", "_retry_after")
+
+    def __init__(self, retry_after: float, charges: tuple[_Charge, ...]) -> None:
+        if retry_after == 0.0 and not charges:
+            raise ValueError("a granted reservation must carry the attempts it recorded")
+        if retry_after != 0.0 and charges:
+            raise ValueError("a blocked reservation records nothing")
+        self._retry_after = retry_after
+        self._charges = charges
+        self._refunded = False
+
+    @property
+    def retry_after(self) -> float:
+        """Seconds until the blocked keys may try again; ``0.0`` when the attempt was granted and recorded."""
+        return self._retry_after
 
     @property
     def granted(self) -> bool:
-        return self.retry_after == 0.0
+        return self._retry_after == 0.0
 
 
 class RateLimiter:
@@ -84,26 +99,31 @@ class RateLimiter:
         A blocked reservation records nothing. The attempt that reaches the limit is still granted (it is the
         ``limit``-th attempt) and starts the lockout for the attempts after it.
         """
+        if not keys:
+            raise ValueError("reserve needs at least one key")
         async with self._lock:
             now = self._clock()
             states = {key: await self._store.get_rate_limit(key) for key in dict.fromkeys(keys)}
             wait = max((s.blocked_until - now for s in states.values() if s is not None), default=0.0)
             if wait > 0:
-                return Reservation(retry_after=wait)
+                return Reservation(wait, ())
             charges = []
             for key, state in states.items():
                 new_state, _ = self._record(state or _EMPTY, now)
                 await self._store.save_rate_limit(key, new_state, now)
                 charges.append(_Charge(key, now, state, new_state))
-            return Reservation(retry_after=0.0, _charges=tuple(charges))
+            return Reservation(0.0, tuple(charges))
 
     async def refund(self, reservation: Reservation) -> None:
-        """Take back a granted reservation's attempt (the login succeeded); a no-op for blocked ones.
+        """Take back a granted reservation's attempt (the login succeeded); a no-op for blocked or refunded ones.
 
         If the attempt started a lockout that is still unchanged, the key's previous state is restored. When the
         key changed since (other attempts, a newer lockout, a reset) only this attempt's timestamp is removed.
         """
         async with self._lock:
+            if reservation._refunded:
+                return
+            reservation._refunded = True
             now = self._clock()
             for charge in reservation._charges:
                 state = await self._store.get_rate_limit(charge.key)
@@ -130,5 +150,6 @@ class RateLimiter:
         if len(hits) < self._rule.limit:
             return RateLimitState(hits, state.strikes, state.blocked_until), 0.0
         strikes = state.strikes + 1
-        lockout = min(self._rule.max_lockout, self._rule.base_lockout * 2.0 ** (strikes - 1))
+        # The exponent is capped so a long-lived key (thousands of strikes) cannot overflow the float.
+        lockout = min(self._rule.max_lockout, self._rule.base_lockout * 2.0 ** min(strikes - 1, 32))
         return RateLimitState((), strikes, now + lockout), lockout

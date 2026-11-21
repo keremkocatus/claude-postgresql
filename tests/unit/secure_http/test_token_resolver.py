@@ -51,11 +51,24 @@ def test_resolves_from_the_current_request_not_the_session_context() -> None:
     assert principal.display_name == "Alice" and principal.auth_source == "oidc"
 
 
-def test_falls_back_to_auth_context_without_a_request() -> None:
+def test_auth_context_alone_is_refused() -> None:
+    # Without the current request the token is unknown; the session's context variable is a stale snapshot.
     stale = auth_context_var.set(AuthenticatedUser(ratatoskr_token("bob", ["g"])))
     try:
-        assert TokenPrincipalResolver().resolve().subject == "bob"
+        with pytest.raises(PermissionError, match="Authentication required"):
+            TokenPrincipalResolver().resolve()
     finally:
+        auth_context_var.reset(stale)
+
+
+def test_request_context_without_an_http_request_is_refused() -> None:
+    stale = auth_context_var.set(AuthenticatedUser(ratatoskr_token("bob", ["g"])))
+    ctx = request_ctx.set(SimpleNamespace(request=None))  # type: ignore[arg-type]
+    try:
+        with pytest.raises(PermissionError, match="Authentication required"):
+            TokenPrincipalResolver().resolve()
+    finally:
+        request_ctx.reset(ctx)
         auth_context_var.reset(stale)
 
 
@@ -90,19 +103,10 @@ def test_expired_request_token_is_refused() -> None:
     try:
         with pytest.raises(PermissionError, match="Authentication required"):
             TokenPrincipalResolver(clock=lambda: 1000.0).resolve()
-        # Like the SDK's bearer middleware: still valid in the second it expires.
-        assert TokenPrincipalResolver(clock=lambda: 999.0).resolve().subject == "alice"
+        # Like the SDK's bearer middleware (``expires_at < int(time.time())``): valid in the second it expires.
+        assert TokenPrincipalResolver(clock=lambda: 999.9).resolve().subject == "alice"
     finally:
         request_ctx.reset(ctx)
-
-
-def test_expired_fallback_context_token_is_refused() -> None:
-    stale = auth_context_var.set(AuthenticatedUser(ratatoskr_token("bob", ["g"], expires_at=999)))
-    try:
-        with pytest.raises(PermissionError, match="Authentication required"):
-            TokenPrincipalResolver(clock=lambda: 1000.0).resolve()
-    finally:
-        auth_context_var.reset(stale)
 
 
 def test_token_without_expiry_is_accepted() -> None:
