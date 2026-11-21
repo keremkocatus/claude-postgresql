@@ -1,27 +1,26 @@
 [project]
-name = "claude-postgresql"
-version = "0.1.0"
-description = "A high-performance PostgreSQL MCP server for Claude — schema discovery, query execution, monitoring, and more."
+name = "ratatoskr-mcp"
+version = "1.0.0.dev0"
+description = "Ratatoskr: a secure, multi-connection MCP server that lets Claude query PostgreSQL."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.28.0,<2",
     "asyncpg>=0.30.0",
     "pydantic>=2.0",
-    "pydantic-settings>=2.0",
-    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
-claude-postgresql = "claude_postgresql.server:main"
+ratatoskr = "ratatoskr.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/claude_postgresql"]
+packages = ["src/ratatoskr"]
 
 [project.optional-dependencies]
 dev = [
@@ -29,19 +28,28 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "ruff>=0.4.0",
     "mypy>=1.10",
+    "testcontainers>=4.0",
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 120
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = ["integration: needs Docker; starts a PostgreSQL container via testcontainers"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*", "yaml"]
+ignore_missing_imports = true
