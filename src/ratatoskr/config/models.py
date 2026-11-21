@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from ratatoskr.config.loki_models import LokiConnection
 from ratatoskr.config.prometheus_models import PrometheusConnection
 from ratatoskr.config.shared import DEFAULT_MAX_RESPONSE_BYTES
 from ratatoskr.config.shared import duration_value as _duration
@@ -262,8 +263,7 @@ class PostgresConnection(BaseModel):
         return self
 
 
-ConnectionConfig = Annotated[PostgresConnection | PrometheusConnection, Field(discriminator="kind")]
-# Stage 3 adds LokiConnection to this union.
+ConnectionConfig = Annotated[PostgresConnection | PrometheusConnection | LokiConnection, Field(discriminator="kind")]
 
 
 class RatatoskrConfig(BaseModel):

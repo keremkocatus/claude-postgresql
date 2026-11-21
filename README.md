@@ -1,8 +1,8 @@
 # Ratatoskr
 
 Ratatoskr is an MCP server that gives Claude (claude.ai, Claude Desktop, Claude Code) controlled access to
-**several PostgreSQL databases and Prometheus servers at once**, with per-group access levels and an audit trail.
-A Loki backend is planned.
+**several PostgreSQL databases, Prometheus servers and Loki log stores at once**, with per-group access levels and
+an audit trail.
 
 > **Status: 1.0.0.dev0.** Runs locally over **stdio**, or remotely over **streamable HTTP** as a claude.ai custom
 > connector: Ratatoskr is its own OAuth 2.1 authorization server, and people sign in with local users or through an
@@ -12,16 +12,16 @@ A Loki backend is planned.
 
 ## Features
 
-- Any number of named PostgreSQL (12 or newer) and Prometheus connections in one server; the tool set stays the
-  same (16 tools). Prometheus connections also work with Mimir, Thanos Query and VictoriaMetrics.
+- Any number of named PostgreSQL (12 or newer), Prometheus and Loki connections in one server; the tool set stays
+  the same (19 tools). Prometheus connections also work with Mimir, Thanos Query and VictoriaMetrics.
 - Access per group: `read` or `write`, capped by each connection's `mode`. Unknown and forbidden connections look
   identical ("Connection 'x' not found.").
 - Read-only enforcement by PostgreSQL itself rather than by SQL pattern matching (see [Security model](#security-model)).
-- Every tool call is audited: one JSON log line with `event: audit` (the SQL or PromQL with secrets masked and truncated to 4096
+- Every tool call is audited: one JSON log line with `event: audit` (the SQL, PromQL or LogQL with secrets masked and truncated to 4096
   characters, plus the SHA-256 of the full text) and a `result` of `ok` (the tool answered; a health report that
   shows a connection down is still `ok`), `denied` (no identity, unknown or forbidden connection, insufficient
-  access), `error` (PostgreSQL, Prometheus or backend error, guard rejection, unexpected failure, client cancellation) or
-  `timeout` (deadline, `statement_timeout` or Prometheus' query timeout). Arguments that do not match a tool's schema are rejected by the
+  access), `error` (PostgreSQL, Prometheus, Loki or backend error, guard rejection, unexpected failure, client cancellation) or
+  `timeout` (deadline, `statement_timeout`, Prometheus' query timeout or Loki's HTTP 504). Arguments that do not match a tool's schema are rejected by the
   MCP layer before the call reaches Ratatoskr, so they are not audited.
 - Failed calls return an `Error: ...` text with MCP `isError: true`, so the host sees them as failures.
 - Responses are clamped (rows and bytes) with an explicit note on how to narrow the request. Rows that do not fit
@@ -29,8 +29,8 @@ A Loki backend is planned.
 - Remote use over streamable HTTP with OAuth 2.1 (dynamic client registration, PKCE, rotating refresh tokens with
   reuse detection, revocation), local argon2id users or OIDC (Authentik), rate-limited login pages, and a
   persistent audit trail in SQLite (`/data/state.db`, kept 90 days by default).
-- Query results are returned exactly as stored. Masking of DSNs, passwords and tokens applies to error messages,
-  logs and the audited SQL, never to your data.
+- Query results and log lines are returned exactly as stored (long log lines are cut, and marked). Masking of DSNs,
+  passwords and tokens applies to error messages, logs and the audited query text, never to your data.
 
 ## Quick start (stdio)
 
@@ -187,11 +187,11 @@ One YAML file; [`config.example.yaml`](config.example.yaml) is the annotated ref
 | `auth.local.users[]` | - | `username`, `password_hash` (argon2id from `ratatoskr hash-password`), `groups`. |
 | `auth.oidc` | - | `issuer` (https), `client_id`, `client_secret`, `scopes` (default `openid email profile groups offline_access`), `groups_claim` (`groups`), `subject_claim` (`email`). |
 | `roles.<group>` | `{}` | `{ <connection> or "*": read \| write }`. |
-| `connections.<name>.kind` | required | `postgres` or `prometheus`. Names: `^[a-z0-9][a-z0-9_-]{0,62}$`. |
+| `connections.<name>.kind` | required | `postgres`, `prometheus` or `loki`. Names: `^[a-z0-9][a-z0-9_-]{0,62}$`. |
 | `connections.<name>.dsn` | required | PostgreSQL: `postgresql://user:password@host:port/db`, via `${VAR}` / `${file:...}`. |
 | `connections.<name>.mode` | `read` | PostgreSQL: `write` enables `pg_execute` and write-level `pg_explain(analyze=true)`. |
 | `connections.<name>.write_dsn` | unset | PostgreSQL, `mode: write` only: login for the write pool (`pg_execute`, write-level `pg_explain`). Unset: the write pool uses `dsn`. Recommended (see below). |
-| `connections.<name>.description` | `""` | Both kinds: shown to Claude in `list_connections`. |
+| `connections.<name>.description` | `""` | Every kind: shown to Claude in `list_connections`. |
 | `connections.<name>.statement_timeout` | `30s` | PostgreSQL: server-side timeout of every statement. |
 | `connections.<name>.pool` | `min_size: 1, max_size: 5, write_max_size: 2` | PostgreSQL: read pool; the write pool opens lazily. |
 | `connections.<name>.allowed_schemas` | `[]` (all) | PostgreSQL: filters the discovery tools only (see below). |
@@ -235,7 +235,8 @@ connections:
 Requests ask for an uncompressed answer (`Accept-Encoding: identity`) so `max_body_bytes` counts what is decoded. A
 server that compresses anyway (`gzip`, `deflate`) is decoded step by step within the cap; other encodings are refused.
 
-Outgoing HTTP (OIDC issuer, Prometheus) honours `HTTPS_PROXY` / `HTTP_PROXY`; put in-cluster hosts in `NO_PROXY`.
+Outgoing HTTP (OIDC issuer, Prometheus, Loki) honours `HTTPS_PROXY` / `HTTP_PROXY`; put in-cluster hosts in
+`NO_PROXY`.
 `check-config` shows each Prometheus connection's auth type and number of extra headers, never the URL, token or
 header values.
 
@@ -245,6 +246,43 @@ partial. VictoriaMetrics: metadata may be empty (names are still listed) and ale
 `-vmalert.proxyURL`; without them `prom_alerts` reports the rule groups as unavailable or fails.
 `connection_health` uses `/api/v1/status/buildinfo` and falls back to a trivial query when the server answers 404
 there.
+
+### Loki connections
+
+```yaml
+connections:
+  logs:
+    kind: loki
+    description: "Production logs"
+    url: https://loki.example.com
+    tenant: ${LOKI_TENANT}
+    auth: { type: basic, username: ${LOKI_USER}, password: ${LOKI_PASSWORD} }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `url` | required | Loki root or its gateway (`http` or `https`); requests go to `<url>/loki/api/v1/...`. No credentials, query string or fragment. Redirects are not followed. |
+| `mode` | `read` | Always `read`: every Loki tool is a read, and `mode: write` is rejected. |
+| `tenant` | unset | Sent as `X-Scope-OrgID` on every request (multi-tenant Loki, Grafana Enterprise Logs); several tenants for a cross-tenant query: `a\|b` (the server must allow it). Letters, digits and `!-_.*'()`, at most 150 per tenant. `X-Scope-OrgID` under `headers` is refused, so the tenant has one source. |
+| `auth` | `{type: none}` | `none`, `basic` (`username`, `password`; Grafana Cloud: the user ID and an access token) or `bearer` (`token`); secrets via `${VAR}` / `${file:...}`, never empty. |
+| `headers` | `{}` | Extra request headers; values are treated as secrets. The same headers as for Prometheus are refused, plus `X-Scope-OrgID`. |
+| `timeout` | `30s` | 1s to 10m. Each tool call has one deadline for all its requests, `timeout` + 5s (`connection_health` sends two). Loki's own `query_timeout` still applies on the server. |
+| `tls` | `verify: true` | As for Prometheus: `verify: false`, or `ca_file` to trust only that CA. No client certificates. |
+| `limits.max_lines` | `500` | Highest `limit` a `loki_query` may ask for (1 to 5000, Loki's own default ceiling); the default `limit` is 100 (or `max_lines` if lower). A higher `limit` is refused. |
+| `limits.max_line_bytes` | `2048` | Each log line is cut to this many bytes (64 to 65536) and marked `… [cut: N bytes]`. |
+| `limits.max_range` | `24h` | Longest window for `loki_query`, `loki_labels` and `loki_label_values` (at least `1m`); a longer one is refused before any request. |
+| `limits.max_series` | `100` | Series shown for a metric query (1 to 10000). |
+| `limits.max_points` | `1000` | Points per series in a metric query (10 to 11000); a `step` that needs more is refused with the smallest step that fits. |
+| `limits.max_values` | `500` | Label names and values shown per response. |
+| `limits.max_query_length` | `20000` | Characters of LogQL or of a `selector`. |
+| `limits.max_response_bytes` | `65536` | Text returned to Claude (at least 1024). |
+| `limits.max_body_bytes` | `8388608` | Bytes read from Loki per request (8 MiB; at least 65536); a larger answer is refused with a hint to lower `limit` or narrow the query. Memory and decoding cost as for Prometheus. |
+
+`check-config` shows each Loki connection's auth type, whether a tenant is set and the number of extra headers, never
+the URL, tenant, token or header values. Tested with Loki 3.7; `selector` on `loki_labels` and `loki_label_values`
+needs a server that supports the `query` parameter of those endpoints (older ones may ignore it).
+`connection_health` lists the labels of the last minute (that checks credentials and tenant) and then reads the version
+from `/loki/api/v1/status/buildinfo` ("Loki API" when the server does not offer it).
 
 ## Tools
 
@@ -266,6 +304,9 @@ there.
 | `prom_list_metrics` | read | Metric names with data in a window, with type and help; `name_contains` and `match` filters. |
 | `prom_label_values` | read | Values of one label, optionally only on series matching a selector. |
 | `prom_alerts` | read | Firing and pending alerts, and the state of every rule group (unhealthy rules with their last error). |
+| `loki_query` | read | LogQL over a window (default the last hour, at most `max_range`). Log queries: lines newest first (`direction: forward` for oldest first), each stream's labels once, `limit` lines (default 100). Metric queries: per series points, min/max/avg/last and sampled points. |
+| `loki_labels` | read | Label names on streams with data in a window, optionally only streams matching a `selector`. |
+| `loki_label_values` | read | Values of one label, optionally only on streams matching a `selector`. |
 
 Prometheus tools take `connection` from `list_connections` and refuse a PostgreSQL connection (and the `pg_*` tools a
 Prometheus one). Times accept RFC3339 (`2026-11-22T10:00:00Z`), unix seconds, or `now`, `now-15m`, `now-2h`; windows
@@ -273,6 +314,14 @@ Prometheus one). Times accept RFC3339 (`2026-11-22T10:00:00Z`), unix seconds, or
 `step` arguments longer than 64 characters are refused. A `step` must be at least `1ms` and is rounded to whole
 milliseconds; without `step`, `prom_query_range` picks a round one that gives up to about 120 points. Label names
 for `prom_label_values` are plain Prometheus names (`^[A-Za-z_][A-Za-z0-9_]*$`).
+
+Loki tools refuse other kinds of connection the same way and take the same time formats. `loki_query` always uses
+Loki's range endpoint: a log query returns at most `limit` lines and says when Loki stopped at the limit (narrow with
+a shorter window, more label matchers or a `|= "text"` filter); labels shared by every stream are shown once at the top
+and each stream's own labels once above its lines; timestamps have milliseconds (UTC); lines of a multi-line entry
+are indented under it. A metric query (`count_over_time`, `rate`, `sum by`) is summarised like `prom_query_range`;
+`step` applies to it (default: up to about 120 points). Label names for `loki_label_values` follow the same pattern
+as for Prometheus.
 
 ## Security model
 
@@ -333,6 +382,23 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
   (401/403, 404, 429, redirects, 5xx, HTML login pages) get fixed wording; details go to the log. `serve` and `check-config` warn when
   `auth` credentials would go over plain `http` to a host other than loopback.
 - At `log_level: INFO` httpx's request lines (which carry internal hosts and label matchers) are not logged.
+
+### Loki connections
+
+- Read-only by design: Ratatoskr calls only the query_range, labels, label values and buildinfo endpoints, never push,
+  tail, delete, rules or admin endpoints.
+- **LogQL is not restricted.** Anyone with read access to the connection can run any query over the tenant's logs.
+  Ratatoskr refuses windows longer than `max_range` and limits above `max_lines` before sending anything, caps the
+  points of metric queries, enforces its deadline, caps what it reads (`max_body_bytes`) and what it returns. Keep
+  Loki's own per-tenant limits (`query_timeout`, `max_query_length`, `max_query_series`,
+  `max_entries_limit_per_query`) in place, and give each connection a tenant and credential that only see what its
+  users may see.
+- Log lines are the user's data: they are cut to `max_line_bytes` but never masked, so a secret written into a log
+  line is shown as it is. Loki's error texts (which can echo the query) and warnings go through the same address
+  removal and secret masking as Prometheus messages; 401/403, 404, 429, redirects, 5xx and HTML pages get fixed
+  wording, a multi-tenant server without a tenant gets a hint to set `tenant`, and HTTP 504 is reported as a timeout.
+- `tenant`, credentials and header values never appear in errors, logs or `check-config` output; `serve` and
+  `check-config` warn when `auth` credentials would go over plain `http` to a host other than loopback.
 
 ### HTTP transport
 
@@ -417,7 +483,7 @@ connections:
 ```bash
 pip install --index-url https://pypi.org/simple -e ".[dev]"
 python -m pytest -q                     # unit tests, no network
-python -m pytest -m integration -q      # needs Docker: starts PostgreSQL and Prometheus with testcontainers
+python -m pytest -m integration -q      # needs Docker: starts PostgreSQL, Prometheus and Loki with testcontainers
 python -m ruff check src tests
 python -m ruff format --check src tests
 python -m mypy src

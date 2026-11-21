@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import ssl
+import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,7 @@ from pydantic import SecretStr
 
 from ratatoskr import __version__
 from ratatoskr.backends.errors import BackendQueryError, BackendTimeoutError, BackendUnavailableError
+from ratatoskr.backends.http import client as http_client
 from ratatoskr.backends.http import options
 from ratatoskr.backends.http.client import (
     EndpointNotFoundError,
@@ -217,3 +220,22 @@ def test_ca_file_builds_its_own_context(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(options.ssl, "create_default_context", fake_context)
     assert options.build_verify(HttpTlsSettings(ca_file=ca)) == "context"
     assert seen == {"cafile": str(ca)}
+
+
+async def test_one_deadline_covers_several_requests(
+    router: respx.Router, client: HttpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each request answers within the 2s timeout; together they do not."""
+    monkeypatch.setattr(http_client, "TIMEOUT_GRACE_SECONDS", 0.0)
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.8)
+        return httpx.Response(200, json={"status": "success"})
+
+    router.get("/api/v1/a").mock(side_effect=slow)
+    started = time.perf_counter()
+    with pytest.raises(BackendTimeoutError, match=r"^Connection 'prom' did not answer within 2s\.$"):
+        async with client.deadline():
+            for _ in range(3):
+                await client.request("GET", "/api/v1/a")
+    assert 1.9 < time.perf_counter() - started < 2.4

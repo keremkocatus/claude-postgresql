@@ -7,9 +7,10 @@ import pytest
 import respx
 
 from ratatoskr.backends.errors import InvalidRequestError
-from ratatoskr.backends.prometheus import api, querying
+from ratatoskr.backends.http import envelope
+from ratatoskr.backends.output import MAX_NOTES
+from ratatoskr.backends.prometheus import querying
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
-from ratatoskr.backends.prometheus.formatting import MAX_NOTES
 from tests.unit.prom_helpers import TS, make_backend, matrix, success, vector
 
 
@@ -138,7 +139,7 @@ async def test_decoding_and_parsing_run_off_the_event_loop(
 
         return run
 
-    monkeypatch.setattr(api, "parse_json", recorded("json", api.parse_json))
+    monkeypatch.setattr(envelope, "parse_json", recorded("json", envelope.parse_json))
     monkeypatch.setattr(querying, "parse_result", recorded("parse", querying.parse_result))
     prom_api.post("/api/v1/query").mock(return_value=success(vector(({"job": "a"}, "1"))))
     prom_api.post("/api/v1/query_range").mock(return_value=success(matrix(({"job": "a"}, [(TS, "1")]))))

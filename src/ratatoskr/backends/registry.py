@@ -11,8 +11,10 @@ from collections.abc import Callable
 from ratatoskr.auth.policy import ConnectionNotFoundError
 from ratatoskr.backends.base import Backend, ConnectionInfo
 from ratatoskr.backends.errors import BackendUnavailableError
+from ratatoskr.backends.loki.backend import LokiBackend
 from ratatoskr.backends.postgres.backend import PostgresBackend
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
+from ratatoskr.config.loki_models import LokiConnection
 from ratatoskr.config.models import ConnectionConfig, RatatoskrConfig
 from ratatoskr.config.prometheus_models import PrometheusConnection
 from ratatoskr.config.shared import DEFAULT_MAX_RESPONSE_BYTES
@@ -27,6 +29,8 @@ logger = logging.getLogger("ratatoskr.backends")
 def default_factory(name: str, config: ConnectionConfig) -> Backend:
     if isinstance(config, PrometheusConnection):
         return PrometheusBackend(name, config)
+    if isinstance(config, LokiConnection):
+        return LokiBackend(name, config)
     return PostgresBackend(name, config)
 
 

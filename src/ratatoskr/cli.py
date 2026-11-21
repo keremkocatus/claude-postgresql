@@ -14,10 +14,11 @@ from ratatoskr.app import build_app
 from ratatoskr.auth.password_cli import DESCRIPTION as HASH_PASSWORD_DESCRIPTION
 from ratatoskr.auth.password_cli import run_hash_password
 from ratatoskr.auth.resolver import StdioPrincipalResolver
+from ratatoskr.config.http_models import HttpConnection
 from ratatoskr.config.loader import ConfigError, load_config
+from ratatoskr.config.loki_models import LokiConnection
 from ratatoskr.config.models import PostgresConnection, RatatoskrConfig
 from ratatoskr.config.notices import config_warnings
-from ratatoskr.config.prometheus_models import PrometheusConnection
 from ratatoskr.observability.audit import LogAuditSink
 from ratatoskr.observability.logging import setup_logging
 from ratatoskr.transport.preconditions import check_http_preconditions
@@ -79,8 +80,11 @@ def summarize(config: RatatoskrConfig) -> str:
         details = ""
         if isinstance(connection, PostgresConnection) and connection.mode == "write":
             details = f", separate write role: {'yes' if connection.write_dsn is not None else 'no'}"
-        elif isinstance(connection, PrometheusConnection):
-            details = f", auth: {connection.auth.type}, extra headers: {len(connection.headers)}"
+        elif isinstance(connection, HttpConnection):
+            tenant = ""
+            if isinstance(connection, LokiConnection):
+                tenant = f", tenant: {'yes' if connection.tenant is not None else 'no'}"
+            details = f", auth: {connection.auth.type}{tenant}, extra headers: {len(connection.headers)}"
         lines.append(f"  - {name}: {connection.kind}, mode={connection.mode}{details}{description}")
     return "\n".join(lines)
 

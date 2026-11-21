@@ -8,16 +8,10 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from ratatoskr.backends.errors import BackendError
+from ratatoskr.backends.output import BlockWriter, cell, error_note, response_budget, truncation_note, with_notes
+from ratatoskr.backends.prometheus.api import SOURCE
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
-from ratatoskr.backends.prometheus.formatting import (
-    BlockWriter,
-    cell,
-    error_note,
-    response_budget,
-    short_time,
-    truncation_note,
-    with_notes,
-)
+from ratatoskr.backends.prometheus.formatting import short_time
 from ratatoskr.backends.timeparse import format_duration
 from ratatoskr.tools.runtime import ToolOutput
 
@@ -46,7 +40,7 @@ async def alerts_overview(backend: PrometheusBackend) -> ToolOutput:
         notes += rules_result.notes
         omitted += rules_result.omitted_notes
     # rows: the alerts shown, as the PostgreSQL tools count the rows they show
-    return ToolOutput(text=with_notes("\n\n".join(sections), notes, omitted=omitted), rows=shown)
+    return ToolOutput(text=with_notes("\n\n".join(sections), notes, source=SOURCE, omitted=omitted), rows=shown)
 
 
 def format_alerts(alerts: list[dict[str, Any]], *, max_items: int, budget: int) -> tuple[str, int]:

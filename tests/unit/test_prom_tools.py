@@ -12,7 +12,6 @@ from ratatoskr.auth.policy import Policy
 from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.backends.base import Backend
 from ratatoskr.backends.http import client as http_client
-from ratatoskr.backends.prometheus import backend as prometheus_backend
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
 from ratatoskr.backends.prometheus.tools import register_prometheus_tools
 from ratatoskr.backends.registry import BackendRegistry
@@ -173,7 +172,6 @@ async def test_a_call_of_two_requests_has_one_deadline(
     prom_api: respx.Router, monkeypatch: pytest.MonkeyPatch, tool: str, first: str, second: str
 ) -> None:
     """Each request answers within the 1s timeout, but the call as a whole does not."""
-    monkeypatch.setattr(prometheus_backend, "TIMEOUT_GRACE_SECONDS", 0.0)
     monkeypatch.setattr(http_client, "TIMEOUT_GRACE_SECONDS", 0.0)
 
     async def slow(request: httpx.Request) -> httpx.Response:

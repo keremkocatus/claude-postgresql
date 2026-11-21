@@ -64,6 +64,95 @@ groups:
 # Nothing listens here: tests for an unreachable Prometheus.
 UNREACHABLE_PROMETHEUS = "http://127.0.0.1:1"
 
+LOKI_IMAGE = "grafana/loki:3.7.9"
+# Single binary, multi-tenant (every request needs X-Scope-OrgID), no usage reports to grafana.com.
+LOKI_CONFIG = """
+auth_enabled: true
+server:
+  http_listen_port: 3100
+  log_level: warn
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+analytics:
+  reporting_enabled: false
+"""
+LOKI_TENANT = "team-a"
+OTHER_TENANT = "team-b"
+LONG_LINE = "x" * 5000
+TRACEBACK = 'Traceback (most recent call last):\n  File "worker.py", line 7\nValueError: bad input'
+# Nothing listens here: tests for an unreachable Loki.
+UNREACHABLE_LOKI = "http://127.0.0.1:1"
+
+
+def loki_sample_streams(now_ns: int) -> list[dict[str, Any]]:
+    """Three streams for tenant LOKI_TENANT, all within the last 30 seconds before *now_ns*."""
+    second = 1_000_000_000
+
+    def at(seconds_ago: int, line: str) -> list[str]:
+        return [str(now_ns - seconds_ago * second), line]
+
+    return [
+        {
+            "stream": {"app": "api", "level": "error", "pod": "api-1"},
+            "values": [at(i + 1, f"error {i} GET /orders 500") for i in range(5)],
+        },
+        {
+            "stream": {"app": "api", "level": "info", "pod": "api-2"},
+            "values": [at(2 * i + 2, f"info {i} GET /health 200") for i in range(3)],
+        },
+        {
+            "stream": {"app": "worker", "level": "info"},
+            "values": [at(3, LONG_LINE), at(4, TRACEBACK), at(5, "login ok for alice password=hunter2")],
+        },
+    ]
+
+
+def seed_loki(url: str, *, timeout: float = 60.0) -> None:
+    """Push the sample streams through the push API, then block until all 11 lines can be queried."""
+    headers = {"X-Scope-OrgID": LOKI_TENANT}
+    deadline = time.monotonic() + timeout
+    with httpx.Client(base_url=url, timeout=5.0, trust_env=False) as client:
+        pushed = client.post(
+            "/loki/api/v1/push", json={"streams": loki_sample_streams(time.time_ns())}, headers=headers
+        )
+        pushed.raise_for_status()
+        while time.monotonic() < deadline:
+            end = time.time() + 1
+            answer = client.get(
+                "/loki/api/v1/query_range",
+                params={"query": '{level=~".+"}', "start": f"{end - 600:.3f}", "end": f"{end:.3f}", "limit": "100"},
+                headers=headers,
+            ).json()
+            if sum(len(stream["values"]) for stream in answer["data"]["result"]) >= 11:
+                return
+            time.sleep(0.5)
+    raise RuntimeError("Loki did not make the pushed lines queryable in time")
+
+
+def make_loki_config(url: str, **values: Any) -> RatatoskrConfig:
+    """Connection 'logs' for the local container (tenant LOKI_TENANT, 10 s timeout); role 'admins' has '*': write."""
+    connection: dict[str, Any] = {"kind": "loki", "url": url, "tenant": LOKI_TENANT, "timeout": "10s", **values}
+    connection = {key: value for key, value in connection.items() if value is not None}
+    return RatatoskrConfig.model_validate({"roles": {"admins": {"*": "write"}}, "connections": {"logs": connection}})
+
 
 def wait_for_prometheus_data(url: str, *, timeout: float = 60.0) -> None:
     """Block until Prometheus holds at least 5 samples of `up` and both test alerts are active."""

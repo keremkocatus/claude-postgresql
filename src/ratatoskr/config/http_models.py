@@ -1,4 +1,4 @@
-"""Config models shared by HTTP-based connection kinds: Prometheus now, Loki in stage 3.
+"""Config models shared by the HTTP-based connection kinds (Prometheus, Loki).
 
 No validation message echoes a value: credentials, header values and URLs may hold secrets.
 """
@@ -6,10 +6,13 @@ No validation message echoes a value: credentials, header values and URLs may ho
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from ratatoskr.config.shared import duration_value
 
 # RFC 9110 token characters.
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -119,3 +122,56 @@ def check_headers(headers: dict[str, SecretStr]) -> dict[str, SecretStr]:
         if any(character in value.get_secret_value() for character in "\r\n\0"):
             raise ValueError(f"headers: the value of {name} contains a line break or NUL")
     return headers
+
+
+class HttpConnection(BaseModel):
+    """What every HTTP connection kind shares; a subclass adds ``kind`` (a ``Literal``), ``limits`` and ``KIND``.
+
+    HTTP kinds are read-only: every tool is a read of the server's HTTP API, so ``write`` would grant nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    KIND: ClassVar[str] = "http"
+
+    description: str = ""
+    mode: Literal["read"] = "read"
+    url: AnyHttpUrl
+    auth: HttpAuth = NoAuth(type="none")
+    headers: dict[str, SecretStr] = {}
+    tls: HttpTlsSettings = HttpTlsSettings()
+    timeout: timedelta = timedelta(seconds=30)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _check_mode(cls, value: Any) -> Any:
+        if value != "read":
+            raise ValueError(f"{cls.KIND} connections are read-only: omit mode or set it to read")
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        return check_base_url(value)
+
+    @field_validator("headers", mode="before")
+    @classmethod
+    def _stringify_headers(cls, value: Any) -> Any:
+        return stringify_header_values(value)
+
+    @field_validator("headers")
+    @classmethod
+    def _check_headers(cls, value: dict[str, SecretStr]) -> dict[str, SecretStr]:
+        return check_headers(value)
+
+    @field_validator("timeout", mode="before")
+    @classmethod
+    def _parse_timeout(cls, value: Any) -> timedelta:
+        return duration_value(value)
+
+    @field_validator("timeout")
+    @classmethod
+    def _check_timeout(cls, value: timedelta) -> timedelta:
+        if not timedelta(seconds=1) <= value <= timedelta(minutes=10):
+            raise ValueError("timeout must be between 1s and 10m")
+        return value

@@ -19,9 +19,9 @@ from ratatoskr.tools.runtime import ToolOutput, ToolRuntime
 HEALTH_TIMEOUT_SECONDS = 15.0
 
 LIST_CONNECTIONS = (
-    "List the data connections you can use: name, kind (postgres or prometheus), description and your access "
-    "level (read or write). Call this first: every other tool takes one of these names as its `connection` "
-    "argument, and pg_* tools need a postgres connection, prom_* tools a prometheus one."
+    "List the data connections you can use: name, kind (postgres, prometheus or loki), description and your "
+    "access level (read or write). Call this first: every other tool takes one of these names as its `connection` "
+    "argument; pg_* tools need a postgres connection, prom_* tools a prometheus one and loki_* tools a loki one."
 )
 CONNECTION_HEALTH = (
     "Check whether connections are reachable: status, round-trip latency and server version. Pass a connection "

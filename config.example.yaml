@@ -2,7 +2,7 @@
 # Secrets never go in this file: reference them as ${ENV_VAR} or ${file:/path/to/secret}.
 # An undefined variable is an error. Validate with:  ratatoskr check-config --config config.yaml
 # Durations accept a number of seconds or "30s", "5m", "1h", "30d".
-# Proxies: outgoing HTTP (OIDC, Prometheus) honours HTTPS_PROXY / HTTP_PROXY; list internal hosts in NO_PROXY.
+# Proxies: outgoing HTTP (OIDC, Prometheus, Loki) honours HTTPS_PROXY / HTTP_PROXY; list internal hosts in NO_PROXY.
 
 server:
   transport: stdio            # stdio (local, Claude Desktop / Code) | streamable-http (remote, OAuth; see below)
@@ -73,6 +73,21 @@ connections:
   #   tls: { verify: true }     # https only; ca_file: /config/certs/prom-ca.pem trusts only that CA
   #   limits: { max_series: 100, max_values: 500, max_points: 1000, max_range: 31d, max_response_bytes: 65536 }
   #   # limits.max_body_bytes: 8388608 (8 MiB read per request; a call holds about 10x this while decoding)
+
+  # logs:                       # Loki HTTP API (see README; tested with Loki 3.7)
+  #   kind: loki                # always read-only (leave mode out); LogQL itself is not restricted
+  #   description: "Production logs"
+  #   url: http://loki:3100     # Loki root (<url>/loki/api/v1/...), or the URL of its gateway
+  #   tenant: ${LOKI_TENANT}    # sent as X-Scope-OrgID (multi-tenant Loki); several tenants: a|b. Not under headers
+  #   auth:                     # none (default) | basic (username, password) | bearer (token)
+  #     type: basic
+  #     username: ${LOKI_USER}
+  #     password: ${LOKI_PASSWORD}
+  #   timeout: 30s              # one deadline per tool call: timeout + 5s
+  #   tls: { verify: true }     # https only; ca_file: /config/certs/loki-ca.pem trusts only that CA
+  #   limits: { max_lines: 500, max_line_bytes: 2048, max_range: 24h, max_response_bytes: 65536 }
+  #   # limits also: max_series 100 and max_points 1000 (metric queries), max_values 500 (label lists),
+  #   # max_query_length 20000, max_body_bytes 8388608 (8 MiB read per request)
 
   # staging-db:
   #   kind: postgres

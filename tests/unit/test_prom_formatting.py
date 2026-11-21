@@ -1,19 +1,19 @@
 import pytest
 
 from ratatoskr.backends.errors import BackendQueryError
-from ratatoskr.backends.prometheus.formatting import (
+from ratatoskr.backends.output import (
     SIDE_NOTE_BYTES,
     BlockWriter,
     cell,
     clip_bytes,
     error_note,
-    format_instant,
     response_budget,
-    short_time,
     truncation_note,
     with_notes,
 )
-from ratatoskr.backends.prometheus.series import QueryResult, Series, parse_result, series_name
+from ratatoskr.backends.prometheus.api import SERIES_HINT
+from ratatoskr.backends.prometheus.formatting import format_instant, short_time
+from ratatoskr.backends.series import LABEL_NAME_RE, QueryResult, Series, parse_result, series_name
 from tests.unit.prom_helpers import NOW, TS, matrix, vector
 
 
@@ -37,6 +37,11 @@ def test_unreadable_results(data: object) -> None:
         parse_result(data)
 
 
+def test_label_names() -> None:
+    names = ("job", "__name__", "_x1", "1x", "a-b", "")
+    assert [bool(LABEL_NAME_RE.match(name)) for name in names] == [True, True, True, False, False, False]
+
+
 def test_series_name() -> None:
     assert series_name({"__name__": "up", "job": "a", "instance": "h:9100"}) == 'up{job="a", instance="h:9100"}'
     assert series_name({"__name__": "up"}) == "up"
@@ -52,8 +57,8 @@ def test_block_writer_keeps_the_first_block_and_stops_at_the_budget() -> None:
 
 
 def test_truncation_note_reasons() -> None:
-    assert truncation_note(3, 3, 100) == ""
-    assert "the limit is 2" in truncation_note(2, 3, 2)
+    assert truncation_note(3, 3, 100, hint=SERIES_HINT) == ""
+    assert "the limit is 2" in truncation_note(2, 3, 2, hint=SERIES_HINT)
     assert "the response size limit was reached" in truncation_note(1, 3, 2, unit="metrics", hint="Narrow.")
     assert truncation_note(1, 3, 2, unit="metrics", hint="Narrow.").endswith(
         "3 metrics: the response size limit was reached. Narrow.]"
@@ -63,8 +68,9 @@ def test_truncation_note_reasons() -> None:
 def test_helpers() -> None:
     assert response_budget(65536) == 65536 - 2048
     assert response_budget(1024) == 512
-    assert with_notes("x", []) == "x"
-    assert with_notes("x", ["warning: a"]) == "x\n\nNotes from Prometheus:\n- warning: a"
+    assert with_notes("x", [], source="Loki") == "x"
+    assert with_notes("x", ["warning: a"], source="Prometheus") == "x\n\nNotes from Prometheus:\n- warning: a"
+    assert with_notes("x", [], source="Loki", omitted=2) == "x\n\nNotes from Loki:\n- ... and 2 more"
     assert cell("a|b\nc") == "a\\|b c"
     assert cell("z" * 400).endswith("…")
     assert short_time("2026-11-22T09:12:00.123456789Z") == "2026-11-22T09:12:00Z"

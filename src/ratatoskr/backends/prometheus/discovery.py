@@ -2,25 +2,18 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from ratatoskr.backends.errors import BackendError, BackendQueryError, InvalidRequestError
 from ratatoskr.backends.limits import clip_input
+from ratatoskr.backends.output import BlockWriter, cell, error_note, response_budget, truncation_note, with_notes
+from ratatoskr.backends.prometheus.api import SOURCE
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
-from ratatoskr.backends.prometheus.formatting import (
-    BlockWriter,
-    cell,
-    error_note,
-    response_budget,
-    truncation_note,
-    with_notes,
-)
+from ratatoskr.backends.series import LABEL_NAME_RE
 from ratatoskr.backends.timeparse import TimeRange, format_time, resolve_range, unix_seconds
 from ratatoskr.config.prometheus_models import PrometheusLimits
 from ratatoskr.tools.runtime import ToolOutput
 
-LABEL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HELP_CHARS = 160
 METRICS_HINT = "Pass name_contains or match to narrow the list."
 VALUES_HINT = 'Pass a match selector such as {job="api"} or a shorter time range.'
@@ -63,7 +56,7 @@ async def list_metrics(
     text = writer.text() + truncation_note(shown, len(names), limits.max_values, unit="metrics", hint=METRICS_HINT)
     if metadata_note:
         text += f"\n\n{metadata_note}"
-    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, source=SOURCE, omitted=result.omitted_notes), rows=shown)
 
 
 async def label_values(
@@ -95,7 +88,7 @@ async def label_values(
             break
     shown = writer.kept - 1
     text = writer.text() + truncation_note(shown, len(values), limits.max_values, unit="values", hint=VALUES_HINT)
-    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, source=SOURCE, omitted=result.omitted_notes), rows=shown)
 
 
 def _strings(data: Any) -> list[str]:

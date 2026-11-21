@@ -1,7 +1,7 @@
 [project]
 name = "ratatoskr-mcp"
 dynamic = ["version"]
-description = "Ratatoskr: a secure, multi-connection MCP server that lets Claude query PostgreSQL and Prometheus."
+description = "Ratatoskr: a secure, multi-connection MCP server that lets Claude query PostgreSQL, Prometheus and Loki."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -79,7 +79,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-m 'not integration'"
-markers = ["integration: needs Docker; starts PostgreSQL and Prometheus containers via testcontainers"]
+markers = ["integration: needs Docker; starts PostgreSQL, Prometheus and Loki containers via testcontainers"]
 
 [tool.mypy]
 python_version = "3.12"

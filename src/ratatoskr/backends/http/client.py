@@ -7,10 +7,11 @@ name only the connection, and the details go to the log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import ssl
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -95,6 +96,18 @@ class HttpClient:
                 limits=httpx.Limits(max_connections=MAX_CONNECTIONS, max_keepalive_connections=MAX_CONNECTIONS),
                 follow_redirects=False,
             )
+
+    @contextlib.asynccontextmanager
+    async def deadline(self) -> AsyncIterator[None]:
+        """One deadline for a whole tool call, which may send several requests (names, then metadata): the
+        connection's timeout plus the same grace a single request gets."""
+        try:
+            async with asyncio.timeout(self.timeout + TIMEOUT_GRACE_SECONDS):
+                yield
+        except TimeoutError:
+            raise BackendTimeoutError(
+                f"Connection '{self._connection}' did not answer within {self.timeout:.0f}s."
+            ) from None
 
     async def aclose(self) -> None:
         self._closed = True

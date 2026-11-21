@@ -2,8 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from ratatoskr.config.http_models import BearerAuth
+from ratatoskr.config.http_models import BasicAuth, BearerAuth
 from ratatoskr.config.loader import load_config
+from ratatoskr.config.loki_models import LokiConnection
 from ratatoskr.config.prometheus_models import PrometheusConnection
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config.example.yaml"
@@ -36,7 +37,7 @@ def test_commented_write_connection_example_is_valid(tmp_path: Path) -> None:
 def test_commented_prometheus_connection_example_is_valid(tmp_path: Path) -> None:
     lines = EXAMPLE.read_text(encoding="utf-8").splitlines()
     start = next(index for index, line in enumerate(lines) if line.startswith("  # metrics:"))
-    stop = lines.index("  # staging-db:")
+    stop = next(index for index, line in enumerate(lines) if line.startswith("  # logs:"))
     block = [line.replace("  # ", "  ", 1) for line in lines[start:stop] if line.startswith("  # ")]
     path = tmp_path / "config.yaml"
     path.write_text("\n".join(lines[:start] + block) + "\n", encoding="utf-8")
@@ -47,6 +48,28 @@ def test_commented_prometheus_connection_example_is_valid(tmp_path: Path) -> Non
     assert isinstance(metrics.auth, BearerAuth)
     assert metrics.headers["X-Scope-OrgID"].get_secret_value() == "team-a"
     assert (metrics.limits.max_series, metrics.limits.max_points) == (100, 1000)
+
+
+def test_commented_loki_connection_example_is_valid(tmp_path: Path) -> None:
+    lines = EXAMPLE.read_text(encoding="utf-8").splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("  # logs:"))
+    stop = lines.index("  # staging-db:")
+    block = [line.replace("  # ", "  ", 1) for line in lines[start:stop] if line.startswith("  # ")]
+    path = tmp_path / "config.yaml"
+    path.write_text("\n".join(lines[:start] + block) + "\n", encoding="utf-8")
+    env = {
+        "APP_DB_DSN": "postgresql://reader:pw@localhost/app",
+        "LOKI_TENANT": "team-a",
+        "LOKI_USER": "123456",
+        "LOKI_PASSWORD": "loki-password",
+    }
+    logs = load_config(path, env=env).connections["logs"]
+    assert isinstance(logs, LokiConnection)
+    assert logs.mode == "read"
+    assert isinstance(logs.auth, BasicAuth)
+    assert logs.tenant is not None and logs.tenant.get_secret_value() == "team-a"
+    limits = logs.limits
+    assert (limits.max_lines, limits.max_line_bytes, limits.max_range.total_seconds()) == (500, 2048, 86400)
 
 
 def _uncomment_http(lines: list[str], *, oidc: bool) -> list[str]:

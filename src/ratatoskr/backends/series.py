@@ -1,12 +1,17 @@
-"""Parse Prometheus query results into small typed values; render series names the way PromQL writes them."""
+"""Parse query results in the Prometheus data format (Prometheus, and Loki's metric queries) into small typed
+values; render series names the way PromQL and LogQL write them."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from ratatoskr.backends.errors import BackendQueryError
+
+# Label names in the Prometheus data model; UTF-8 names (Prometheus 3, quoted) are out of scope.
+LABEL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 Sample = tuple[float, str]  # (unix time, value exactly as Prometheus wrote it: "1", "0.25", "NaN", "+Inf")
 HistogramSample = tuple[float, dict[str, Any]]  # native histogram: count, sum, buckets
@@ -75,7 +80,7 @@ def _histogram(point: Any) -> HistogramSample:
 
 
 def _unreadable() -> BackendQueryError:
-    return BackendQueryError("Prometheus returned a result in a shape Ratatoskr cannot read.")
+    return BackendQueryError("The server returned a result in a shape Ratatoskr cannot read.")
 
 
 def series_name(labels: Mapping[str, str]) -> str:

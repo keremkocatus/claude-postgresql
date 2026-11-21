@@ -7,12 +7,15 @@ from testcontainers.core.wait_strategies import HttpWaitStrategy
 
 from ratatoskr.config.models import RatatoskrConfig
 from tests.integration.helpers import (
+    LOKI_CONFIG,
+    LOKI_IMAGE,
     PROMETHEUS_CONFIG,
     PROMETHEUS_IMAGE,
     PROMETHEUS_RULES,
     MakeHarness,
     ToolHarness,
     seed,
+    seed_loki,
     wait_for_prometheus_data,
 )
 
@@ -40,6 +43,22 @@ def prometheus_url() -> Iterator[str]:
     with container:
         url = f"http://127.0.0.1:{container.get_exposed_port(9090)}"
         wait_for_prometheus_data(url)
+        yield url
+
+
+@pytest.fixture(scope="session")
+def loki_url() -> Iterator[str]:
+    """URL of a throwaway multi-tenant Loki bound to 127.0.0.1, with the sample streams pushed for LOKI_TENANT."""
+    container = (
+        DockerContainer(LOKI_IMAGE)
+        .with_copy_into_container(LOKI_CONFIG.encode(), "/etc/loki/test.yaml")
+        .with_command("-config.file=/etc/loki/test.yaml")
+        .waiting_for(HttpWaitStrategy(3100, "/ready").for_status_code(200))
+    )
+    container.ports["3100"] = ("127.0.0.1", None)  # random host port, loopback only
+    with container:
+        url = f"http://127.0.0.1:{container.get_exposed_port(3100)}"
+        seed_loki(url)
         yield url
 
 

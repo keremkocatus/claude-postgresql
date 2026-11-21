@@ -2,9 +2,9 @@ from typing import Any
 
 import respx
 
+from ratatoskr.backends.output import NOTE_RESERVE_BYTES
 from ratatoskr.backends.prometheus import alerts
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
-from ratatoskr.backends.prometheus.formatting import NOTE_RESERVE_BYTES
 from tests.unit.prom_helpers import api_error, make_backend, success
 
 ALERTS = {

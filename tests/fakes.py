@@ -18,7 +18,8 @@ def make_config(
 ) -> RatatoskrConfig:
     """A valid config; connections default to one read-mode 'main' connection.
 
-    Connections are PostgreSQL unless their values say ``kind: prometheus`` (then they get a fake URL).
+    Connections are PostgreSQL unless their values say ``kind: prometheus`` or ``kind: loki`` (then they get a
+    fake URL).
     """
     if connections is None:
         connections = {"main": {"mode": "read"}}
@@ -33,6 +34,8 @@ def make_config(
 def _connection(name: str, values: dict[str, Any]) -> dict[str, Any]:
     if values.get("kind") == "prometheus":
         return {"url": f"http://{name}.prometheus.internal:9090", **values}
+    if values.get("kind") == "loki":
+        return {"url": f"http://{name}.loki.internal:3100", **values}
     return {"kind": "postgres", "dsn": f"postgresql://u:secret@db.internal/{name}", **values}
 
 

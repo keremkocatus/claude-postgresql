@@ -1,4 +1,5 @@
-"""Range results as per-series summaries (points, min, max, avg, last) plus evenly spaced sample points."""
+"""Range results as per-series summaries (points, min, max, avg, last) plus evenly spaced sample points; used for
+Prometheus range queries and Loki metric queries."""
 
 from __future__ import annotations
 
@@ -7,8 +8,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from ratatoskr.backends.prometheus.formatting import BlockWriter, truncation_note
-from ratatoskr.backends.prometheus.series import QueryResult, Sample, Series, histogram_text, series_name
+from ratatoskr.backends.output import BlockWriter, truncation_note
+from ratatoskr.backends.series import QueryResult, Sample, Series, histogram_text, series_name
 
 MIN_SAMPLES = 6
 MAX_SAMPLES = 60
@@ -113,12 +114,20 @@ def series_block(series: Series, *, expected: int | None, samples: int, same_day
 
 
 def format_matrix(
-    result: QueryResult, *, header: str, expected: int | None, same_day: bool, max_series: int, budget: int
+    result: QueryResult,
+    *,
+    header: str,
+    expected: int | None,
+    same_day: bool,
+    max_series: int,
+    budget: int,
+    hint: str,
+    no_data: str,
 ) -> tuple[str, int]:
-    """Text and number of series shown. *expected* is the number of steps in the range (None: raw samples)."""
+    """Text and number of series shown. *expected* is the number of steps in the range (None: raw samples);
+    *hint* ends the note when series are left out, *no_data* follows the header when there are none."""
     total = result.total
     if total == 0:
-        no_data = "No series had data in this window: check metric and label names with prom_list_metrics."
         return f"{header}\n{no_data}", 0
     writer = BlockWriter(budget)
     writer.add(header)
@@ -127,4 +136,4 @@ def format_matrix(
         if not writer.add(series_block(series, expected=expected, samples=samples, same_day=same_day)):
             break
     shown = writer.kept - 1
-    return writer.text() + truncation_note(shown, total, max_series), shown
+    return writer.text() + truncation_note(shown, total, max_series, hint=hint), shown

@@ -6,22 +6,17 @@ user-safe "unavailable" error rather than at startup.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
-import logging
-import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, ClassVar
 
 from ratatoskr.backends.base import ConnectionInfo, HealthResult
-from ratatoskr.backends.errors import BackendError, BackendTimeoutError
-from ratatoskr.backends.http.client import TIMEOUT_GRACE_SECONDS, EndpointNotFoundError, HttpClient
+from ratatoskr.backends.http.client import EndpointNotFoundError, HttpClient
+from ratatoskr.backends.http.health import timed_health
 from ratatoskr.backends.prometheus.api import PrometheusApi
 from ratatoskr.backends.timeparse import unix_seconds, utc_now
 from ratatoskr.config.prometheus_models import PrometheusConnection, PrometheusLimits
-
-logger = logging.getLogger("ratatoskr.backends.prometheus")
 
 
 class PrometheusBackend:
@@ -57,31 +52,15 @@ class PrometheusBackend:
     async def open(self) -> None:
         await self._client.open()
 
-    @contextlib.asynccontextmanager
-    async def deadline(self) -> AsyncIterator[None]:
-        """One deadline for a whole tool call, which may send several requests (names, then metadata): the
-        connection's timeout plus the same grace a single request gets."""
-        seconds = self._client.timeout
-        try:
-            async with asyncio.timeout(seconds + TIMEOUT_GRACE_SECONDS):
-                yield
-        except TimeoutError:
-            raise BackendTimeoutError(f"Connection '{self.name}' did not answer within {seconds:.0f}s.") from None
+    def deadline(self) -> contextlib.AbstractAsyncContextManager[None]:
+        """One deadline for a whole tool call, which may send several requests (see ``HttpClient.deadline``)."""
+        return self._client.deadline()
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def health(self) -> HealthResult:
-        started = time.perf_counter()
-        try:
-            version = await self._version()
-        except BackendError as exc:
-            return HealthResult(ok=False, latency_ms=None, version=None, error=str(exc))
-        except Exception as exc:
-            logger.warning("health check of %s failed", self.name, exc_info=True)
-            return HealthResult(ok=False, latency_ms=None, version=None, error=type(exc).__name__)
-        latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        return HealthResult(ok=True, latency_ms=latency_ms, version=version, error=None)
+        return await timed_health(self.name, self._version)
 
     async def _version(self) -> str:
         """``Prometheus <version>`` from buildinfo; servers without that endpoint are probed with a query."""

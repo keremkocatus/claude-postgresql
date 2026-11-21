@@ -1,5 +1,6 @@
+from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 import pytest
 from pydantic import AnyHttpUrl, BaseModel, SecretStr, ValidationError
@@ -8,6 +9,7 @@ from ratatoskr.config.http_models import (
     BasicAuth,
     BearerAuth,
     HttpAuth,
+    HttpConnection,
     HttpTlsSettings,
     NoAuth,
     check_base_url,
@@ -108,3 +110,22 @@ def test_header_rules_never_echo_values(headers: dict[str, str], expected: str) 
 def test_valid_headers_pass() -> None:
     headers = {"X-Scope-OrgID": SecretStr("team-a"), "X-Api-Key": SecretStr(SECRET)}
     assert check_headers(headers) == headers
+
+
+class _DemoConnection(HttpConnection):
+    KIND: ClassVar[str] = "demo"
+
+    kind: Literal["demo"]
+
+
+def test_http_connection_base_shares_fields_and_checks() -> None:
+    connection = _DemoConnection.model_validate(
+        {"kind": "demo", "url": "http://demo:80", "headers": {"X-A": 1}, "timeout": "1m"}
+    )
+    assert (connection.mode, connection.auth.type, connection.tls.verify) == ("read", "none", True)
+    assert connection.headers["X-A"].get_secret_value() == "1"
+    assert connection.timeout == timedelta(minutes=1)
+    with pytest.raises(ValidationError, match="demo connections are read-only: omit mode or set it to read"):
+        _DemoConnection.model_validate({"kind": "demo", "url": "http://demo:80", "mode": "write"})
+    with pytest.raises(ValidationError, match="timeout must be between 1s and 10m"):
+        _DemoConnection.model_validate({"kind": "demo", "url": "http://demo:80", "timeout": "11m"})

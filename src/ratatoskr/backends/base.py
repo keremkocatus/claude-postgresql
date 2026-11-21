@@ -1,4 +1,4 @@
-"""The protocol every backend kind (postgres, later prometheus and loki) implements."""
+"""The protocol every backend kind (postgres, prometheus, loki) implements."""
 
 from __future__ import annotations
 

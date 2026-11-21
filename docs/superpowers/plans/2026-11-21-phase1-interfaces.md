@@ -417,3 +417,26 @@ aynen kullanır:
   sonra, backend açılmadan önce kontrol edilir (yasak bağlantı yine "not found").
 - `observability/logging.py`: `httpx` logger'ı `log_level: INFO` iken WARNING (istek satırları iç host ve
   `match[]` seçicilerini taşır; PromQL POST gövdesinde gider).
+
+## Aşama 3 (Loki) ekleri
+
+Plan: `docs/superpowers/plans/2026-11-22-phase3-loki.md`. Sözleşmeyi bozmadan eklenenler:
+
+- `config/http_models.py`: `HttpConnection` (HTTP türlerinin ortak tabanı: `description`, `mode: Literal["read"]`, `url`,
+  `auth`, `headers`, `tls`, `timeout` ve doğrulayıcıları; alt sınıf `KIND`, `kind` ve `limits` ekler).
+  `PrometheusConnection` artık bundan türer. `config/shared.py`: `check_max_range`.
+- `config/loki_models.py`: `LokiLimits(max_lines=500 (≤5000), max_line_bytes=2048, max_series=100, max_values=500,
+  max_points=1000, max_range=24h, max_query_length=20000, max_response_bytes=65536, max_body_bytes=8 MiB)`,
+  `LokiConnection(kind="loki", ..., tenant: SecretStr | None)`; `tenant` → `X-Scope-OrgID`, `headers` altında bu başlık
+  reddedilir. `ConnectionConfig` birliği `PostgresConnection | PrometheusConnection | LokiConnection`.
+- Paylaşılan çıktı parçaları `backends/prometheus/` dışına taşındı: `backends/output.py` (`BlockWriter`, `MAX_NOTES`,
+  `NOTE_RESERVE_BYTES`, `response_budget`, `truncation_note(..., hint=)` (hint zorunlu), `with_notes(..., source=)`,
+  `error_note`, `clip_bytes`, `cell`), `backends/series.py` (`parse_result`, `series_name`, `LABEL_NAME_RE`),
+  `backends/summarize.py` (`format_matrix(..., hint=, no_data=)`).
+- `backends/http/`: `HttpClient.deadline()` (çağrı başına tek deadline; `PrometheusBackend.deadline()` ve
+  `LokiBackend.deadline()` bunu döndürür), `envelope.py` (`ApiResult`, `decode_json`, `success_result`,
+  `scrub_server_text`), `health.py` (`timed_health`).
+- `backends/loki/`: `LokiApi` (yalnız query_range (POST), labels, label values, buildinfo), `LokiBackend`, `streams.py`,
+  `formatting.py`, `querying.py`, `discovery.py`, `descriptions.py`, `tools.py` (`register_loki_tools`). Araçlar:
+  `loki_query(connection, logql, start?, end?, limit?, direction?, step?)`, `loki_labels(connection, selector?, start?,
+  end?)`, `loki_label_values(connection, label, selector?, start?, end?)`; toplam 19 araç.

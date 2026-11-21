@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 
 from ratatoskr.backends.errors import BackendQueryError, InvalidRequestError
+from ratatoskr.backends.output import response_budget, with_notes
+from ratatoskr.backends.prometheus.api import SERIES_HINT, SOURCE
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
-from ratatoskr.backends.prometheus.formatting import format_instant, response_budget, with_notes
-from ratatoskr.backends.prometheus.series import parse_result
-from ratatoskr.backends.prometheus.summarize import format_matrix
+from ratatoskr.backends.prometheus.formatting import format_instant
+from ratatoskr.backends.series import parse_result
+from ratatoskr.backends.summarize import format_matrix
 from ratatoskr.backends.timeparse import (
     format_duration,
     format_time,
@@ -21,6 +23,8 @@ from ratatoskr.backends.timeparse import (
 )
 from ratatoskr.config.prometheus_models import PrometheusLimits
 from ratatoskr.tools.runtime import ToolOutput
+
+NO_DATA = "No series had data in this window: check metric and label names with prom_list_metrics."
 
 
 def check_promql(promql: str, limits: PrometheusLimits) -> str:
@@ -47,11 +51,18 @@ async def instant_query(backend: PrometheusBackend, promql: str, time: str | Non
     if parsed.result_type == "matrix":  # a range vector selector such as up[5m]: raw samples
         header = f"matrix: {parsed.total} series of raw samples up to {format_time(at)} (times are UTC)"
         text, shown = format_matrix(
-            parsed, header=header, expected=None, same_day=False, max_series=limits.max_series, budget=budget
+            parsed,
+            header=header,
+            expected=None,
+            same_day=False,
+            max_series=limits.max_series,
+            budget=budget,
+            hint=SERIES_HINT,
+            no_data=NO_DATA,
         )
     else:
         text, shown = format_instant(parsed, at=at, max_series=limits.max_series, budget=budget)
-    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, source=SOURCE, omitted=result.omitted_notes), rows=shown)
 
 
 async def range_query(
@@ -79,5 +90,7 @@ async def range_query(
         same_day=window.start.date() == window.end.date(),
         max_series=limits.max_series,
         budget=response_budget(limits.max_response_bytes),
+        hint=SERIES_HINT,
+        no_data=NO_DATA,
     )
-    return ToolOutput(text=with_notes(text, result.notes, omitted=result.omitted_notes), rows=shown)
+    return ToolOutput(text=with_notes(text, result.notes, source=SOURCE, omitted=result.omitted_notes), rows=shown)

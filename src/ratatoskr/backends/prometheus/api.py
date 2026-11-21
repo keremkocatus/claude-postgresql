@@ -2,39 +2,28 @@
 
 Only read endpoints are called: query, query_range, label values, metadata, alerts, rules and buildinfo. The admin
 and write APIs (``/api/v1/admin/*``, remote write, ``/-/reload``) are not reachable through this module. Server
-messages (errors, warnings) are passed on after :func:`scrub_upstream_text` removes addresses from them and
-:func:`redact` masks secrets.
+messages (errors, warnings) are passed on after :func:`scrub_server_text` removes addresses and masks secrets.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Iterable
-from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import quote
 
 from ratatoskr.backends.errors import BackendError, BackendQueryError, BackendTimeoutError, BackendUnavailableError
-from ratatoskr.backends.http.client import Fields, HttpClient, HttpReply, parse_json, status_error
-from ratatoskr.backends.http.scrub import scrub_upstream_text
-from ratatoskr.observability.redact import redact
+from ratatoskr.backends.http.client import Fields, HttpClient, HttpReply, status_error
+from ratatoskr.backends.http.envelope import ApiResult, decode_json, scrub_server_text, success_result
 
+SOURCE = "Prometheus"  # names the server in "Notes from ..."
 SERIES_HINT = "Select fewer series with label matchers, or aggregate (sum by (...), topk(10, ...))."
 VALUES_HINT = 'Pass a match selector such as {job="api"}, or a shorter time range.'
-MAX_NOTES = 5  # server notes (warnings, infos) shown per answer; the rest are counted
 _TIMEOUT_ERROR_TYPES = frozenset({"timeout", "canceled"})
 _KNOWN_ERROR_TYPES = _TIMEOUT_ERROR_TYPES | {"bad_data", "execution", "internal", "unavailable", "not_found"}
 ERROR_TYPE_CHARS = 40  # errorType is a short keyword; anything else from the server is scrubbed and cut
 
 logger = logging.getLogger("ratatoskr.backends.prometheus")
-
-
-@dataclass(frozen=True)
-class ApiResult:
-    data: Any
-    notes: list[str] = field(default_factory=list)  # the first scrubbed warnings and infos from the server
-    omitted_notes: int = 0  # further warnings and infos, counted but not shown
 
 
 class PrometheusApi:
@@ -47,7 +36,7 @@ class PrometheusApi:
 
     def scrub(self, text: str) -> str:
         """Server text (errors, warnings, rule errors) as it may be shown: no addresses, no secrets."""
-        return redact(scrub_upstream_text(text, hosts=self._hosts))
+        return scrub_server_text(text, hosts=self._hosts)
 
     async def query(self, promql: str, time: str) -> ApiResult:
         form = {"query": promql, "time": time, "timeout": self._eval_timeout}
@@ -86,21 +75,11 @@ class PrometheusApi:
         hint: str = "",
     ) -> ApiResult:
         reply = await self._client.request(method, path, params=params, form=form, too_large_hint=hint)
-        payload = await asyncio.to_thread(parse_json, reply.body)  # the C decoder holds the GIL (~20 ms/MiB loop stall)
-        if reply.status == 200 and isinstance(payload, dict) and payload.get("status") == "success":
-            notes, omitted = self._notes(payload)
-            return ApiResult(data=payload.get("data"), notes=notes, omitted_notes=omitted)
+        payload = await decode_json(reply.body)
+        result = success_result(reply.status, payload, self.scrub)
+        if result is not None:
+            return result
         raise self._error(reply, payload, path)
-
-    def _notes(self, payload: dict[str, Any]) -> tuple[list[str], int]:
-        """The first MAX_NOTES warnings and infos, scrubbed, and the number of the others."""
-        found: list[tuple[str, Any]] = []
-        for key, label in (("warnings", "warning"), ("infos", "info")):
-            values = payload.get(key)
-            if isinstance(values, list):
-                found += [(label, value) for value in values]
-        notes = [f"{label}: {self.scrub(str(value))}" for label, value in found[:MAX_NOTES]]
-        return notes, len(found) - len(notes)
 
     def _error(self, reply: HttpReply, payload: Any, path: str) -> BackendError:
         if isinstance(payload, dict) and payload.get("status") == "error":

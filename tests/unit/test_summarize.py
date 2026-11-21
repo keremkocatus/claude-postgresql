@@ -1,7 +1,7 @@
 import math
 
-from ratatoskr.backends.prometheus.series import Series, parse_result
-from ratatoskr.backends.prometheus.summarize import (
+from ratatoskr.backends.series import Series, parse_result
+from ratatoskr.backends.summarize import (
     format_matrix,
     number,
     sample_indexes,
@@ -62,19 +62,30 @@ def test_series_block_across_days_shows_the_date() -> None:
 def test_format_matrix_caps_series() -> None:
     result = parse_result(matrix(*(({"i": str(i)}, [(TS, "1")]) for i in range(5))))
     text, shown = format_matrix(
-        result, header="matrix: 5 series", expected=1, same_day=True, max_series=2, budget=10_000
+        result,
+        header="matrix: 5 series",
+        expected=1,
+        same_day=True,
+        max_series=2,
+        budget=10_000,
+        hint="Aggregate.",
+        no_data="-",
     )
     assert text.startswith('matrix: 5 series\n{i="0"}\n  1 points, min 1, max 1, avg 1, last 1 at 10:00:00')
     assert shown == 2
-    assert "[Showing 2 of 5 series: the limit is 2." in text
+    assert text.endswith("[Showing 2 of 5 series: the limit is 2. Aggregate.]")
 
 
 def test_format_matrix_empty() -> None:
     text, shown = format_matrix(
-        parse_result(matrix()), header="matrix: 0 series", expected=121, same_day=True, max_series=100, budget=1000
+        parse_result(matrix()),
+        header="matrix: 0 series",
+        expected=121,
+        same_day=True,
+        max_series=100,
+        budget=1000,
+        hint="Aggregate.",
+        no_data="No series had data in this window.",
     )
-    assert (
-        text
-        == "matrix: 0 series\nNo series had data in this window: check metric and label names with prom_list_metrics."
-    )
+    assert text.splitlines() == ["matrix: 0 series", "No series had data in this window."]
     assert shown == 0

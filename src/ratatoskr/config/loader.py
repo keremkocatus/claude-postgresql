@@ -20,7 +20,7 @@ from ratatoskr.config.models import RatatoskrConfig
 
 _REFERENCE_RE = re.compile(r"\$\{([^}]*)\}")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_KIND_TAGS = frozenset({"postgres", "prometheus"})
+_KIND_TAGS = frozenset({"postgres", "prometheus", "loki"})
 
 
 class ConfigError(Exception):
