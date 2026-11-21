@@ -277,3 +277,11 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   sabit yollar `/login`, `/oauth/callback`, `/healthz`, `/readyz`; varsayılan scope `mcp`; `secret_key` en az
   32 karakter; `public_url` yolsuz origin. `config.models.AuthSettings` ile MCP'nin `AuthSettings`'i aynı adda —
   import alias'ı kullanılır.
+
+## 1b uygulanırken dikkate alınacak review notları
+
+- Uvicorn'un varsayılan `LOGGING_CONFIG`'i `uvicorn` ve `uvicorn.access` logger'larına kendi handler'larını verir
+  (`propagate: False`); bu satırlar maskeleyen kök handler'ı atlar. `serve_http` uvicorn'u `log_config=None` ile
+  başlatmalı (ya da bu handler'ları temizlemeli) ve bunu bir testle doğrulamalı.
+- `setup_logging` kök handler'ları değiştirir; `tests/unit/conftest.py` her testten sonra geri yükler. HTTP testleri
+  de bu fixture'a güvenir.
