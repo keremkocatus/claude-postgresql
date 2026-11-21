@@ -23,6 +23,7 @@ from starlette.applications import Starlette
 from ratatoskr.app import build_app
 from ratatoskr.auth.crypto import Keyring
 from ratatoskr.auth.csrf import CsrfProtector
+from ratatoskr.auth.identity.base import ExternalLogin, UpstreamUnavailableError
 from ratatoskr.auth.identity.oidc import OidcIdentityProvider
 from ratatoskr.auth.oauth_server import RatatoskrOAuthProvider
 from ratatoskr.auth.ratelimit import LOGIN_RULE, REGISTER_RULE, RateLimiter
@@ -30,7 +31,7 @@ from ratatoskr.auth.resolver import TokenPrincipalResolver
 from ratatoskr.auth.web import CALLBACK_PATH, LoginRoutes
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.loader import ConfigError
-from ratatoskr.config.models import RatatoskrConfig
+from ratatoskr.config.models import OidcSettings, RatatoskrConfig
 from ratatoskr.observability.audit import CompositeAuditSink, LogAuditSink
 from ratatoskr.observability.health import HealthRoutes
 from ratatoskr.state.audit import SqliteAuditSink
@@ -64,47 +65,57 @@ class HttpApp:
     registry: BackendRegistry
 
 
-class _LazyTransport(httpx.AsyncBaseTransport):
-    """Creates the real transport (connection pool, TLS context) on the first request.
+class _RunningOidc:
+    """The OIDC identity provider, which exists (with its upstream HTTP client) only while the app runs.
 
-    The upstream client is built with the app but used only while the app runs, and the lifespan closes it. A client
-    built by a ``build_http_app`` call that then fails, or by an app that is never started, has opened nothing and
-    leaves nothing behind.
+    The routes and the OAuth provider are wired at build time to this object; :meth:`running` (entered by the app's
+    lifespan) creates the ``httpx.AsyncClient`` with httpx's own transport, so ``HTTPS_PROXY``/``HTTP_PROXY``/
+    ``NO_PROXY`` are honoured, builds the :class:`OidcIdentityProvider` on it and closes the client on the way out.
+    Before startup and after shutdown every call fails as "issuer unavailable", which never revokes a session.
     """
 
-    def __init__(self) -> None:
-        self._inner: httpx.AsyncHTTPTransport | None = None
+    def __init__(self, settings: OidcSettings, redirect_uri: str, clock: Clock, *, insecure_dev: bool) -> None:
+        if settings.issuer.scheme != "https" and not insecure_dev:
+            # The provider's own rule, checked here so that the mistake is a ConfigError at build time.
+            raise ConfigError("auth.oidc.issuer must use https (plain http is only possible with --insecure-dev)")
+        self._settings = settings
+        self._redirect_uri = redirect_uri
+        self._clock = clock
+        self._insecure_dev = insecure_dev
+        self._provider: OidcIdentityProvider | None = None
 
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if self._inner is None:
-            self._inner = httpx.AsyncHTTPTransport()
-        return await self._inner.handle_async_request(request)
+    @asynccontextmanager
+    async def running(self) -> AsyncIterator[None]:
+        client = httpx.AsyncClient(timeout=UPSTREAM_HTTP_TIMEOUT_SECONDS, follow_redirects=False)
+        try:
+            try:
+                self._provider = OidcIdentityProvider(
+                    self._settings,
+                    self._redirect_uri,
+                    client,
+                    self._clock,
+                    allow_insecure_http=self._insecure_dev,
+                )
+            except ValueError as exc:  # the message names the setting, never a secret
+                raise ConfigError(str(exc)) from None
+            yield
+        finally:
+            self._provider = None
+            await client.aclose()
 
-    async def aclose(self) -> None:
-        inner, self._inner = self._inner, None
-        if inner is not None:
-            await inner.aclose()
+    def _current(self) -> OidcIdentityProvider:
+        if self._provider is None:
+            raise UpstreamUnavailableError("the OIDC client is not running")
+        return self._provider
 
+    async def authorization_url(self, state: str, nonce: str, code_verifier: str) -> str:
+        return await self._current().authorization_url(state, nonce, code_verifier)
 
-def _upstream_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=_LazyTransport(), timeout=UPSTREAM_HTTP_TIMEOUT_SECONDS, follow_redirects=False)
+    async def complete(self, code: str, code_verifier: str, nonce: str) -> ExternalLogin:
+        return await self._current().complete(code, code_verifier, nonce)
 
-
-def _oidc_provider(
-    settings: HttpSettings, http_client: httpx.AsyncClient, clock: Clock, *, insecure_dev: bool
-) -> OidcIdentityProvider:
-    if settings.auth.oidc is None:
-        raise ConfigError("auth.mode 'oidc' requires the auth.oidc section")
-    try:
-        return OidcIdentityProvider(
-            settings.auth.oidc,
-            settings.public_url + CALLBACK_PATH,
-            http_client,
-            clock,
-            allow_insecure_http=insecure_dev,
-        )
-    except ValueError as exc:  # the message names the setting, never a secret
-        raise ConfigError(str(exc)) from None
+    async def refresh(self, refresh_token: str) -> ExternalLogin:
+        return await self._current().refresh(refresh_token)
 
 
 def build_http_app(
@@ -135,11 +146,11 @@ def build_http_app(
     local = settings.local_provider if settings.auth.mode == "local" else None
     if settings.auth.mode == "local" and local is None:
         raise ConfigError("auth.mode 'local' requires at least one entry in auth.local.users")
-    http_client: httpx.AsyncClient | None = None
-    oidc: OidcIdentityProvider | None = None
+    oidc: _RunningOidc | None = None
     if settings.auth.mode == "oidc":
-        http_client = _upstream_client()
-        oidc = _oidc_provider(settings, http_client, clock, insecure_dev=insecure_dev)
+        if settings.auth.oidc is None:
+            raise ConfigError("auth.mode 'oidc' requires the auth.oidc section")
+        oidc = _RunningOidc(settings.auth.oidc, settings.public_url + CALLBACK_PATH, clock, insecure_dev=insecure_dev)
 
     backends = registry if registry is not None else BackendRegistry(config)
     keyring = Keyring(settings.secret_key)
@@ -200,17 +211,17 @@ def build_http_app(
     @asynccontextmanager
     async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
         # Every release is registered before anything starts, so a failed start releases everything too (each one is
-        # a no-op for what never started). Callbacks run in reverse: the session manager exits first (no session can
-        # use a backend any more), then the registry is closed, then the cleanup task, the audit writer (flushing
-        # what shutdown itself recorded), the upstream HTTP client and finally the store. A failing step does not
-        # skip the ones after it.
+        # a no-op for what never started). Exit runs in reverse: the session manager first (no session can use a
+        # backend or the issuer any more), then the upstream HTTP client, the registry, the cleanup task, the audit
+        # writer (flushing what shutdown itself recorded) and finally the store. A failing step does not skip the
+        # ones after it.
         async with AsyncExitStack() as stack:
             stack.push_async_callback(store.close)
-            if http_client is not None:
-                stack.push_async_callback(http_client.aclose)
             stack.push_async_callback(sqlite_sink.aclose)
             stack.push_async_callback(cleanup.stop)
             stack.push_async_callback(backends.close_all)
+            if oidc is not None:
+                await stack.enter_async_context(oidc.running())
             await store.open()
             sqlite_sink.start()
             cleanup.start()
