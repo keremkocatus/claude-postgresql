@@ -7,7 +7,8 @@ Read enforcement (spec 6.2):
 3. Every read runs inside ``BEGIN READ ONLY`` and is always rolled back.
 
 Session hygiene (both pools): asyncpg's ``RESET ALL`` on release leaves ``role`` and ``session_authorization``
-alone, so the reset query also restores the login identity and drops SQL-level prepared statements. The
+alone, so the reset query also restores the login identity and drops SQL-level prepared statements, temp
+tables and cached sequence state (currval/lastval). The
 client-side statement cache is off, so a user's ``DEALLOCATE ALL`` cannot poison later requests.
 """
 
@@ -40,7 +41,10 @@ CLIENT_TIMEOUT_GRACE_SECONDS = 5.0
 CLOSE_TIMEOUT_SECONDS = 5.0
 READ_ONLY_SQLSTATE = "25006"
 FIRST_CHUNK_ROWS = 10
-SESSION_RESET_SQL = "SET SESSION AUTHORIZATION DEFAULT;\nRESET ROLE;\nDEALLOCATE ALL;\n"
+# DISCARD ALL is not usable: the multi-statement reset runs as an implicit transaction block.
+SESSION_RESET_SQL = (
+    "SET SESSION AUTHORIZATION DEFAULT;\nRESET ROLE;\nDEALLOCATE ALL;\nDISCARD TEMP;\nDISCARD SEQUENCES;\n"
+)
 # SQLSTATEs (or classes) raised while connecting: their text names the user, database or host.
 _UNAVAILABLE_SQLSTATE_PREFIXES = ("08", "28", "3D", "53300", "57P0")
 _TAGGED_VERBS = frozenset({"SELECT", "UPDATE", "DELETE", "MERGE", "FETCH", "MOVE", "COPY"})

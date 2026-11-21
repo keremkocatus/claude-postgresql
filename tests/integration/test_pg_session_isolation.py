@@ -19,6 +19,8 @@ DO $$ BEGIN
 END $$;
 DROP TABLE IF EXISTS isolation_t;
 CREATE TABLE isolation_t (id int PRIMARY KEY);
+DROP SEQUENCE IF EXISTS isolation_seq;
+CREATE SEQUENCE isolation_seq;
 """
 
 
@@ -72,6 +74,18 @@ async def test_identity_change_does_not_survive_the_request(backend: PostgresBac
 async def _introspect(backend: PostgresBackend) -> list[dict[str, object]]:
     async with backend.read_session() as session:
         return await session.fetch("SELECT $1::int AS x", 7)
+
+
+async def test_temp_tables_and_sequence_state_do_not_survive_the_request(backend: PostgresBackend) -> None:
+    _, _, pid = await _write_identity(backend)
+    await backend.execute(
+        [("CREATE TEMP TABLE leak (x int)", []), ("SELECT nextval('isolation_seq')", [])], max_rows=10
+    )
+    [found] = await backend.execute([("SELECT to_regclass('pg_temp.leak') IS NULL, pg_backend_pid()", [])], 10)
+    assert found.rows == [(True, pid)]  # same connection, temp table gone
+    with pytest.raises(BackendQueryError, match="not yet defined in this session"):
+        await backend.execute([("SELECT currval('isolation_seq')", [])], max_rows=10)
+    assert (await _write_identity(backend))[2] == pid
 
 
 async def test_deallocate_all_on_the_read_path_does_not_poison_later_requests(backend: PostgresBackend) -> None:
