@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import ipaddress
 import re
 from datetime import timedelta
 from pathlib import Path
@@ -54,6 +55,9 @@ class ServerSettings(BaseModel):
     allowed_redirect_hosts: list[str] = ["claude.ai", "claude.com", "localhost", "127.0.0.1"]
     stdio_role: str | None = None
     log_level: str = "INFO"
+    # Proxy IPs/CIDRs whose X-Forwarded-For is trusted for client IPs (rate limiting). Empty: never trusted.
+    trusted_proxies: list[str] = []
+    audit_retention: timedelta = timedelta(days=90)
 
     @field_validator("log_level")
     @classmethod
@@ -62,6 +66,18 @@ class ServerSettings(BaseModel):
         if level not in _LOG_LEVELS:
             raise ValueError(f"log_level must be one of {sorted(_LOG_LEVELS)}")
         return level
+
+    @field_validator("audit_retention", mode="before")
+    @classmethod
+    def _parse_audit_retention(cls, value: Any) -> timedelta:
+        return _duration(value)
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _check_trusted_proxies(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            ipaddress.ip_network(entry, strict=False)
+        return value
 
 
 class LocalUser(BaseModel):
