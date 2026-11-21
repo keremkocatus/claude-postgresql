@@ -48,8 +48,11 @@ These were checked by reading the installed source and by running probes; do not
 3. `load_refresh_token` is called before `exchange_refresh_token`, and `/revoke` calls `load_access_token` then
    `load_refresh_token`. Reuse detection lives in `load_refresh_token` (an already-used refresh token revokes the
    family) and again in the atomic `rotate_refresh` (two concurrent refreshes with the same token).
-4. `RevocationRequest.client_secret` is a required field (`str | None` without default): `/revoke` must always send
-   a `client_secret` form field.
+4. `RevocationRequest.client_secret` is a required field (`str | None` without default): a `/revoke` form without a
+   `client_secret` field gets 400. Public clients (`none`) and `client_secret_basic` clients never send it, so
+   `transport/oauth_compat.py` puts an empty `client_secret=` in front of url-encoded `/revoke` bodies that lack one
+   (the `ClientAuthenticator` treats an empty secret as missing; Starlette form data keeps the last value of a
+   repeated field, so a real secret still wins).
 5. **Streamable-HTTP enters the FastMCP lifespan once per MCP session** (`Server.run` →
    `AsyncExitStack.enter_async_context(self.lifespan(self))`). The Starlette app's own lifespan is only
    `session_manager.run()`. Process-wide resources therefore live in the Starlette lifespan that
@@ -68,6 +71,21 @@ These were checked by reading the installed source and by running probes; do not
    refreshed token keeps using the same session.
 10. `uvicorn` defaults to `proxy_headers=True` with `forwarded_allow_ips=127.0.0.1`; Ratatoskr disables it and
     applies `server.trusted_proxies` itself. `aiosqlite` logs every statement *with parameters* at DEBUG.
+11. Scopes: `ClientRegistrationOptions.valid_scopes` is both the AS metadata `scopes_supported` and a DCR check
+    that refuses any other requested scope (400), so `oauth_compat` rewrites a `/register` JSON `scope` to `mcp`
+    before the handler. `/authorize` calls `client.validate_scope()` on the object `get_client()` returns and
+    answers `invalid_scope` for unregistered names; the provider returns a `RegisteredClient` subclass whose
+    `validate_scope` passes names through, and `authorize()` caps them and grants `mcp`. `AuthSettings.required_scopes`
+    is the protected-resource `scopes_supported` and is enforced by `RequireAuthMiddleware` on `/mcp` (403).
+    Refresh with an explicit `scope` outside the token's scopes is still `invalid_scope` (SDK, before the provider).
+12. `build_metadata` hard-codes `token_endpoint_auth_methods_supported` and
+    `revocation_endpoint_auth_methods_supported` to `client_secret_post`/`client_secret_basic`; `none` cannot be
+    advertised by configuration (DCR with `none` works regardless).
+13. `sse-starlette` (the SDK's SSE responses on `/mcp`) watches uvicorn's exit flag and cancels its task group on
+    shutdown, returning without the final body; `transport/stream_end.py` sends it so uvicorn does not log
+    `ASGI callable returned without completing response.`
+14. The SDK pin is `mcp>=1.30,<1.31` and the image installs `constraints.txt`: re-verify facts 1–13 before raising
+    either.
 
 ## Plan 1a facts this plan builds on (verified in the code at `c4c8de0`)
 

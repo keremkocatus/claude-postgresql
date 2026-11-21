@@ -8,6 +8,7 @@ the issuer), and single use of the pending request.
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -109,7 +110,15 @@ async def test_issuer_error_is_relayed_as_access_denied(http_app, run_app, fake_
     assert fake_issuer.token_requests == []
 
 
-async def test_bad_id_token_fails_the_sign_in(http_app, run_app, fake_issuer) -> None:
+def login_failures(tmp_path) -> list[tuple[str, str, str]]:
+    with sqlite3.connect(tmp_path / "state.db") as raw:
+        rows = raw.execute(
+            "SELECT tool, result, error_class FROM audit_events WHERE tool = 'login_failed' ORDER BY id"
+        ).fetchall()
+    return [tuple(row) for row in rows]
+
+
+async def test_bad_id_token_fails_the_sign_in(http_app, run_app, fake_issuer, tmp_path) -> None:
     async with run_app(http_app) as driver:
         await driver.register()
         state, _ = await start_oidc_login(driver, fake_issuer)
@@ -120,6 +129,30 @@ async def test_bad_id_token_fails_the_sign_in(http_app, run_app, fake_issuer) ->
     assert response.status_code == 400
     assert "location" not in response.headers
     assert len(fake_issuer.token_requests) == 1
+    assert login_failures(tmp_path) == [("login_failed", "denied", "identity_invalid")]
+
+
+async def test_issuer_refusing_the_code_is_a_denied_sign_in(http_app, run_app, fake_issuer, tmp_path) -> None:
+    async with run_app(http_app) as driver:
+        await driver.register()
+        state, _ = await start_oidc_login(driver, fake_issuer)
+        fake_issuer.queue_token_response(400, error="invalid_grant")
+        response = await driver.http.get("/oauth/callback", params={"code": "c", "state": state})
+    assert response.status_code == 400
+    assert login_failures(tmp_path) == [("login_failed", "denied", "upstream_rejected")]
+
+
+async def test_unreachable_issuer_at_the_callback_is_an_error_not_a_denial(
+    http_app, run_app, fake_issuer, tmp_path
+) -> None:
+    async with run_app(http_app) as driver:
+        await driver.register()
+        state, _ = await start_oidc_login(driver, fake_issuer)
+        fake_issuer.queue_token_response(503)
+        response = await driver.http.get("/oauth/callback", params={"code": "c", "state": state})
+    assert response.status_code == 502
+    assert "could not be reached" in response.text
+    assert login_failures(tmp_path) == [("login_failed", "error", "upstream_unavailable")]
 
 
 async def test_password_form_is_disabled_in_oidc_mode(http_app, run_app) -> None:

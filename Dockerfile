@@ -1,21 +1,34 @@
 # syntax=docker/dockerfile:1
 
+# Base image: python:3.12-slim, pinned by digest so that rebuilds start from the same layers. To move to a newer one:
+#   docker pull python:3.12-slim && docker inspect --format '{{index .RepoDigests 0}}' python:3.12-slim
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+
 # ── build: install the package into a self-contained virtualenv ─────────────
-FROM python:3.12-slim AS builder
+FROM ${PYTHON_IMAGE} AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN python -m venv /opt/ratatoskr
+# No pip, setuptools or wheel in the runtime venv: the builder's own pip installs into it (`--python`).
+RUN python -m venv --without-pip /opt/ratatoskr
 WORKDIR /src
 # pyproject.toml names README.md (readme) and LICENSE (license-files): hatchling needs both to build.
-COPY pyproject.toml README.md LICENSE ./
+# constraints.txt pins the whole runtime dependency closure to the tested versions (see CLAUDE.md).
+COPY pyproject.toml README.md LICENSE constraints.txt ./
 COPY src/ src/
-RUN /opt/ratatoskr/bin/pip install . \
+RUN python -m pip --python /opt/ratatoskr/bin/python install -c constraints.txt . \
  && /opt/ratatoskr/bin/python -m compileall -q /opt/ratatoskr
 
 # ── runtime: non-root, read-only friendly; only /data is written ────────────
-FROM python:3.12-slim
+FROM ${PYTHON_IMAGE}
+
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="ratatoskr" \
+      org.opencontainers.image.description="Secure multi-connection MCP server for PostgreSQL" \
+      org.opencontainers.image.source="https://github.com/keremkocatus/claude-postgresql" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="MIT"
 
 # Pre-compiled bytecode plus PYTHONDONTWRITEBYTECODE: nothing is written outside /data, so the container runs with
 # `--read-only` (add `--tmpfs /tmp` if anything ever needs scratch space).

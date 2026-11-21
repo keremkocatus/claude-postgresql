@@ -103,7 +103,7 @@ public https origin, here `https://mcp.example.com`.
      host: 0.0.0.0
      port: 8000
      secret_key: ${SERVER_SECRET_KEY}        # >= 32 random characters
-     trusted_proxies: [172.18.0.0/16]        # your reverse proxy's IP or network
+     trusted_proxies: [172.17.0.1]           # the address your reverse proxy connects from (see below)
    auth:
      mode: local
      local:
@@ -130,14 +130,30 @@ public https origin, here `https://mcp.example.com`.
      -e SERVER_SECRET_KEY -e ALICE_PASSWORD_HASH -e APP_DB_DSN ratatoskr
    ```
 
-   `docker ps` shows `(healthy)` once `/healthz` answers. `docker stop` sends SIGTERM: in-flight requests get a
+   `docker ps` shows `(healthy)` once `/healthz` answers. The state lives in the named volume `ratatoskr-data`;
+   if you bind-mount a host directory on `/data` instead, it must be owned by uid 10001
+   (`sudo chown 10001:10001 /srv/ratatoskr-data`), otherwise `check-config` and `serve` stop with
+   `server.state_path: ... is not writable by uid 10001`. `docker stop` sends SIGTERM: in-flight requests get a
    few seconds to finish and queued audit events are written before the process exits. Keep the stop grace period
    at **10 s or more** (Docker's default; do not lower it with `docker stop -t` or compose `stop_grace_period`),
    otherwise SIGKILL can cut off the audit flush.
 
+   **`trusted_proxies`** must hold the address the *container* sees the proxy connect from. With the proxy on the
+   host and `-p 127.0.0.1:8000:8000` as above, that is the Docker bridge gateway, not `127.0.0.1`: find it with
+   `docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'` (usually `172.17.0.1`; for a
+   user-defined network use its name instead of `bridge`). Simpler and tighter: run the proxy (e.g. Caddy) in the
+   same Docker network as Ratatoskr, do not publish port 8000 at all, and list that network's subnet or the proxy
+   container's address ([`docs/authentik.md`](docs/authentik.md) has a Caddy example). With a wrong value every
+   client shares the proxy's rate-limit bucket.
+
+   **Configuration changes need a restart** (`docker restart ratatoskr`); there is no reload on SIGHUP. After the
+   restart they apply at once to existing sessions too: roles, local users' groups, removed users and changed
+   passwords are checked on every request with an access token (OIDC groups follow at the next refresh).
+
 5. Point the reverse proxy at port 8000. In claude.ai open *Settings → Connectors → Add custom connector* and enter
    `https://mcp.example.com/mcp`: claude.ai registers itself, sends you to Ratatoskr's sign-in page and connects.
-   Claude Code uses the same URL: `claude mcp add --transport http ratatoskr https://mcp.example.com/mcp`.
+   Claude Code uses the same URL: `claude mcp add --transport http ratatoskr https://mcp.example.com/mcp`. Claude
+   Code registers as a public client (no client secret, PKCE only); that is supported, including `/revoke`.
 
 For single sign-on with Authentik (`auth.mode: oidc`), follow [`docs/authentik.md`](docs/authentik.md); it also has
 a Caddy example and a verification checklist.
@@ -163,6 +179,7 @@ One YAML file; [`config.example.yaml`](config.example.yaml) is the annotated ref
 | `server.trusted_proxies` | `[]` | HTTP: IPs/CIDRs of your reverse proxies; `X-Forwarded-For` is honoured only from them (rate limits use the client IP). |
 | `server.allowed_redirect_hosts` | `[claude.ai, claude.com, localhost, 127.0.0.1]` | HTTP: exact hosts (any port) an OAuth client may register in a `redirect_uri`; https required except on loopback. |
 | `server.audit_retention` | `90d` | HTTP: audit rows in SQLite older than this are deleted hourly (at least `1d`). |
+| `server.metrics_port` | unset | Reserved; metrics are not implemented yet. A value is accepted but nothing listens on it (`serve` and `check-config` warn). |
 | `auth.mode` | required for HTTP | `local` (users in the file) or `oidc` (e.g. Authentik). Ignored over stdio. |
 | `auth.access_token_ttl` | `1h` | Access token lifetime; also how often an OIDC user is re-checked at the issuer. |
 | `auth.refresh_token_ttl` | `30d` | Refresh token lifetime (each refresh rotates it). Must not exceed `session_max_age`. |
@@ -248,8 +265,12 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
 
 - `serve` refuses `streamable-http` without an `auth` section, without a `secret_key` of at least 32 characters, or
   with a non-https `public_url` (except `--insecure-dev` on loopback). `check-config` runs the same checks.
-- OAuth: dynamic client registration only for redirect URIs on `allowed_redirect_hosts`; authorization code with
-  PKCE S256 only; codes are single use and live 5 minutes; tokens are opaque random values stored as SHA-256
+- OAuth: dynamic client registration only for redirect URIs on `allowed_redirect_hosts`, for confidential
+  (`client_secret_post`, `client_secret_basic`) and public (`none`) clients; authorization code with PKCE S256 only;
+  the only scope is `mcp` (`scopes_supported`): whatever scope a client registers or requests (`claudeai`,
+  `openid profile`, ...) is replaced by `mcp` rather than refused, at most 4 distinct names per request. The
+  authorization server metadata comes from the MCP SDK, which lists only `client_secret_post` and
+  `client_secret_basic` under `token_endpoint_auth_methods_supported`; public clients work anyway; codes are single use and live 5 minutes; tokens are opaque random values stored as SHA-256
   hashes and bound to `<public_url>/mcp`. Each refresh rotates the refresh token; presenting a used one revokes the
   whole session (`token_reuse_detected`), except a retry within 5 seconds, which is refused but keeps the session.
   So `/revoke` with the old refresh token within those 5 seconds does not end the session; use the current one.
@@ -257,12 +278,15 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
   then, and a user the issuer refuses loses the session. Upstream refresh tokens are stored sealed (AES-GCM).
 - Local users: argon2id hashes. All users must share one set of argon2 parameters (`hash-password` always
   produces the same), or the config is refused, so that response times do not reveal which names exist. Changing a
-  user's `password_hash` or removing the user ends their sessions at the next refresh (the password is
-  fingerprinted when the authorization code is exchanged, not when the form is submitted).
+  user's `password_hash` or removing the user (and restarting) ends their sessions: access tokens stop working at
+  once, and the next refresh revokes the session (`session_revoked`). The password is fingerprinted when the
+  authorization code is exchanged, not when the form is submitted.
 - Sign-in is limited to 5 attempts per minute per client IP **and** per user name, then locked for 1 minute,
   doubling up to 1 hour. The per-user limit means anyone who knows a user name can keep that user locked out; that
   is the price of stopping password guessing spread over many IPs. `/register` allows 20 registrations per hour
-  and `/authorize` 60 requests per 10 minutes per IP. Login pages use CSRF tokens, `SameSite=Strict` cookies and a
+  and `/authorize` 60 requests per 10 minutes per IP; refused requests there are logged and audited as
+  `rate_limited` (`error_class` `rate_limited:register` / `rate_limited:authorize`), at most once a minute per
+  client address. Login pages use CSRF tokens, `SameSite=Strict` cookies and a
   CSP with `frame-ancestors 'none'`. Requests whose `Host` is not the `public_url` host are refused.
 - Reverse proxy: set **HSTS** there (Ratatoskr does not). Put the proxy's address in `server.trusted_proxies`;
   otherwise every client appears to come from the proxy and shares one rate-limit bucket, so five wrong passwords
@@ -271,8 +295,13 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
 - Rotating `server.secret_key` is the emergency switch: every session ends, registered clients must register again
   and OIDC users sign in again.
 - Health: `/healthz` (process is up) and `/readyz` (the state store accepts writes; databases are not checked).
-- Sign-ins, refused sign-ins, rate-limit hits, token reuse, revocations and failed upstream refreshes are audit
-  events next to the tool calls, both in the log and in the `audit_events` table.
+- Sign-ins, refused sign-ins (`login_failed`: `denied`, or `error` with `upstream_unavailable` when the issuer
+  could not be reached), rate-limit hits (`login_rate_limited`, `rate_limited`), token reuse, client revocations
+  (`token_revoked`), sessions the server ended itself (`session_revoked`, `error_class` `user_removed` or
+  `password_changed`) and failed upstream refreshes are audit events next to the tool calls, both in the log and in
+  the `audit_events` table.
+- On shutdown open `/mcp` event streams are ended cleanly (clients see the stream close and reconnect); there is no
+  `ASGI callable returned without completing response.` error per open stream.
 
 ### Database roles
 
@@ -319,7 +348,7 @@ python -m pytest -m integration -q      # needs Docker: starts PostgreSQL with t
 python -m ruff check src tests
 python -m ruff format --check src tests
 python -m mypy src
-docker build -t ratatoskr:dev .         # container image
+docker build -t ratatoskr:dev .         # container image (dependencies pinned by constraints.txt)
 ```
 
 The HTTP tests (OAuth flows against the real Starlette app in process, fake OIDC issuer) are unit tests under

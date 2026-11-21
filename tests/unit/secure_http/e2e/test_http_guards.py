@@ -4,6 +4,7 @@ cookie flags and the OIDC flow cookie."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import sqlite3
 from collections.abc import AsyncIterator
@@ -17,7 +18,7 @@ from ratatoskr.auth.identity.local import normalize_username
 from ratatoskr.auth.ratelimit import LOGIN_RULE, REGISTER_RULE
 from ratatoskr.transport.app import build_http_app
 from ratatoskr.transport.body_limit import MAX_AUTH_BODY_BYTES
-from ratatoskr.transport.endpoint_limit import AUTHORIZE_RULE
+from ratatoskr.transport.endpoint_limit import AUTHORIZE_RULE, RATE_LIMIT_REPORT_INTERVAL
 from tests.unit.secure_http.e2e.conftest import OAuthDriver
 
 PASSWORD = "correct horse battery staple"
@@ -173,6 +174,39 @@ async def test_parallel_authorize_burst_from_one_ip_is_capped(http_app, run_app)
         async with driver.spawn("198.51.100.21") as other:
             other.client_id = driver.client_id
             assert (await other.http.get("/authorize", params=other.authorize_params())).status_code == 302
+
+
+def rate_limit_rows(tmp_path) -> list[tuple[str, str, str, str, str]]:
+    with sqlite3.connect(tmp_path / "state.db") as raw:
+        rows = raw.execute(
+            "SELECT tool, subject, auth_source, result, error_class FROM audit_events WHERE tool = 'rate_limited'"
+            " ORDER BY id"
+        ).fetchall()
+    return [tuple(row) for row in rows]
+
+
+@pytest.mark.parametrize("endpoint", ["register", "authorize"])
+async def test_endpoint_rate_limit_hits_are_audited_and_logged_once_per_interval(
+    http_app, run_app, tmp_path, clock, caplog, endpoint
+) -> None:
+    async with run_app(http_app) as driver:
+        await driver.register()
+        limit = REGISTER_RULE.limit if endpoint == "register" else AUTHORIZE_RULE.limit
+
+        async def hit() -> int:
+            if endpoint == "register":
+                return (await driver.register()).status_code
+            return (await driver.http.get("/authorize", params=driver.authorize_params())).status_code
+
+        with caplog.at_level(logging.WARNING, logger="ratatoskr.transport.endpoint_limit"):
+            statuses = [await hit() for _ in range(limit + 5)]
+            assert statuses.count(429) >= 5
+            clock.advance(RATE_LIMIT_REPORT_INTERVAL + 1)
+            assert await hit() == 429
+    expected = ("rate_limited", "unknown", "http", "denied", f"rate_limited:{endpoint}")
+    assert rate_limit_rows(tmp_path) == [expected, expected]
+    warnings = [r.getMessage() for r in caplog.records if r.name == "ratatoskr.transport.endpoint_limit"]
+    assert len(warnings) == 2 and all(f"/{endpoint}" in w and "203.0.113.10" in w for w in warnings)
 
 
 @pytest.mark.parametrize(

@@ -69,8 +69,8 @@ def derive_key(secret_key: str, purpose: str) -> bytes:
 def secret_key_problem(secret_key: str) -> str | None:
     """Why ``secret_key`` is too weak to derive keys from, or ``None`` if it is acceptable.
 
-    Not wired into startup here: the HTTP preconditions (Plan 1b Task 12) call it and refuse to serve on a problem.
-    The message never contains the key.
+    Not wired into startup here: the HTTP preconditions (``transport.preconditions``) call it and refuse to serve on
+    a problem. The message never contains the key.
     """
     if len(secret_key) < MIN_SECRET_KEY_LENGTH:
         return f"server.secret_key must be at least {MIN_SECRET_KEY_LENGTH} characters long"

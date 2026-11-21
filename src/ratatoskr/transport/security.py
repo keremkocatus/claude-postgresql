@@ -13,11 +13,19 @@ from ratatoskr.auth.oauth_server import DEFAULT_SCOPES, MCP_PATH
 
 
 def mcp_auth_settings(public_url: str) -> McpAuthSettings:
-    """Issuer is the public origin; tokens are bound (RFC 8707) to ``<public_url>/mcp``."""
+    """Issuer is the public origin; tokens are bound (RFC 8707) to ``<public_url>/mcp``.
+
+    ``valid_scopes`` puts ``scopes_supported: ["mcp"]`` into the authorization server metadata and ``required_scopes``
+    into the protected-resource metadata (every token carries ``mcp``). The SDK would refuse a registration asking for
+    another scope; ``transport.oauth_compat`` replaces the requested scope with ``mcp`` before it gets there.
+    """
     return McpAuthSettings(
         issuer_url=AnyHttpUrl(public_url),
         resource_server_url=AnyHttpUrl(public_url + MCP_PATH),
-        client_registration_options=ClientRegistrationOptions(enabled=True, default_scopes=list(DEFAULT_SCOPES)),
+        required_scopes=list(DEFAULT_SCOPES),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, valid_scopes=list(DEFAULT_SCOPES), default_scopes=list(DEFAULT_SCOPES)
+        ),
         revocation_options=RevocationOptions(enabled=True),
         validate_token_resource=True,
     )

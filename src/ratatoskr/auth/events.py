@@ -1,4 +1,8 @@
-"""Audit events for authentication (login, token reuse, revocation, upstream refresh)."""
+"""Audit events for authentication (login, token reuse, revocation, upstream refresh, rate limits).
+
+``token_revoked`` is a client's ``/revoke``; ``session_revoked`` is the server ending a session itself (the local
+user was removed or their password changed; ``error_class`` says which).
+"""
 
 from __future__ import annotations
 
@@ -10,8 +14,10 @@ AuthEventName = Literal[
     "login_succeeded",
     "login_failed",
     "login_rate_limited",
+    "rate_limited",
     "token_reuse_detected",
     "token_revoked",
+    "session_revoked",
     "refresh_retry_within_grace",
     "upstream_refresh_failed",
 ]

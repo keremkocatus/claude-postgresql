@@ -12,8 +12,9 @@ server:
   # host: 0.0.0.0                         # 127.0.0.1 by default; 0.0.0.0 in a container
   # port: 8000                            # keep 8000 in the container (the image's health check uses it)
   # state_path: /data/state.db            # SQLite state: clients, tokens, rate limits, audit trail
+  #                                       # its directory must be writable (a bind-mounted /data: uid 10001)
   # secret_key: ${SERVER_SECRET_KEY}      # >= 32 characters, random; changing it signs everyone out
-  # trusted_proxies: [172.18.0.0/16]      # your reverse proxy's IP/network; X-Forwarded-For only from these
+  # trusted_proxies: [172.18.0.0/16]      # address the proxy connects from, as the container sees it; XFF only from these
   # allowed_redirect_hosts: [claude.ai, claude.com, localhost, 127.0.0.1]   # OAuth client redirect hosts (exact)
   # audit_retention: 90d                  # audit rows older than this are deleted hourly (minimum 1d)
 

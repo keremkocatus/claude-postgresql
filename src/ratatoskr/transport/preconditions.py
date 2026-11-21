@@ -6,7 +6,9 @@ accepts too. Messages name the offending setting but never contain a secret valu
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from pydantic import SecretStr
 
@@ -14,6 +16,7 @@ from ratatoskr.auth.crypto import secret_key_problem
 from ratatoskr.auth.identity.local import LocalIdentityProvider, password_hash_weakness
 from ratatoskr.config.loader import ConfigError
 from ratatoskr.config.models import LOOPBACK_HOSTS, AuthSettings, LocalUser, RatatoskrConfig, ServerSettings
+from ratatoskr.config.notices import config_warnings
 from ratatoskr.transport.client_ip import catch_all_networks
 
 INSECURE_DEV_WARNING = (
@@ -94,6 +97,33 @@ def _check_public_url(server: ServerSettings, *, insecure_dev: bool) -> str:
     return str(url).rstrip("/")
 
 
+def _user() -> str:
+    getuid = getattr(os, "getuid", None)
+    return f"uid {getuid()}" if getuid is not None else "the current user"
+
+
+def _check_state_path(path: Path) -> None:
+    """The SQLite file's directory must exist or be creatable, and be writable by this process. Nothing is created:
+    the store creates the directory when it opens."""
+    path = path.absolute()
+    if path.is_dir():
+        raise ConfigError(f"server.state_path {path} is a directory; give the path of the SQLite file")
+    directory = path.parent
+    existing = directory
+    while not existing.exists():
+        if existing.parent == existing:
+            break
+        existing = existing.parent
+    if not existing.is_dir():
+        raise ConfigError(f"server.state_path: directory {directory} cannot be created ({existing} is not a directory)")
+    if not os.access(existing, os.W_OK | os.X_OK) or (path.exists() and not os.access(path, os.R_OK | os.W_OK)):
+        where = path if path.exists() and existing == directory else existing
+        raise ConfigError(
+            f"server.state_path: {where} is not writable by {_user()}; in the container a bind-mounted /data must be"
+            " owned by uid 10001 (`chown 10001:10001` on the host directory)"
+        )
+
+
 def check_http_preconditions(config: RatatoskrConfig, *, insecure_dev: bool) -> HttpSettings:
     """Validated HTTP settings plus warnings to print and log at every start; ``ConfigError`` on any problem."""
     server = config.server
@@ -104,9 +134,11 @@ def check_http_preconditions(config: RatatoskrConfig, *, insecure_dev: bool) -> 
     auth, local_provider, auth_warnings = _check_auth(config.auth, insecure_dev=insecure_dev)
     secret = _check_secret_key(server.secret_key)
     public_url = _check_public_url(server, insecure_dev=insecure_dev)
+    _check_state_path(server.state_path)
 
     warnings: list[str] = [INSECURE_DEV_WARNING] if insecure_dev else []
     warnings.extend(auth_warnings)
+    warnings.extend(config_warnings(config))
     for entry in catch_all_networks(server.trusted_proxies):
         warnings.append(
             f"server.trusted_proxies contains {entry}: every peer is trusted, so any client can choose its own IP"

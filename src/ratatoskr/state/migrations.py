@@ -84,7 +84,7 @@ MIGRATIONS: tuple[str, ...] = (
         value TEXT NOT NULL
     );
     """,
-    # 2 — token families: absolute session lifetime and local password fingerprints (Q5 review). Existing families
+    # 2 — token families: absolute session lifetime and local password fingerprints. Existing families
     # are backfilled from their tokens; their sign-in time is the oldest token's creation time. Upgrading signs
     # everyone out: backfilled local families have no password fingerprint and old upstream blobs are sealed
     # without the family binding, so both fail closed.

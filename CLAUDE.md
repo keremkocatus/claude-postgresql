@@ -20,6 +20,19 @@ Current state: stdio (Plan 1a) and secure streamable-HTTP (Plan 1b: OAuth AS, lo
 - Installing packages: pip's extra index on this machine is broken and slow; always pass
   `--index-url https://pypi.org/simple`.
 
+### Runtime constraints (`constraints.txt`)
+
+The image installs `pip install -c constraints.txt .`: exact pins of the runtime dependency closure (no dev tools,
+not the project) as last tested. After changing `dependencies` in `pyproject.toml` or upgrading packages in
+`.venv`, run the full unit and integration suites, then regenerate the pins from the installed runtime closure
+(walk `importlib.metadata` requirements from `ratatoskr-mcp`, skipping extras; equivalent to `pip freeze` filtered
+to that closure), keep the `pywin32` line's `sys_platform == "win32"` marker, and rebuild the image. `mcp` is capped
+at `<1.31` in `pyproject.toml`: an SDK upgrade must first re-verify the "SDK facts" in
+`docs/superpowers/plans/2026-11-21-phase1b-secure-http.md` (handler and client-auth behaviour, scope handling,
+metadata, sse-starlette shutdown) and the shims that rely on them (`transport/oauth_compat.py`,
+`transport/stream_end.py`, `RegisteredClient` in `auth/oauth_server.py`). The base image is pinned by digest in
+the `Dockerfile`; the comment there shows how to move it.
+
 Plain `pytest` skips integration tests (`addopts = -m 'not integration'`); `-m integration` selects them.
 Integration tests only ever use the local testcontainers PostgreSQL; never connect to a remote or production
 database.
@@ -33,7 +46,8 @@ database.
 - `state/` SQLite state store (`sqlite.py`, WAL, one connection + lock, `migrations.py`), audit sink, hourly
   cleanup. All OAuth/session state goes through the `Store` protocol; it stores hashes and sealed blobs only.
 - `transport/` HTTP composition root (`app.py`), preconditions (same checks for `serve` and `check-config`), client
-  IP / trusted proxies, Host check, body and endpoint limits, uvicorn (`serve.py`).
+  IP / trusted proxies, Host check, body and endpoint limits, client compatibility rewrites for `/revoke` and
+  `/register` (`oauth_compat.py`), clean end of `/mcp` streams on shutdown (`stream_end.py`), uvicorn (`serve.py`).
 - `backends/` `Backend` protocol, `BackendRegistry` (lazy open, 10 s retry), user-safe errors, `clamp_text`.
 - `backends/postgres/` pools and execution (`backend.py`), guard pre-checks (`guard.py`), TLS (`tls.py`), catalog
   SQL (`introspection.py`), query/execute/explain (`querying.py`), tool registration (`tools.py`) and tool texts

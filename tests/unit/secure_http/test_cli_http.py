@@ -76,6 +76,20 @@ def test_hash_password_prints_an_argon2id_hash(monkeypatch, capsys) -> None:
     assert PasswordHasher().verify(printed, "s3cret-pass")
 
 
+def test_hash_password_warns_about_short_passwords_but_hashes_them(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("short-pw\n"))
+    assert main(["hash-password"]) == 0
+    captured = capsys.readouterr()
+    assert PasswordHasher().verify(captured.out.strip(), "short-pw")
+    assert "shorter than 12 characters" in captured.err and "short-pw" not in captured.err
+
+
+def test_hash_password_does_not_warn_from_12_characters(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("twelve-chars\n"))
+    assert main(["hash-password"]) == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_hash_password_rejects_empty_input(monkeypatch, capsys) -> None:
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     assert main(["hash-password"]) == 1
@@ -116,6 +130,42 @@ def test_serve_logs_precondition_warnings_once_on_stderr(write_config, monkeypat
     assert captured.err.count("INSECURE DEV MODE") == 1
     assert '"level": "WARNING"' in captured.err
     assert "INSECURE DEV MODE" not in captured.out
+
+
+WEAK_HASH = PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1).hash("pw")
+
+
+@pytest.mark.parametrize("command", ["serve", "check-config"])
+def test_weak_hash_warning_is_reported_exactly_once(write_config, monkeypatch, capsys, command) -> None:
+    monkeypatch.setenv("TEST_RATATOSKR_HASH", WEAK_HASH)
+    monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: None)
+    assert main([command, "--config", write_config()]) == 0
+    captured = capsys.readouterr()
+    assert (captured.out + captured.err).count("OWASP") == 1
+    assert WEAK_HASH not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("command", ["serve", "check-config"])
+def test_metrics_port_is_reported_as_not_implemented(write_config, monkeypatch, capsys, command) -> None:
+    monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: None)
+    path = Path(write_config())
+    path.write_text(path.read_text(encoding="utf-8").replace("  host:", "  metrics_port: 9100\n  host:"), "utf-8")
+    assert main([command, "--config", str(path)]) == 0
+    captured = capsys.readouterr()
+    assert (captured.out + captured.err).count("server.metrics_port") == 1
+    assert "not implemented" in captured.out + captured.err
+
+
+def test_check_config_reports_an_unwritable_state_directory(write_config, tmp_path, capsys) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    path = Path(write_config())
+    text = path.read_text(encoding="utf-8")
+    state_line = next(line for line in text.splitlines() if "state_path" in line)
+    path.write_text(text.replace(state_line, f"  state_path: {(blocker / 'sub' / 'state.db').as_posix()}"), "utf-8")
+    assert main(["check-config", "--config", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "server.state_path" in err and "Traceback" not in err
 
 
 def test_serve_reports_http_precondition_errors(write_config, served, capsys) -> None:

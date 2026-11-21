@@ -1,12 +1,13 @@
 """Composition root for ``transport: streamable-http``: store, OAuth server, login pages, MCP app, lifespan.
 
-Ownership rule (shared with Plan 1a's ``build_app``): whoever creates the backend registry closes it. The SDK enters
+Ownership rule (shared with ``ratatoskr.app.build_app``): whoever creates the backend registry closes it. The SDK enters
 the FastMCP lifespan once per MCP session, so this module creates the registry, injects it into ``build_app`` (whose
 lifespan then never closes it) and closes it once, in the process-level Starlette lifespan.
 
 Request path, outermost first: Host check (every route but ``/mcp`` and the health probes), 64 KiB body limit on the
-OAuth and login endpoints, per-IP reservations on ``POST /register`` and ``/authorize``, then the SDK's app (bearer
-authentication, OAuth handlers, ``/mcp`` with its DNS-rebinding check) and the custom routes.
+OAuth and login endpoints, per-IP reservations on ``POST /register`` and ``/authorize``, the client compatibility
+rewrites of ``/revoke`` and ``/register`` bodies, the clean end of ``/mcp`` streams on shutdown, then the SDK's app
+(bearer authentication, OAuth handlers, ``/mcp`` with its DNS-rebinding check) and the custom routes.
 """
 
 from __future__ import annotations
@@ -49,8 +50,10 @@ from ratatoskr.transport.endpoint_limit import (
     registration_refused,
 )
 from ratatoskr.transport.host_check import HostCheckMiddleware
+from ratatoskr.transport.oauth_compat import OAuthCompatMiddleware
 from ratatoskr.transport.preconditions import HttpSettings, check_http_preconditions
 from ratatoskr.transport.security import mcp_auth_settings, transport_security
+from ratatoskr.transport.stream_end import StreamEndMiddleware
 
 logger = logging.getLogger("ratatoskr.transport")
 
@@ -186,6 +189,8 @@ def build_http_app(
 
     app = mcp.streamable_http_app()
     # add_middleware puts each new middleware outside the ones added before it.
+    app.add_middleware(StreamEndMiddleware)
+    app.add_middleware(OAuthCompatMiddleware)
     app.add_middleware(
         EndpointRateLimitMiddleware,
         path=REGISTER_PATH,
@@ -193,6 +198,8 @@ def build_http_app(
         limiter=RateLimiter(store, REGISTER_RULE, clock),
         trusted_proxies=trusted_proxies,
         refused=registration_refused,
+        audit=audit,
+        clock=clock,
     )
     app.add_middleware(
         EndpointRateLimitMiddleware,
@@ -201,6 +208,8 @@ def build_http_app(
         limiter=RateLimiter(store, AUTHORIZE_RULE, clock),
         trusted_proxies=trusted_proxies,
         refused=authorization_refused,
+        audit=audit,
+        clock=clock,
     )
     app.add_middleware(AuthBodyLimitMiddleware)
     app.add_middleware(HostCheckMiddleware, public_url=settings.public_url)

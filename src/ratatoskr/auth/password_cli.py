@@ -13,6 +13,8 @@ from typing import BinaryIO, TextIO
 
 from ratatoskr.auth.identity.local import hash_password
 
+# Below this a warning goes to stderr; the hash is still printed (sign-in is rate limited, but short is guessable).
+MIN_RECOMMENDED_LENGTH = 12
 DESCRIPTION = (
     "Print the argon2id hash of a password for auth.local.users[].password_hash. Prompts twice without echo on a"
     " terminal; otherwise reads the first line of stdin as UTF-8. On Windows PowerShell 5.1, piping replaces"
@@ -48,5 +50,10 @@ def run_hash_password(
     if not password:
         print("Password must not be empty.", file=stderr)
         return 1
+    if len(password) < MIN_RECOMMENDED_LENGTH:
+        print(
+            f"Warning: the password is shorter than {MIN_RECOMMENDED_LENGTH} characters; hashing it anyway.",
+            file=stderr,
+        )
     print(hash_password(password), file=stdout)
     return 0

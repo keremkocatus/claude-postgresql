@@ -57,7 +57,15 @@ def local_users(password_hash: str, groups: list[str]) -> LocalIdentityProvider:
 @pytest.fixture
 def build(make_config, store, audit, clock, password_hash):
     def factory(
-        *, mode: str = "local", local=None, oidc=None, keyring=None, server_extra=None, auth_extra=None, kerem_hash=None
+        *,
+        mode: str = "local",
+        local=None,
+        oidc=None,
+        keyring=None,
+        server_extra=None,
+        auth_extra=None,
+        kerem_hash=None,
+        without_kerem=False,
     ) -> RatatoskrOAuthProvider:
         config = make_config(
             mode=mode,
@@ -68,6 +76,11 @@ def build(make_config, store, audit, clock, password_hash):
             users = [LocalUser(username="kerem", password_hash=SecretStr(kerem_hash), groups=["admins"])]
             auth = config.auth.model_copy(update={"local": LocalAuthSettings(users=users)})
             config = config.model_copy(update={"auth": auth})
+        if without_kerem:
+            users = [u for u in config.auth.local.users if u.username != "kerem"]
+            auth = config.auth.model_copy(update={"local": LocalAuthSettings(users=users)})
+            config = config.model_copy(update={"auth": auth})
+            local = LocalIdentityProvider(users)
         return RatatoskrOAuthProvider(
             config,
             store=store,
@@ -209,13 +222,16 @@ async def test_registration_rejects_confidential_client_without_secret(build) ->
     assert info.value.error == "invalid_client_metadata"
 
 
-async def test_registration_rejects_scopes_beyond_mcp(build) -> None:
+@pytest.mark.parametrize("requested", ["mcp admin", "claudeai", "openid profile offline_access", None])
+async def test_registration_replaces_requested_scopes_with_mcp(build, requested) -> None:
+    """RFC 7591 §3.2.1: the server may replace requested metadata instead of refusing it."""
+    provider = build()
     client = OAuthClientInformationFull(
-        client_id="c", redirect_uris=[AnyUrl(REDIRECT)], token_endpoint_auth_method="none", scope="mcp admin"
+        client_id="c", redirect_uris=[AnyUrl(REDIRECT)], token_endpoint_auth_method="none", scope=requested
     )
-    with pytest.raises(RegistrationError) as info:
-        await build().register_client(client)
-    assert info.value.error == "invalid_client_metadata"
+    await provider.register_client(client)
+    stored = await provider.get_client("c")
+    assert stored is not None and stored.scope == "mcp"
 
 
 async def test_secret_sealed_under_other_key_hides_client(build, caplog) -> None:
@@ -286,12 +302,19 @@ async def test_authorize_rejects_bad_requests(build, overrides) -> None:
     assert info.value.error == "invalid_request"
 
 
-async def test_authorize_rejects_scopes_beyond_mcp(build) -> None:
+@pytest.mark.parametrize("requested", [["mcp", "admin"], ["claudeai"], ["openid", "profile", "offline_access"]])
+async def test_authorize_grants_mcp_whatever_scopes_are_requested(build, requested) -> None:
     provider = build()
     client = await register(provider)
-    with pytest.raises(AuthorizeError) as info:
-        await provider.authorize(client, params(scopes=["mcp", "admin"]))
-    assert info.value.error == "invalid_scope"
+    assert client.validate_scope(" ".join(requested)) == requested, "the SDK's check must let unknown names through"
+    url = await provider.authorize(client, params(scopes=requested))
+    pending = await provider.take_pending(parse_qs(urlsplit(url).query)["request"][0])
+    assert pending is not None
+    code = await provider.complete_authorization(pending, KEREM, None)
+    loaded = await provider.load_authorization_code(client, parse_qs(urlsplit(code).query)["code"][0])
+    assert loaded is not None and loaded.scopes == ["mcp"]
+    tokens = await provider.exchange_authorization_code(client, loaded)
+    assert tokens.scope == "mcp"
 
 
 async def test_authorize_rechecks_redirect_host_against_current_allowlist(build) -> None:
@@ -957,6 +980,43 @@ async def test_password_change_refuses_a_preloaded_refresh(build) -> None:
     with pytest.raises(TokenError) as info:
         await changed.exchange_refresh_token(client, loaded, ["mcp"])
     assert info.value.error == "invalid_grant"
+    assert await provider.load_access_token(tokens.access_token) is None
+
+
+def revocations(audit) -> list[tuple[str, str, str | None]]:
+    return [(e.subject, e.result, e.error_class) for e in audit.events if e.tool == "session_revoked"]
+
+
+async def test_password_change_is_audited_as_a_server_side_revocation(build, audit, caplog) -> None:
+    provider = build()
+    client = await register(provider)
+    tokens = await tokens_for(provider, client)
+    changed = build(kerem_hash=hash_password("a new password"))
+    with caplog.at_level(logging.WARNING, logger="ratatoskr.auth.oauth"):
+        assert await changed.load_refresh_token(client, tokens.refresh_token) is None
+        # Already revoked: a second attempt neither logs nor audits again.
+        assert await changed.load_refresh_token(client, tokens.refresh_token) is None
+    assert revocations(audit) == [("kerem", "denied", "password_changed")]
+    assert caplog.text.count("password of kerem changed") == 1
+
+
+@pytest.mark.parametrize("path", ["load", "exchange"])
+async def test_removed_user_is_reported_as_removed_not_as_a_password_change(build, audit, caplog, path) -> None:
+    provider = build()
+    client = await register(provider)
+    tokens = await tokens_for(provider, client)
+    removed = build(without_kerem=True)
+    with caplog.at_level(logging.WARNING, logger="ratatoskr.auth.oauth"):
+        if path == "load":
+            assert await removed.load_refresh_token(client, tokens.refresh_token) is None
+        else:
+            loaded = await provider.load_refresh_token(client, tokens.refresh_token)
+            assert loaded is not None
+            with pytest.raises(TokenError) as info:
+                await removed.exchange_refresh_token(client, loaded, ["mcp"])
+            assert info.value.error == "invalid_grant"
+    assert revocations(audit) == [("kerem", "denied", "user_removed")]
+    assert "kerem is no longer configured" in caplog.text and "password" not in caplog.text
     assert await provider.load_access_token(tokens.access_token) is None
 
 

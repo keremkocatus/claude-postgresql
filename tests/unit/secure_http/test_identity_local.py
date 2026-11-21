@@ -208,15 +208,16 @@ def test_upper_bounds_are_inclusive(password_hash: str) -> None:
     assert password_hash_problem(user) is None
 
 
-def test_weak_but_valid_parameters_are_logged_not_refused(caplog: pytest.LogCaptureFixture) -> None:
+def test_weak_but_valid_parameters_are_reported_not_refused(caplog: pytest.LogCaptureFixture) -> None:
     weak = PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1).hash("pw")
     user = LocalUser(username="kerem", password_hash=SecretStr(weak))
     assert password_hash_problem(user) is None
-    assert password_hash_weakness(user) is not None
+    weakness = password_hash_weakness(user)
+    assert weakness is not None and "kerem" in weakness and "OWASP" in weakness and weak not in weakness
     caplog.set_level("WARNING")
     provider(weak)
-    assert "kerem" in caplog.text and "OWASP" in caplog.text
-    assert weak not in caplog.text
+    # The provider does not log it: the preconditions collect it and serve / check-config report it once.
+    assert caplog.text == ""
 
 
 def test_default_parameters_are_not_weak(password_hash: str) -> None:
@@ -308,9 +309,9 @@ class FakeTty(io.StringIO):
 
 def test_hash_password_command_reads_stdin() -> None:
     out, err = io.StringIO(), io.StringIO()
-    assert run_hash_password(io.StringIO("s3cret\n"), out, err) == 0
+    assert run_hash_password(io.StringIO("s3cret-long-enough\n"), out, err) == 0
     printed = out.getvalue().strip()
-    assert printed.startswith("$argon2id$") and "s3cret" not in printed
+    assert printed.startswith("$argon2id$") and "s3cret-long-enough" not in printed
     assert err.getvalue() == ""
 
 

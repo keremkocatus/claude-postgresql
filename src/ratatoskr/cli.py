@@ -16,6 +16,7 @@ from ratatoskr.auth.password_cli import run_hash_password
 from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.config.loader import ConfigError, load_config
 from ratatoskr.config.models import RatatoskrConfig
+from ratatoskr.config.notices import config_warnings
 from ratatoskr.observability.audit import LogAuditSink
 from ratatoskr.observability.logging import setup_logging
 from ratatoskr.transport.preconditions import check_http_preconditions
@@ -85,9 +86,9 @@ def _check_config(args: argparse.Namespace) -> int:
     path = resolve_config_path(args.config)
     try:
         config = load_config(path, insecure_dev=args.insecure_dev)
-        warnings: tuple[str, ...] = ()
+        # The same checks and warnings serve reports before binding, so the two commands cannot disagree.
+        warnings: tuple[str, ...] = tuple(config_warnings(config))
         if config.server.transport == "streamable-http":
-            # The same checks serve runs before binding, so the two commands cannot disagree.
             warnings = check_http_preconditions(config, insecure_dev=args.insecure_dev).warnings
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
@@ -115,6 +116,8 @@ def _serve(args: argparse.Namespace) -> int:
         return _serve_http(config, insecure_dev=args.insecure_dev)
     if config.server.stdio_role is None:
         logger.warning("server.stdio_role is not set: the stdio user cannot see any connection")
+    for warning in config_warnings(config):
+        logger.warning(warning)
     try:
         app = build_app(config, resolver=StdioPrincipalResolver(config.server.stdio_role), audit=LogAuditSink())
         logger.info("starting ratatoskr %s over stdio with %d connection(s)", __version__, len(config.connections))

@@ -569,9 +569,8 @@ async def test_userinfo_sub_must_match_the_id_token_sub(oidc, fake_issuer) -> No
     await oidc.complete("c", VERIFIER, "nn")
     fake_issuer.userinfo = {"sub": "someone-else", "email": "alice@example.com"}
     fake_issuer.queue_token_response(access_token="up-access")
-    with pytest.raises(IdentityError, match="sub") as info:
+    with pytest.raises(UpstreamRejectedError, match="sub"):
         await oidc.refresh("up-1")
-    assert not isinstance(info.value, UpstreamUnavailableError)
 
 
 async def test_sub_is_tracked_across_upstream_rotation(oidc, fake_issuer) -> None:
@@ -580,7 +579,7 @@ async def test_sub_is_tracked_across_upstream_rotation(oidc, fake_issuer) -> Non
     fake_issuer.queue_token_response(id_token=fake_issuer.id_token(), refresh_token="up-2")
     assert (await oidc.refresh("up-1")).refresh_token == "up-2"
     fake_issuer.queue_token_response(id_token=fake_issuer.id_token(sub="someone-else"), refresh_token="up-3")
-    with pytest.raises(IdentityError, match="sub"):
+    with pytest.raises(UpstreamRejectedError, match="sub"):
         await oidc.refresh("up-2")
 
 

@@ -30,7 +30,7 @@ The group names are matched exactly against the keys under `roles:`.
 | Field | Value |
 |---|---|
 | Name | `ratatoskr` |
-| Authorization flow | `default-provider-authorization-implicit-consent` (or the explicit-consent flow) |
+| Authorization flow | **`default-provider-authorization-explicit-consent`** (recommended, see below) |
 | Client type | **Confidential** |
 | Client ID / Client Secret | generated; copy both into the environment as `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` |
 | Redirect URIs/Origins | **Strict**, exactly `https://mcp.example.com/oauth/callback` |
@@ -40,6 +40,15 @@ The group names are matched exactly against the keys under `roles:`.
 | Subject mode | any; Ratatoskr uses the claim named by `subject_claim` (default `email`), see below |
 | Access code validity | `minutes=1` (default) |
 | Refresh token validity | at least `auth.refresh_token_ttl` (default 30 days) |
+
+**Explicit consent.** In OIDC mode Ratatoskr shows no consent page of its own: `/login` sends the browser straight
+to Authentik, and if Authentik also consents implicitly, a user who is already signed in there is sent back with a
+code without seeing anything. Any MCP client that registered itself (dynamic registration is open by design) could
+then start a sign-in in that user's browser and obtain a session for them, as long as its redirect URI is on
+`server.allowed_redirect_hosts` (a confused deputy). Two things limit that: keep `allowed_redirect_hosts` to the
+hosts of the clients you actually use (the default is claude.ai, claude.com and loopback), and use Authentik's
+explicit-consent flow so that every new sign-in stops at a page where the user confirms it. Authentik remembers the
+consent per user and application, so this costs one click per user, not one per sign-in.
 
 `offline_access` is mandatory: Ratatoskr re-validates every user at Authentik on each of its own refreshes (at most
 `auth.access_token_ttl`, default 1 hour, apart). Without an Authentik refresh token that check is impossible, so
@@ -152,13 +161,15 @@ Run these after every Authentik or Ratatoskr upgrade.
       no signing key is selected on the provider).
 - [ ] `docker exec ratatoskr ratatoskr check-config` succeeds, prints no secret and no warning you did not expect.
 - [ ] From the internal network: `docker exec ratatoskr python -c "import urllib.request as u;
-      print(u.urlopen('http://127.0.0.1:8000/readyz').read())"` → `{"status":"ready"}`; `docker ps` shows
-      `(healthy)`. From outside, `https://mcp.example.com/healthz` is not reachable.
-- [ ] `curl -sI https://mcp.example.com/.well-known/oauth-authorization-server` has a
-      `Strict-Transport-Security` header, and the body lists `/authorize`, `/token`, `/register`, `/revoke` under
-      `https://mcp.example.com`.
+      print(u.urlopen('http://127.0.0.1:8000/readyz').read().decode())"` prints `{"status":"ready"}`; `docker ps`
+      shows `(healthy)`. From outside, `https://mcp.example.com/healthz` answers 404 (hidden by the proxy).
+- [ ] `curl -sI https://mcp.example.com/.well-known/oauth-authorization-server` (headers only) shows a
+      `Strict-Transport-Security` header, and `curl -s https://mcp.example.com/.well-known/oauth-authorization-server`
+      (the JSON document) lists `/authorize`, `/token`, `/register` and `/revoke` under `https://mcp.example.com`
+      and `"scopes_supported": ["mcp"]`.
 - [ ] In claude.ai: *Settings → Connectors → Add custom connector*, URL `https://mcp.example.com/mcp`. The browser
-      goes to Authentik, then back to claude.ai; the connector shows as connected.
+      goes to Authentik (the consent page names the `Ratatoskr` application), then back to claude.ai; the connector
+      shows as connected.
 - [ ] Ask Claude to run `list_connections`: exactly the connections your groups grant are listed.
 - [ ] Remove yourself from a group in Authentik. Within one access-token lifetime (default 1 hour) the connection
       disappears from `list_connections` without reconnecting.
@@ -181,6 +192,7 @@ Sign-in errors are shown to the user as a short generic page; the reason is in R
 | `ID token signature rejected: …` | Token signed with an algorithm Ratatoskr does not accept, or with a key not in the JWKS |
 | `OIDC discovery issuer does not match the configured issuer` | `auth.oidc.issuer` differs from Authentik's issuer (check the trailing slash and slug) |
 | `claim 'email' is missing from the identity` | `email` scope not selected, "Include claims in id_token" off, or the user has no e-mail; or set `subject_claim: sub` |
+| `OIDC sign-in failed, issuer unavailable: …` (user sees "Sign-in is unavailable"; audit `login_failed`, result `error`, `upstream_unavailable`) | Authentik unreachable or answering 5xx from Ratatoskr's network; not a refused user |
 | User sees no connections | `groups` scope missing, "Include claims in id_token" off, or group names differ from the keys under `roles:` |
 | Users must sign in every hour | `offline_access` scope missing on the provider |
 | "Sign-in could not be verified" page after Authentik | The browser dropped the `__Host-ratatoskr-oidc` flow cookie: start from the same browser, and do not open the callback URL in another profile |

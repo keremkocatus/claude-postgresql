@@ -27,7 +27,13 @@ from starlette.responses import RedirectResponse, Response
 from ratatoskr.auth.crypto import Signer
 from ratatoskr.auth.csrf import CsrfProtector
 from ratatoskr.auth.events import record_auth_event
-from ratatoskr.auth.identity.base import IdentityError, PasswordIdentityProvider, RedirectIdentityProvider
+from ratatoskr.auth.identity.base import (
+    IdentityError,
+    PasswordIdentityProvider,
+    RedirectIdentityProvider,
+    UpstreamRejectedError,
+    UpstreamUnavailableError,
+)
 from ratatoskr.auth.identity.local import normalize_username
 from ratatoskr.auth.oauth_server import PENDING_TTL_SECONDS, PendingRequest, RatatoskrOAuthProvider
 from ratatoskr.auth.pages import apply_security_headers, login_page, message_page
@@ -244,9 +250,30 @@ class LoginRoutes:
             return self._finish(_expired())
         try:
             login = await self._oidc.complete(code, verifier, nonce)
+        except UpstreamUnavailableError as exc:
+            # An outage, not a refusal: audited as an error so it does not read like a wrong or blocked user.
+            logger.warning("OIDC sign-in failed, issuer unavailable: %s", exc)
+            record_auth_event(
+                self._audit,
+                "login_failed",
+                subject="unknown",
+                auth_source="oidc",
+                result="error",
+                error_class="upstream_unavailable",
+            )
+            return self._finish(
+                message_page("Sign-in is unavailable", "The identity provider could not be reached.", 502)
+            )
         except IdentityError as exc:
             logger.warning("OIDC sign-in failed: %s", exc)
-            record_auth_event(self._audit, "login_failed", subject="unknown", auth_source="oidc", result="denied")
+            record_auth_event(
+                self._audit,
+                "login_failed",
+                subject="unknown",
+                auth_source="oidc",
+                result="denied",
+                error_class="upstream_rejected" if isinstance(exc, UpstreamRejectedError) else "identity_invalid",
+            )
             return self._finish(
                 message_page("Sign-in failed", "The identity provider's answer could not be verified.", 400)
             )

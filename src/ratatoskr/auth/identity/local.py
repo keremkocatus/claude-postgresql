@@ -13,7 +13,6 @@ Verifications run on a small dedicated thread pool, so a login flood cannot occu
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 import secrets
 import unicodedata
@@ -25,8 +24,6 @@ from argon2.low_level import Type
 
 from ratatoskr.auth.principal import Principal
 from ratatoskr.config.models import LocalUser
-
-logger = logging.getLogger(__name__)
 
 _HASHER = PasswordHasher()
 # PHC string of argon2id v1.3: parameters, then unpadded standard-base64 salt (>= 8 bytes) and hash (>= 16 bytes).
@@ -117,6 +114,9 @@ def _verify(password_hash: str, password: str) -> bool:
 
 
 class LocalIdentityProvider:
+    """Refuses unusable hashes (``ValueError``). Usable but weak ones are not logged here: the HTTP preconditions
+    collect :func:`password_hash_weakness` and ``serve`` / ``check-config`` report each warning once."""
+
     def __init__(self, users: list[LocalUser]) -> None:
         self._users: dict[str, LocalUser] = {}
         for user in users:
@@ -129,9 +129,6 @@ class LocalIdentityProvider:
             if key in self._users:
                 raise ValueError(f"auth.local user {user.username!r} is configured more than once (names ignore case)")
             self._users[key] = user
-            weakness = password_hash_weakness(user)
-            if weakness is not None:
-                logger.warning(weakness)
         costs = {user.username: _cost(user) for user in users}
         if len(set(costs.values())) > 1:
             names = ", ".join(repr(name) for name in costs)

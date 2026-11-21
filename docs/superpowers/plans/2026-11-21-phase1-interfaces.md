@@ -362,7 +362,7 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Task 13 (Q5 review): `/authorize` için IP başına rate-limit (`RateLimiter.reserve`), `/register`, `/token`, `/revoke`,
   `/authorize`, `/login`, `/oauth/callback` için ~64 KiB ASGI istek gövdesi sınırı.
 - Kod tekrar kullanımı: token'lar iptal edilmez (RFC 6749 §4.1.2 SHOULD'dan bilinçli sapma; PKCE kapısı + tek kullanımlık
-  silme). Refresh için 10 sn tolerans penceresi; `auth.session_max_age` (varsayılan 30 gün) mutlak oturum ömrü.
+  silme). Refresh için 5 sn tolerans penceresi (`REFRESH_GRACE_SECONDS`); `auth.session_max_age` (varsayılan 30 gün) mutlak oturum ömrü.
 - Task 13/16 (Q6a): per-IP anahtarı `rate_limit_address(client_ip(scope, parse_trusted_proxies(...)))`; CSRF çerezi
   `csrf.cookie_name` ile okunur; OIDC callback için Lax çerez Task 13'te kurulur. `serve` LocalIdentityProvider'ı
   preconditions'ta bir kez kurar — tekrar kurmak yerine aynı örneği kullan (çift argon2 maliyeti ve çift uyarı logu).

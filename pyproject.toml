@@ -20,7 +20,9 @@ classifiers = [
     "Topic :: Database",
 ]
 dependencies = [
-    "mcp>=1.30,<2",
+    # Capped to the minor release whose internals were verified (handler, settings and client-auth behaviour the
+    # OAuth layer relies on; see the "SDK facts" in the Plan 1b document). Re-verify them before raising the cap.
+    "mcp>=1.30,<1.31",
     "asyncpg>=0.30.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",

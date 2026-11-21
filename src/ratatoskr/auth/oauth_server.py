@@ -1,12 +1,13 @@
 """MCP OAuth 2.1 authorization server backed by the state store (spec §5.2).
 
 The SDK handlers already enforce: ``code_challenge`` present and method ``S256`` (``/authorize``), redirect_uri
-registered for the client, scope within the client's registered scope, PKCE verifier match, redirect_uri equality
-between ``/authorize`` and ``/token``, code and refresh-token expiry, client authentication and refresh scope
-narrowing. This provider adds what the SDK leaves to us: the redirect host allowlist, S256 challenge shape, RFC 8707
-resource binding, the ``mcp`` scope limit, request and metadata size limits, single-use codes, hashed storage, an
-absolute session lifetime (``auth.session_max_age``), refresh rotation with a short retry grace and reuse detection,
-family revocation, local password-change detection and upstream (OIDC) re-validation.
+registered for the client, PKCE verifier match, redirect_uri equality between ``/authorize`` and ``/token``, code and
+refresh-token expiry, client authentication and refresh scope narrowing. This provider adds what the SDK leaves to
+us: the redirect host allowlist, S256 challenge shape, RFC 8707 resource binding, the single ``mcp`` scope (requested
+scopes are replaced by it at registration and ``/authorize``, not refused), request and metadata size limits,
+single-use codes, hashed storage, an absolute session lifetime (``auth.session_max_age``), refresh rotation with a
+short retry grace and reuse detection, family revocation, local password-change and user-removal detection and
+upstream (OIDC) re-validation.
 
 Error descriptions returned to clients are fixed texts. Logs name the subject and client id, never a token, code,
 client secret, password hash or upstream refresh token.
@@ -67,7 +68,7 @@ logger = logging.getLogger("ratatoskr.auth.oauth")
 
 PENDING_TTL_SECONDS = 600.0
 CODE_TTL_SECONDS = 300.0
-# Short on purpose: a thief who refreshes first survives a victim retry inside this window (review Q5).
+# Short on purpose: a thief who refreshes first survives a victim retry inside this window.
 REFRESH_GRACE_SECONDS = 5.0
 DEFAULT_SCOPES = ("mcp",)
 MAX_REDIRECT_URIS = 10
@@ -82,6 +83,10 @@ _ALLOWED_SCOPES = frozenset(DEFAULT_SCOPES)
 _S256_CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")
 _SUPPORTED_CLIENT_AUTH = frozenset({"none", "client_secret_post", "client_secret_basic"})
 _MAX_LOGGED_NAME = 100
+# Family problems that revoke the family (audited as ``session_revoked``, error class with ``_`` for the spaces).
+USER_REMOVED = "user removed"
+PASSWORD_CHANGED = "password changed"
+_REVOKING_PROBLEMS = frozenset({USER_REMOVED, PASSWORD_CHANGED})
 
 
 def _client_id(client: OAuthClientInformationFull) -> str:
@@ -108,6 +113,19 @@ def _code_aad(subject: str) -> str:
 def _family_aad(subject: str, family_id: str) -> str:
     """Associated data of an upstream refresh token stored for a token family: subject and family, unambiguously."""
     return json.dumps(["family", subject, family_id])
+
+
+class RegisteredClient(OAuthClientInformationFull):
+    """A stored client as handed to the SDK. Scope policy is the provider's: :meth:`validate_scope` refuses nothing.
+
+    The SDK's ``/authorize`` handler calls ``client.validate_scope`` and answers ``invalid_scope`` for any name the
+    client did not register. Clients ask for scopes of other servers (``claudeai``, ``openid profile``), so the
+    requested names are passed through unchanged and :meth:`RatatoskrOAuthProvider.authorize` caps their number and
+    grants ``mcp``.
+    """
+
+    def validate_scope(self, requested_scope: str | None) -> list[str] | None:
+        return None if requested_scope is None else requested_scope.split()
 
 
 def _metadata_problem(client: OAuthClientInformationFull) -> str | None:
@@ -181,7 +199,7 @@ class RatatoskrOAuthProvider(
         if stored is None:
             return None
         try:
-            client = OAuthClientInformationFull.model_validate_json(stored.metadata_json)
+            client = RegisteredClient.model_validate_json(stored.metadata_json)
         except ValidationError:
             logger.warning("client %s has unreadable stored metadata; treating it as unknown", client_id)
             return None
@@ -211,8 +229,6 @@ class RatatoskrOAuthProvider(
             )
         if method != "none" and not client_info.client_secret:
             raise RegistrationError("invalid_client_metadata", "a confidential client needs a client_secret")
-        if client_info.scope is not None and not set(client_info.scope.split()) <= _ALLOWED_SCOPES:
-            raise RegistrationError("invalid_client_metadata", "the only supported scope is 'mcp'")
         problem = _metadata_problem(client_info)
         if problem is not None:
             raise RegistrationError("invalid_client_metadata", problem)
@@ -225,7 +241,10 @@ class RatatoskrOAuthProvider(
             problem = redirect_uri_problem(str(uri), self._allowed_hosts)
             if problem is not None:
                 raise RegistrationError("invalid_redirect_uri", problem)
-        metadata = client_info.model_copy(update={"client_secret": None}).model_dump_json(exclude_none=True)
+        # RFC 7591 §3.2.1: the server may replace requested metadata. Whatever scope was asked for, it is ``mcp``.
+        metadata = client_info.model_copy(
+            update={"client_secret": None, "scope": " ".join(DEFAULT_SCOPES)}
+        ).model_dump_json(exclude_none=True)
         if len(metadata.encode("utf-8")) > MAX_CLIENT_METADATA_BYTES:
             raise RegistrationError(
                 "invalid_client_metadata", f"client metadata is larger than {MAX_CLIENT_METADATA_BYTES} bytes"
@@ -250,8 +269,9 @@ class RatatoskrOAuthProvider(
             raise AuthorizeError("invalid_request", f"state is longer than {MAX_STATE_LENGTH} characters")
         if params.scopes is not None and len(_unique(params.scopes)) > MAX_SCOPES:
             raise AuthorizeError("invalid_request", f"at most {MAX_SCOPES} scopes may be requested")
-        if params.scopes is not None and not set(params.scopes) <= _ALLOWED_SCOPES:
-            raise AuthorizeError("invalid_scope", "the only supported scope is 'mcp'")
+        if params.scopes is not None:
+            # Unknown names are ignored rather than refused: the grant is always ``mcp``.
+            params = params.model_copy(update={"scopes": list(DEFAULT_SCOPES)})
         # The allowlist may have been tightened since the client registered.
         if redirect_uri_problem(str(params.redirect_uri), self._allowed_hosts) is not None:
             raise AuthorizeError("invalid_request", "redirect_uri is not allowed by this server")
@@ -427,21 +447,25 @@ class RatatoskrOAuthProvider(
         stored = self._password_hashes.get(normalize_username(subject))
         return None if stored is None else self._keyring.password_fingerprint.sign(stored)
 
-    def _password_changed(self, family: TokenFamily) -> bool:
+    def _local_problem(self, family: TokenFamily) -> str | None:
+        """``user removed`` when the subject is no longer configured, ``password changed`` when its hash changed."""
         current = self._password_fingerprint(family.subject)
+        if current is None:
+            return USER_REMOVED
         recorded = family.password_fingerprint
-        if current is None or recorded is None:
-            return True
-        return not hmac.compare_digest(current.encode("ascii"), recorded.encode("ascii"))
+        if recorded is None or not hmac.compare_digest(current.encode("ascii"), recorded.encode("ascii")):
+            return PASSWORD_CHANGED
+        return None
 
     def _family_problem(self, family: TokenFamily | None, principal: Principal, now: float) -> str | None:
-        """Why tokens of this family are no longer valid: unknown family, session too old or password changed."""
+        """Why tokens of this family are no longer valid: unknown family, session too old, user removed or password
+        changed."""
         if family is None:
             return "unknown token family"
         if now >= family.created_at + self._max_age:
             return "session max age reached"
-        if principal.auth_source == "local" and self._password_changed(family):
-            return "password changed"
+        if principal.auth_source == "local":
+            return self._local_problem(family)
         return None
 
     async def load_access_token(self, token: str) -> RatatoskrAccessToken | None:
@@ -502,9 +526,23 @@ class RatatoskrOAuthProvider(
         )
 
     async def _end_family(self, record: TokenRecord, problem: str, now: float) -> None:
-        """A password change revokes the family; an expired session or a missing family just stops working."""
-        if problem == "password changed" and await self._store.revoke_family(record.family_id, now):
-            logger.warning("password of %s changed; token family revoked", record.principal.subject)
+        """A removed user or a password change revokes the family (logged and audited once, when it is revoked); an
+        expired session or a missing family just stops working."""
+        if problem not in _REVOKING_PROBLEMS or not await self._store.revoke_family(record.family_id, now):
+            return
+        subject = record.principal.subject
+        if problem == USER_REMOVED:
+            logger.warning("local user %s is no longer configured; token family revoked", subject)
+        else:
+            logger.warning("password of %s changed; token family revoked", subject)
+        record_auth_event(
+            self._audit,
+            "session_revoked",
+            subject=subject,
+            auth_source=record.principal.auth_source,
+            result="denied",
+            error_class=problem.replace(" ", "_"),
+        )
 
     async def _refuse_used(self, record: TokenRecord, now: float) -> None:
         """A rotated refresh token came back: a retry inside the grace window, or reuse (revoke the family)."""
@@ -563,8 +601,7 @@ class RatatoskrOAuthProvider(
             else:
                 current = self._local.lookup(principal.subject) if self._local is not None else None
                 if current is None:
-                    await self._store.revoke_family(record.family_id, now)
-                    logger.warning("refresh refused for %s: the local user no longer exists", principal.subject)
+                    await self._end_family(record, USER_REMOVED, now)
                     raise TokenError("invalid_grant", "the user no longer exists")
                 principal = current
             access, refresh, response = self._new_pair(

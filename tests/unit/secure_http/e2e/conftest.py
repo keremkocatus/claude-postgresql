@@ -54,21 +54,30 @@ class OAuthDriver:
         self.app = app
         self.client_id = ""
         self.client_secret = ""
+        self.auth_method = "client_secret_post"
         self.verifier = secrets.token_urlsafe(48)
         self._ids = 0
 
-    async def register(self, redirect_uri: str = CLIENT_REDIRECT) -> httpx.Response:
-        response = await self.http.post(
-            "/register",
-            json={
-                "redirect_uris": [redirect_uri],
-                "client_name": "Claude",
-                "token_endpoint_auth_method": "client_secret_post",
-            },
-        )
+    async def register(
+        self,
+        redirect_uri: str = CLIENT_REDIRECT,
+        *,
+        auth_method: str = "client_secret_post",
+        scope: str | None = None,
+    ) -> httpx.Response:
+        """DCR. ``auth_method="none"`` registers a public client (Claude Code), which gets no secret."""
+        metadata: dict[str, Any] = {
+            "redirect_uris": [redirect_uri],
+            "client_name": "Claude",
+            "token_endpoint_auth_method": auth_method,
+        }
+        if scope is not None:
+            metadata["scope"] = scope
+        response = await self.http.post("/register", json=metadata)
         if response.status_code == 201:
             body = response.json()
-            self.client_id, self.client_secret = body["client_id"], body["client_secret"]
+            self.client_id, self.client_secret = body["client_id"], body.get("client_secret") or ""
+            self.auth_method = auth_method
         return response
 
     def authorize_params(self, **overrides: str | None) -> dict[str, str]:
@@ -84,8 +93,8 @@ class OAuthDriver:
         }
         return {k: v for k, v in values.items() if v is not None}
 
-    async def authorize(self) -> str:
-        response = await self.http.get("/authorize", params=self.authorize_params())
+    async def authorize(self, **overrides: str | None) -> str:
+        response = await self.http.get("/authorize", params=self.authorize_params(**overrides))
         assert response.status_code == 302, response.text
         return response.headers["location"]
 
@@ -109,10 +118,18 @@ class OAuthDriver:
         assert response.status_code == 302, response.text
         return code_from(response.headers["location"])
 
+    def _client_auth(self) -> tuple[dict[str, str], httpx.BasicAuth | None]:
+        """Form fields and HTTP auth that authenticate this client as it registered (none, post or basic)."""
+        fields = {"client_id": self.client_id}
+        if self.auth_method == "client_secret_basic":
+            return fields, httpx.BasicAuth(self.client_id, self.client_secret)
+        if self.client_secret:
+            fields["client_secret"] = self.client_secret
+        return fields, None
+
     async def token(self, **form: str) -> httpx.Response:
-        return await self.http.post(
-            "/token", data={"client_id": self.client_id, "client_secret": self.client_secret, **form}
-        )
+        fields, auth = self._client_auth()
+        return await self.http.post("/token", data={**fields, **form}, auth=auth or httpx.USE_CLIENT_DEFAULT)
 
     async def exchange(self, code: str) -> dict[str, Any]:
         response = await self.token(
@@ -125,9 +142,8 @@ class OAuthDriver:
         return await self.token(grant_type="refresh_token", refresh_token=refresh_token)
 
     async def revoke(self, token: str) -> httpx.Response:
-        return await self.http.post(
-            "/revoke", data={"token": token, "client_id": self.client_id, "client_secret": self.client_secret}
-        )
+        fields, auth = self._client_auth()
+        return await self.http.post("/revoke", data={"token": token, **fields}, auth=auth or httpx.USE_CLIENT_DEFAULT)
 
     async def mcp_post(
         self,

@@ -12,14 +12,19 @@ deadline, does not follow redirects and reads at most :data:`MAX_RESPONSE_BYTES`
 than :data:`JWKS_MAX_STALE_SECONDS`); an unknown ``kid`` forces a refetch at most once per
 :data:`JWKS_REFRESH_COOLDOWN_SECONDS`, so made-up key ids cannot make us hammer the issuer.
 
-Errors — retry versus revoke. Only a definitive answer about the user's session is a plain :class:`IdentityError` or
-:class:`UpstreamRejectedError` (the caller revokes our tokens): token endpoint 400/401, userinfo 401/403, an ID token
-that fails verification, a changed ``sub``. A discovery document that names another issuer or plain-http endpoints
-is a hard error at sign-in and a pause (:class:`UpstreamUnavailableError`) during refresh.
-Everything else — network errors, timeouts, 3xx, 408, 429, 5xx, any other non-200, a non-JSON or oversized body,
-every other failure of discovery or JWKS, an unknown ``kid`` while refetching is cooling down, cached keys past the
-staleness cap — is :class:`UpstreamUnavailableError` (keep our tokens, retry later). Messages never contain tokens or
-secrets.
+Errors, in three classes (the OAuth provider acts on them during refresh; at sign-in each one fails the sign-in):
+
+- :class:`UpstreamRejectedError`, a definitive answer about the user's session: token endpoint 400/401, userinfo
+  401/403, a ``sub`` that differs from the one the session signed in with. The provider revokes the token family.
+- :class:`UpstreamUnavailableError`, no usable answer: network errors, timeouts, 3xx, 408, 429, 5xx, any other
+  non-200, a non-JSON or oversized body, every other failure of discovery or JWKS, an unknown ``kid`` while
+  refetching is cooling down, cached keys past the staleness cap, and during refresh a discovery document that names
+  another issuer or plain-http endpoints (a hard error at sign-in). The provider keeps the family; retry later.
+- Any other :class:`IdentityError`, an answer that cannot be verified: an ID token that fails signature or claim
+  checks, an identity without ``sub`` or the subject claim. The provider refuses that refresh but keeps the family,
+  because the cause may be on the issuer's or our side rather than the user's.
+
+Messages never contain tokens or secrets.
 
 ``sub`` continuity (OIDC Core §5.3.2, §12.2): the ``sub`` seen for an upstream refresh token is remembered in memory
 (bounded, keyed by the token's hash), and a refresh whose ID token or userinfo names another ``sub`` is refused.
@@ -429,8 +434,9 @@ class OidcIdentityProvider:
     async def refresh(self, refresh_token: str) -> ExternalLogin:
         """Re-read the identity with the upstream refresh token.
 
-        Raises :class:`UpstreamUnavailableError` when the issuer gives no usable answer (keep our tokens, retry later)
-        and any other :class:`IdentityError` when the session is refused or the answer fails verification (revoke).
+        Raises :class:`UpstreamRejectedError` when the session is refused or its ``sub`` changed (revoke),
+        :class:`UpstreamUnavailableError` when the issuer gives no usable answer (keep our tokens, retry later) and any
+        other :class:`IdentityError` when the answer fails verification (refuse this refresh, keep the family).
         """
         try:
             await self.metadata()
@@ -449,7 +455,7 @@ class OidcIdentityProvider:
         if not isinstance(sub, str) or not sub:
             raise IdentityError("upstream identity has no 'sub'")
         if known_sub is not None and not _same_secret(sub, known_sub):
-            raise IdentityError("upstream 'sub' differs from the one this session signed in with")
+            raise UpstreamRejectedError("upstream 'sub' differs from the one this session signed in with")
         principal = self._principal(claims)
         new_refresh = data.get("refresh_token")
         upstream_refresh = new_refresh if isinstance(new_refresh, str) and new_refresh else refresh_token
