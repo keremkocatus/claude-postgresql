@@ -120,6 +120,9 @@ Read access is enforced in layers:
 4. When a connection goes back to the pool, the session is reset: role and session authorization, SQL prepared
    statements, temporary tables and sequence state, plus `RESET ALL`.
 5. Catalog (discovery) queries pin `search_path` to `pg_catalog`, so user objects cannot shadow catalog functions.
+6. `pg_query` and `pg_explain` refuse `COPY`, `DO` blocks, `dblink*(...)` calls and server-file functions
+   (`pg_read_file`, `pg_ls_dir`, `pg_stat_file`, ...) before anything reaches the database. This is a
+   convenience that catches the obvious cases, not a guarantee.
 
 Write connections: `pg_execute` runs all statements in one transaction and rejects `COPY` and transaction
 control (`BEGIN`, `COMMIT`, `SAVEPOINT`, ...); a few dangerous operations (`pg_read_file`, `COPY ... PROGRAM`,

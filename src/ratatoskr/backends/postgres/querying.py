@@ -8,7 +8,7 @@ from typing import Any
 
 from ratatoskr.backends.postgres.backend import PostgresBackend
 from ratatoskr.backends.postgres.formatting import markdown_table
-from ratatoskr.backends.postgres.guard import check_explain_target, check_sql, check_write_sql
+from ratatoskr.backends.postgres.guard import check_explain_target, check_read_sql, check_write_sql
 from ratatoskr.config.models import Access
 from ratatoskr.tools.runtime import ToolOutput
 
@@ -34,7 +34,7 @@ def _fence(text: str) -> str:
 
 async def run_query(backend: PostgresBackend, sql: str, params: Sequence[Any]) -> ToolOutput:
     limits = backend.config.limits
-    check_sql(sql, max_length=limits.max_query_length)
+    check_read_sql(sql, max_length=limits.max_query_length)  # defence in depth; the DB role is the boundary
     result = await backend.fetch_rows(sql, params, limits.max_rows, max_bytes=limits.max_response_bytes)
     shown = len(result.rows)
     header = f"{shown} row(s) in {result.elapsed_ms:.1f} ms."
@@ -78,6 +78,7 @@ async def run_explain(
 ) -> ToolOutput:
     limits = backend.config.limits
     check_explain_target(sql, max_length=limits.max_query_length)
+    check_read_sql(sql, max_length=limits.max_query_length)  # defence in depth; the DB role is the boundary
     use_write_pool = analyze and access >= Access.WRITE
     if use_write_pool:
         check_write_sql(sql, max_length=limits.max_query_length)

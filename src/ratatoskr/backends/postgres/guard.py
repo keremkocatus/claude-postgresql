@@ -16,6 +16,10 @@ _DANGEROUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("pg_write_file", re.compile(r"\bpg_write_file\b", re.IGNORECASE)),
     ("lo_import", re.compile(r"\blo_import\b", re.IGNORECASE)),
     ("lo_export", re.compile(r"\blo_export\b", re.IGNORECASE)),
+    # Server file-system reconnaissance (pg_read_server_files / superuser).
+    ("pg_ls_dir", re.compile(r"\bpg_ls_dir\b", re.IGNORECASE)),
+    ("pg_ls_*dir", re.compile(r"\bpg_ls_\w*dir\b", re.IGNORECASE)),
+    ("pg_stat_file", re.compile(r"\bpg_stat_file\b", re.IGNORECASE)),
     ("CREATE EXTENSION", re.compile(r"\bCREATE\s+EXTENSION\b", re.IGNORECASE)),
 )
 
@@ -24,6 +28,7 @@ _TRANSACTION_CONTROL_WORDS = frozenset({"BEGIN", "COMMIT", "END", "ROLLBACK", "A
 # ... and two-word forms: START TRANSACTION, PREPARE TRANSACTION (PREPARE name AS ... is allowed).
 _TRANSACTION_CONTROL_PAIRS = frozenset({("START", "TRANSACTION"), ("PREPARE", "TRANSACTION")})
 _WORD_RE = re.compile(r"[A-Za-z_]+")
+_DBLINK_RE = re.compile(r"\bdblink\w*\s*\(", re.IGNORECASE)
 _EXPLAIN_RE = re.compile(r"\AEXPLAIN\b", re.IGNORECASE)
 
 
@@ -99,12 +104,36 @@ def check_sql(sql: str, *, max_length: int) -> None:
         raise InvalidRequestError(f"The SQL statement is {len(sql)} characters long; the limit is {max_length}.")
 
 
-def check_write_sql(sql: str, *, max_length: int) -> None:
-    """Extra checks for statements that run on the write pool (pg_execute, write-level EXPLAIN ANALYZE)."""
-    check_sql(sql, max_length=max_length)
+def _check_dangerous(sql: str) -> None:
     for label, pattern in _DANGEROUS_PATTERNS:
         if pattern.search(sql):
             raise InvalidRequestError(f"Blocked operation: {label} is not allowed through this server.")
+
+
+def check_read_sql(sql: str, *, max_length: int) -> None:
+    """Extra checks for pg_query and pg_explain (read pool, or write pool for write-level EXPLAIN ANALYZE).
+
+    Defence in depth only. A READ ONLY transaction does not stop COPY TO PROGRAM / TO '<file>' or the server
+    file functions: with a superuser or a pg_execute_server_program / pg_*_server_files role they would run
+    programs and touch files on the database host. Only a restricted DB role really prevents that.
+    """
+    check_sql(sql, max_length=max_length)
+    keyword = leading_keyword(sql)
+    if keyword == "COPY":
+        raise InvalidRequestError("COPY is not supported here; run the SELECT itself to get the rows.")
+    if keyword == "DO":
+        # A DO block returns no rows, so on the read path it can only have side effects (e.g. EXECUTE 'COPY ...').
+        raise InvalidRequestError("DO blocks are not supported in pg_query or pg_explain; they return no rows.")
+    if _DBLINK_RE.search(sql):
+        # dblink opens its own connection, outside this READ ONLY transaction, so it could write.
+        raise InvalidRequestError("dblink is not allowed in pg_query or pg_explain; it bypasses read-only mode.")
+    _check_dangerous(sql)
+
+
+def check_write_sql(sql: str, *, max_length: int) -> None:
+    """Extra checks for statements that run on the write pool (pg_execute, write-level EXPLAIN ANALYZE)."""
+    check_sql(sql, max_length=max_length)
+    _check_dangerous(sql)
     if _is_transaction_control(sql):
         raise InvalidRequestError(
             "Transaction control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, ...) are not allowed: "

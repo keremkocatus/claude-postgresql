@@ -1,7 +1,83 @@
 import pytest
 
 from ratatoskr.backends.errors import InvalidRequestError
-from ratatoskr.backends.postgres.guard import check_explain_target, check_sql, check_write_sql
+from ratatoskr.backends.postgres.guard import check_explain_target, check_read_sql, check_sql, check_write_sql
+
+# -- read path (pg_query, pg_explain) -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "COPY (SELECT 1) TO PROGRAM 'sleep 2'",
+        "COPY items TO '/tmp/x'",
+        "copy items to stdout",
+        "/* a /* b */ */ COPY items TO STDOUT",
+        "  -- c\nCOPY (SELECT 1) TO STDOUT",
+    ],
+)
+def test_read_path_rejects_copy(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="COPY is not supported here"):
+        check_read_sql(sql, max_length=1000)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT pg_read_file('/etc/passwd')",
+        "SELECT pg_read_binary_file('/etc/passwd')",
+        "SELECT lo_import('/etc/passwd')",
+        "SELECT lo_export(1, '/tmp/x')",
+        "SELECT pg_write_file('/tmp/x', 'y')",
+        "SELECT * FROM pg_ls_dir('.')",
+        "SELECT pg_stat_file('postgresql.conf')",
+        "SELECT * FROM pg_ls_logdir()",
+        "SELECT * FROM PG_LS_WALDIR()",
+        "SELECT * FROM pg_ls_tmpdir()",
+        "SELECT * FROM pg_ls_archive_statusdir()",
+    ],
+)
+def test_read_path_applies_the_dangerous_function_list(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="Blocked operation"):
+        check_read_sql(sql, max_length=1000)
+
+
+@pytest.mark.parametrize("sql", ["SELECT * FROM pg_ls_dir('.')", "SELECT pg_stat_file('postgresql.conf')"])
+def test_write_path_blocks_the_file_listing_functions_too(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="Blocked operation"):
+        check_write_sql(sql, max_length=1000)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DO $$ BEGIN EXECUTE 'CO' || 'PY (SELECT 1) TO PROGRAM ''true'''; END $$",
+        "/* x */ do language plpgsql $$ BEGIN NULL; END $$",
+    ],
+)
+def test_read_path_rejects_do_blocks(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="DO blocks are not supported"):
+        check_read_sql(sql, max_length=1000)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM copy_log WHERE note = 'do it'",
+        "WITH c AS (SELECT 1) SELECT * FROM c",
+        "SELECT pg_size_pretty(pg_database_size(current_database()))",
+        "SHOW work_mem",
+    ],
+)
+def test_read_path_allows_ordinary_reads(sql: str) -> None:
+    check_read_sql(sql, max_length=1000)
+
+
+def test_read_path_keeps_the_basic_checks() -> None:
+    with pytest.raises(InvalidRequestError, match="empty"):
+        check_read_sql(" -- nothing", max_length=1000)
+    with pytest.raises(InvalidRequestError, match="limit is 5"):
+        check_read_sql("SELECT 1 + 1", max_length=5)
 
 
 @pytest.mark.parametrize("sql", ["", "   ", "-- only a comment", "/* nothing */"])
@@ -121,3 +197,21 @@ def test_explain_prefix_rejected() -> None:
     with pytest.raises(InvalidRequestError, match="without EXPLAIN"):
         check_explain_target("EXPLAIN SELECT 1", max_length=1000)
     check_explain_target("SELECT 1", max_length=1000)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT dblink_exec('dbname=app', 'DELETE FROM items')",
+        "SELECT * FROM dblink('dbname=app', 'SELECT 1') AS t(x int)",
+        "SELECT dblink_connect('c', 'dbname=app')",
+        "select public.DBLINK_EXEC('x', 'y')",
+    ],
+)
+def test_read_path_rejects_dblink(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="dblink"):
+        check_read_sql(sql, max_length=10_000)
+
+
+def test_write_path_still_allows_dblink() -> None:
+    check_write_sql("SELECT dblink_exec('dbname=app', 'DELETE FROM items')", max_length=10_000)

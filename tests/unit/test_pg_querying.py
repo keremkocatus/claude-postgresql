@@ -64,6 +64,41 @@ async def test_query_guard_runs_before_database() -> None:
         await run_query(_backend(), "SELECT " + "1," * 40 + "1", [])
 
 
+READ_PATH_REJECTIONS = [
+    ("COPY (SELECT 1) TO PROGRAM 'sleep 2'", "COPY is not supported here"),
+    ("COPY t TO '/tmp/x'", "COPY is not supported here"),
+    ("COPY t TO STDOUT", "COPY is not supported here"),
+    ("SELECT pg_read_file('/etc/passwd')", "Blocked operation: pg_read_file"),
+    ("SELECT * FROM pg_ls_dir('.')", "Blocked operation: pg_ls_dir"),
+    ("DO $$ BEGIN NULL; END $$", "DO blocks are not supported"),
+]
+
+
+@pytest.mark.parametrize(("sql", "message"), READ_PATH_REJECTIONS)
+async def test_query_read_guard_runs_before_database(sql: str, message: str) -> None:
+    backend = StubBackend()
+    with pytest.raises(InvalidRequestError, match=message):
+        await run_query(backend, sql, [])
+    assert backend.calls == []
+
+
+@pytest.mark.parametrize(("access", "analyze"), [(Access.READ, False), (Access.READ, True), (Access.WRITE, False)])
+@pytest.mark.parametrize(("sql", "message"), READ_PATH_REJECTIONS)
+async def test_explain_read_guard_runs_before_database(access: Access, analyze: bool, sql: str, message: str) -> None:
+    backend = StubBackend()
+    with pytest.raises(InvalidRequestError, match=message):
+        await run_explain(backend, access, sql, [], analyze=analyze, buffers=False)
+    assert backend.calls == []
+
+
+@pytest.mark.parametrize("sql", ["COPY t TO STDOUT", "SELECT * FROM pg_ls_dir('.')"])
+async def test_write_level_explain_rejects_copy_and_file_functions(sql: str) -> None:
+    backend = StubBackend()
+    with pytest.raises(InvalidRequestError, match="COPY is not supported|Blocked operation"):
+        await run_explain(backend, Access.WRITE, sql, [], analyze=True, buffers=False)
+    assert backend.calls == []
+
+
 async def test_execute_guard_runs_before_database() -> None:
     with pytest.raises(InvalidRequestError, match="Transaction control"):
         await run_execute(_backend(), [("UPDATE t SET a = 1", []), ("COMMIT", [])])
