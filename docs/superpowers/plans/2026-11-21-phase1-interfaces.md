@@ -385,3 +385,4 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   bedeli). `/token` ve `/revoke` hacimsel DoS'u reverse proxy'de sınırlanır.
 - Plan metninde Task 13 Step 6'daki `scope["method"] == "POST"` filtresi yanlıştı (metot değiştirerek limit aşılıyordu);
   gerçek kod tüm metotları sayar, yalnız gerçek CORS preflight hariç.
+- Task 17 (Q7 review): uvicorn `timeout_graceful_shutdown=5`; Docker `stop_grace_period` ≥ 10 s olmalı ki audit kuyruğu boşaltılsın.
