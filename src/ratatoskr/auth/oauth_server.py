@@ -67,7 +67,8 @@ logger = logging.getLogger("ratatoskr.auth.oauth")
 
 PENDING_TTL_SECONDS = 600.0
 CODE_TTL_SECONDS = 300.0
-REFRESH_GRACE_SECONDS = 10.0
+# Short on purpose: a thief who refreshes first survives a victim retry inside this window (review Q5).
+REFRESH_GRACE_SECONDS = 5.0
 DEFAULT_SCOPES = ("mcp",)
 MAX_REDIRECT_URIS = 10
 MAX_STATE_LENGTH = 512
