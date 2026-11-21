@@ -43,6 +43,40 @@ def test_transaction_control_is_rejected_for_writes(sql: str) -> None:
         check_write_sql(sql, max_length=1000)
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "/* /* */ */ COMMIT",
+        "/* a /* b /* c */ */ */\nROLLBACK",
+        "/* /* -- */ */ -- x\n/**/ END",
+        "; COMMIT",
+        " ;\n; /* x */ ; BEGIN",
+        "--x\r\nCOMMIT",
+        "--x\rCOMMIT",
+    ],
+)
+def test_transaction_control_behind_nested_comments_or_empty_statements(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="Transaction control"):
+        check_write_sql(sql, max_length=1000)
+
+
+@pytest.mark.parametrize("sql", ["/* /* */ COMMIT", "/* never closed", "/* x */ /* y"])
+def test_unterminated_leading_comment_is_rejected(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="unterminated"):
+        check_sql(sql, max_length=1000)
+
+
+@pytest.mark.parametrize("sql", ["/* /* */ */", "; ;", "/* a */ -- b"])
+def test_nested_comments_only_is_empty(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="empty"):
+        check_sql(sql, max_length=100)
+
+
+def test_explain_behind_nested_comment_rejected() -> None:
+    with pytest.raises(InvalidRequestError, match="without EXPLAIN"):
+        check_explain_target("/* /* */ */ EXPLAIN SELECT 1", max_length=1000)
+
+
 def test_normal_write_passes() -> None:
     check_write_sql("UPDATE accounts SET note = 'copy program' WHERE id = $1", max_length=1000)
     check_write_sql("-- comment\nINSERT INTO t VALUES (1)", max_length=1000)

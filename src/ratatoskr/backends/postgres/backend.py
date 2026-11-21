@@ -5,6 +5,10 @@ Read enforcement (spec 6.2):
    startup parameters, so asyncpg's ``RESET ALL`` on release keeps them.
 2. User SQL is only ever sent with the extended protocol (prepare/bind), which accepts a single statement.
 3. Every read runs inside ``BEGIN READ ONLY`` and is always rolled back.
+
+Session hygiene (both pools): asyncpg's ``RESET ALL`` on release leaves ``role`` and ``session_authorization``
+alone, so the reset query also restores the login identity and drops SQL-level prepared statements. The
+client-side statement cache is off, so a user's ``DEALLOCATE ALL`` cannot poison later requests.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from ratatoskr.backends.errors import (
     BackendUnavailableError,
     InvalidRequestError,
 )
+from ratatoskr.backends.postgres.guard import leading_keyword
 from ratatoskr.backends.postgres.tls import build_ssl
 from ratatoskr.config.models import PostgresConnection
 
@@ -34,6 +39,13 @@ CONNECT_TIMEOUT_SECONDS = 10.0
 CLIENT_TIMEOUT_GRACE_SECONDS = 5.0
 CLOSE_TIMEOUT_SECONDS = 5.0
 READ_ONLY_SQLSTATE = "25006"
+FIRST_CHUNK_ROWS = 10
+SESSION_RESET_SQL = "SET SESSION AUTHORIZATION DEFAULT;\nRESET ROLE;\nDEALLOCATE ALL;\n"
+# SQLSTATEs (or classes) raised while connecting: their text names the user, database or host.
+_UNAVAILABLE_SQLSTATE_PREFIXES = ("08", "28", "3D", "53300", "57P0")
+_TAGGED_VERBS = frozenset({"SELECT", "UPDATE", "DELETE", "MERGE", "FETCH", "MOVE", "COPY"})
+_DML_VERBS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})
+_MOVE_ALL = 2**31 - 1  # MOVE takes a 32-bit count
 
 logger = logging.getLogger("ratatoskr.backends.postgres")
 
@@ -51,14 +63,44 @@ class StatementResult:
     status: str
     columns: list[str]
     rows: list[tuple[Any, ...]]
+    truncated: bool = False
 
 
-def translate_error(exc: BaseException) -> BackendError | None:
+class _SessionResettingConnection(asyncpg.Connection):  # type: ignore[misc]  # asyncpg is untyped
+    """Pool connection whose release also undoes SET ROLE / SET SESSION AUTHORIZATION and PREPARE."""
+
+    def get_reset_query(self) -> str:
+        return SESSION_RESET_SQL + str(super().get_reset_query())
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    if isinstance(exc, asyncpg.PostgresError):
+        return str(exc.sqlstate or "").startswith(_UNAVAILABLE_SQLSTATE_PREFIXES)
+    return isinstance(exc, OSError | asyncpg.exceptions.ClientConfigurationError)
+
+
+def _postgres_text(exc: Any) -> str:
+    """Message, DETAIL and HINT, without the pgbouncer advice asyncpg appends to prepared-statement errors."""
+    text = str(exc.args[0]) if exc.args else ""
+    detail = getattr(exc, "detail", None)
+    if detail:
+        text += f"\nDETAIL:  {detail}"
+    hint = str(getattr(exc, "hint", None) or "").split("\nNOTE: pgbouncer", 1)[0]
+    if hint:
+        text += f"\nHINT:  {hint}"
+    return text
+
+
+def translate_error(exc: BaseException, *, connection: str | None = None) -> BackendError | None:
     """Map asyncpg errors to user-safe errors; None means "not a query error" (caller hides details)."""
+    if _is_connection_error(exc):
+        logger.warning("connection %s is unavailable: %s: %s", connection, type(exc).__name__, exc)
+        target = f"Connection '{connection}'" if connection else "The connection"
+        return BackendUnavailableError(f"{target} is unavailable; details are in the server log.")
     if isinstance(exc, asyncpg.QueryCanceledError):
         return BackendTimeoutError(f"PostgreSQL cancelled the statement: {exc}.")
     if isinstance(exc, asyncpg.PostgresError):
-        message = f"PostgreSQL error {exc.sqlstate}: {exc}"  # str() already carries DETAIL and HINT
+        message = f"PostgreSQL error {exc.sqlstate}: {_postgres_text(exc)}"
         if exc.sqlstate == READ_ONLY_SQLSTATE:
             message += "\nThis tool runs read-only. Use pg_execute on a connection where you have write access."
         return BackendQueryError(message)
@@ -77,15 +119,16 @@ class ReadSession:
         records = await self._connection.fetch(sql, *args)
         return [dict(record) for record in records]
 
-    async def fetch_limited(self, sql: str, args: Sequence[Any], max_rows: int) -> RowSet:
+    async def fetch_limited(
+        self, sql: str, args: Sequence[Any], max_rows: int, *, max_bytes: int | None = None
+    ) -> RowSet:
         started = time.perf_counter()
         statement = await self._connection.prepare(sql)
         columns = [attribute.name for attribute in statement.get_attributes()]
         cursor = await statement.cursor(*args)
-        records = await cursor.fetch(max_rows + 1)
+        rows, _, truncated = await _read_capped(cursor, max_rows, max_bytes)
         elapsed_ms = (time.perf_counter() - started) * 1000
-        rows = [tuple(record) for record in records[:max_rows]]
-        return RowSet(columns=columns, rows=rows, truncated=len(records) > max_rows, elapsed_ms=elapsed_ms)
+        return RowSet(columns=columns, rows=rows, truncated=truncated, elapsed_ms=elapsed_ms)
 
 
 class PostgresBackend:
@@ -111,6 +154,8 @@ class PostgresBackend:
             "dsn": self.config.dsn.get_secret_value(),
             "server_settings": server_settings,
             "timeout": CONNECT_TIMEOUT_SECONDS,
+            "statement_cache_size": 0,
+            "connection_class": _SessionResettingConnection,
         }
         ssl = build_ssl(self.config.tls)
         if ssl is not None:
@@ -181,7 +226,7 @@ class PostgresBackend:
                 f"Connection '{self.name}' did not answer within {self._client_timeout:.0f}s."
             ) from None
         except Exception as exc:
-            translated = translate_error(exc)
+            translated = translate_error(exc, connection=self.name)
             if translated is None:
                 raise
             raise translated from exc
@@ -216,12 +261,17 @@ class PostgresBackend:
 
     # -- operations --------------------------------------------------------
 
-    async def fetch_rows(self, sql: str, args: Sequence[Any], max_rows: int) -> RowSet:
+    async def fetch_rows(self, sql: str, args: Sequence[Any], max_rows: int, *, max_bytes: int | None = None) -> RowSet:
         async with self.read_session() as session:
-            return await session.fetch_limited(sql, args, max_rows)
+            return await session.fetch_limited(sql, args, max_rows, max_bytes=max_bytes)
 
-    async def execute(self, statements: Sequence[tuple[str, Sequence[Any]]], max_rows: int) -> list[StatementResult]:
-        """Run *statements* in one transaction on the write pool; any failure rolls back all of them."""
+    async def execute(
+        self, statements: Sequence[tuple[str, Sequence[Any]]], max_rows: int, *, max_bytes: int | None = None
+    ) -> list[StatementResult]:
+        """Run *statements* in one transaction on the write pool; any failure rolls back all of them.
+
+        Returned rows are read through a cursor: at most *max_rows* (and about *max_bytes*) per statement.
+        """
         results: list[StatementResult] = []
         total = len(statements)
         async with self._guarded():
@@ -229,19 +279,20 @@ class PostgresBackend:
             async with pool.acquire() as connection, connection.transaction():
                 for index, (sql, args) in enumerate(statements, start=1):
                     try:
-                        statement = await connection.prepare(sql)
-                        records = await statement.fetch(*args)
+                        result = await _run_statement(connection, sql, args, max_rows, max_bytes)
                     except Exception as exc:
-                        translated = translate_error(exc)
+                        translated = translate_error(exc, connection=self.name)
                         if translated is None:
                             raise
                         raise type(translated)(
                             f"Statement {index} of {total} failed, so the transaction was rolled back and nothing "
                             f"was changed.\n{translated}"
                         ) from exc
-                    columns = [attribute.name for attribute in statement.get_attributes()]
-                    rows = [tuple(record) for record in records[:max_rows]]
-                    results.append(StatementResult(status=statement.get_statusmsg(), columns=columns, rows=rows))
+                    if not connection.is_in_transaction():
+                        raise BackendQueryError(
+                            f"Statement {index} ended the transaction; earlier statements may have been committed."
+                        )
+                    results.append(result)
         return results
 
     async def explain(
@@ -269,6 +320,69 @@ class PostgresBackend:
                 finally:
                     await _rollback_quietly(transaction)
         return [str(record["QUERY PLAN"]) for record in records]
+
+
+async def _run_statement(
+    connection: Any, sql: str, args: Sequence[Any], max_rows: int, max_bytes: int | None
+) -> StatementResult:
+    """One pg_execute statement. Row-returning statements are read through a bounded cursor."""
+    statement = await connection.prepare(sql)
+    columns = [attribute.name for attribute in statement.get_attributes()]
+    if not columns:
+        await statement.fetch(*args)
+        return StatementResult(status=statement.get_statusmsg() or "", columns=[], rows=[])
+    cursor = await statement.cursor(*args)
+    rows, consumed, truncated = await _read_capped(cursor, max_rows, max_bytes)
+    # A cursor does not expose the command tag, so build one. DML ... RETURNING has already run to
+    # completion: count the rows left with MOVE (no transfer). A SELECT is not read to the end.
+    verb = leading_keyword(sql)
+    count = len(rows)
+    if truncated and verb in _DML_VERBS:
+        count = consumed + await cursor.forward(_MOVE_ALL)
+    return StatementResult(status=_command_tag(verb, count), columns=columns, rows=rows, truncated=truncated)
+
+
+def _command_tag(verb: str, count: int) -> str:
+    if verb == "INSERT":
+        return f"INSERT 0 {count}"
+    if verb in _TAGGED_VERBS:
+        return f"{verb} {count}"
+    return f"ROWS {count}"
+
+
+def _approximate_size(row: tuple[Any, ...]) -> int:
+    return sum(len(str(value)) for value in row)
+
+
+async def _read_capped(cursor: Any, max_rows: int, max_bytes: int | None) -> tuple[list[tuple[Any, ...]], int, bool]:
+    """Read at most *max_rows* rows (and, with *max_bytes*, about that many bytes) from *cursor*.
+
+    Returns the rows kept, the number of rows taken from the cursor and whether rows were left out. With a
+    byte budget the cursor is read in chunks sized from the rows seen so far, so a result of huge rows never
+    sits in memory as a whole.
+    """
+    if max_bytes is None:
+        records = await cursor.fetch(max_rows + 1)
+        return [tuple(record) for record in records[:max_rows]], len(records), len(records) > max_rows
+    rows: list[tuple[Any, ...]] = []
+    consumed = 0
+    size = 0
+    want = min(FIRST_CHUNK_ROWS, max_rows + 1)
+    while True:
+        records = await cursor.fetch(want)
+        consumed += len(records)
+        for record in records:
+            if len(rows) == max_rows:
+                return rows, consumed, True
+            row = tuple(record)
+            rows.append(row)
+            size += _approximate_size(row)
+            if size > max_bytes:
+                return rows, consumed, True
+        if len(records) < want:
+            return rows, consumed, False
+        average = max(1, size // max(1, len(rows)))
+        want = max(1, min(max_rows + 1 - len(rows), (max_bytes - size) // average + 1))
 
 
 async def _close_pool(pool: Any) -> None:

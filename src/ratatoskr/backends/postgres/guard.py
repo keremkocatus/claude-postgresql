@@ -7,8 +7,6 @@ import re
 
 from ratatoskr.backends.errors import InvalidRequestError
 
-_LEADING_NOISE_RE = re.compile(r"\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)*", re.DOTALL)
-
 _DANGEROUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("DROP DATABASE", re.compile(r"\bDROP\s+DATABASE\b", re.IGNORECASE)),
     ("ALTER SYSTEM", re.compile(r"\bALTER\s+SYSTEM\b", re.IGNORECASE)),
@@ -28,9 +26,44 @@ _TRANSACTION_CONTROL_RE = re.compile(
 _EXPLAIN_RE = re.compile(r"\AEXPLAIN\b", re.IGNORECASE)
 
 
+def _skip_block_comment(sql: str, start: int) -> int:
+    """Index just after the block comment opening at *start*. Block comments nest, as in PostgreSQL."""
+    depth = 0
+    index = start
+    while index < len(sql):
+        if sql.startswith("/*", index):
+            depth += 1
+            index += 2
+        elif sql.startswith("*/", index):
+            depth -= 1
+            index += 2
+            if depth == 0:
+                return index
+        else:
+            index += 1
+    raise InvalidRequestError("The SQL statement has an unterminated /* comment.")
+
+
 def _body(sql: str) -> str:
-    """The statement with leading whitespace and comments removed."""
-    return _LEADING_NOISE_RE.sub("", sql, count=1)
+    """The statement without leading whitespace, comments (nested block comments included) and empty ``;``."""
+    index = 0
+    while index < len(sql):
+        if sql[index].isspace() or sql[index] == ";":
+            index += 1
+        elif sql.startswith("--", index):
+            while index < len(sql) and sql[index] not in "\r\n":
+                index += 1
+        elif sql.startswith("/*", index):
+            index = _skip_block_comment(sql, index)
+        else:
+            break
+    return sql[index:]
+
+
+def leading_keyword(sql: str) -> str:
+    """The first word of the statement in upper case (``""`` if there is none), comments skipped."""
+    match = re.match(r"[A-Za-z_]+", _body(sql))
+    return match.group(0).upper() if match else ""
 
 
 def check_sql(sql: str, *, max_length: int) -> None:
