@@ -9,7 +9,7 @@ from ratatoskr.config.models import LocalAuthSettings, LocalUser
 from ratatoskr.transport.client_ip import client_ip, parse_trusted_proxies, rate_limit_address
 from ratatoskr.transport.preconditions import check_http_preconditions
 from ratatoskr.transport.security import mcp_auth_settings, transport_security
-from tests.unit.secure_http.conftest import SECRET_KEY
+from tests.unit.secure_http.conftest import PASSWORD, SECRET_KEY
 
 
 def scope(peer: str | None, *xff: str) -> dict[str, object]:
@@ -39,8 +39,36 @@ def test_trusted_proxy_uses_rightmost_untrusted_hop() -> None:
 def test_malformed_forwarded_for_falls_back_to_peer() -> None:
     trusted = parse_trusted_proxies(["10.0.0.0/8"])
     assert client_ip(scope("10.1.2.3", "not-an-ip"), trusted) == "10.1.2.3"
-    assert client_ip(scope("10.1.2.3", "198.51.100.7:4444"), trusted) == "10.1.2.3"
     assert client_ip(scope("10.1.2.3", "  ,  "), trusted) == "10.1.2.3"
+
+
+def test_forwarded_for_hops_with_a_port_are_accepted() -> None:
+    trusted = parse_trusted_proxies(["10.0.0.0/8"])
+    assert client_ip(scope("10.1.2.3", "198.51.100.7:4444"), trusted) == "198.51.100.7"
+    assert client_ip(scope("10.1.2.3", "[2001:db8::1]:443"), trusted) == "2001:db8::1"
+    assert client_ip(scope("10.1.2.3", "[2001:db8::1]"), trusted) == "2001:db8::1"
+    assert client_ip(scope("10.1.2.3", "198.51.100.7, 10.0.0.4:80"), trusted) == "198.51.100.7"
+
+
+@pytest.mark.parametrize(
+    "hop",
+    [
+        "198.51.100.7:",
+        "198.51.100.7:abc",
+        "198.51.100.7:99999",
+        "198.51.100.7:+80",
+        "198.51.100.7:٨٠",
+        "2001:db8::1]:443",
+        "[2001:db8::1]x",
+        "[198.51.100.7]:80",
+        "[2001:db8::1]:",
+        "host.example:80",
+        "1.2.3.4:5:6",
+    ],
+)
+def test_malformed_ports_fall_back_to_peer(hop: str) -> None:
+    trusted = parse_trusted_proxies(["10.0.0.0/8"])
+    assert client_ip(scope("10.1.2.3", hop), trusted) == "10.1.2.3"
 
 
 def test_client_garbage_left_of_the_real_hop_is_never_read() -> None:
@@ -123,6 +151,20 @@ def test_https_config_passes(make_config) -> None:
 def test_secret_key_is_not_in_the_repr(make_config) -> None:
     settings = check_http_preconditions(make_config(), insecure_dev=False)
     assert SECRET_KEY not in repr(settings)
+    assert "local_provider" not in repr(settings)
+
+
+async def test_local_mode_carries_the_checked_identity_provider(make_config) -> None:
+    from ratatoskr.auth.identity.local import LocalIdentityProvider
+
+    provider = check_http_preconditions(make_config(), insecure_dev=False).local_provider
+    assert isinstance(provider, LocalIdentityProvider)
+    principal = await provider.verify_password("kerem", PASSWORD)
+    assert principal is not None and principal.subject == "kerem"
+
+
+def test_oidc_mode_has_no_local_provider(make_config) -> None:
+    assert check_http_preconditions(make_config(mode="oidc"), insecure_dev=False).local_provider is None
 
 
 def test_auth_is_mandatory(make_config) -> None:
@@ -253,11 +295,21 @@ def test_oidc_mode_without_section_is_refused(make_config) -> None:
         check_http_preconditions(with_auth(make_config(mode="oidc"), oidc=None), insecure_dev=False)
 
 
-@pytest.mark.parametrize("entry", ["0.0.0.0/0", "::/0"])
-def test_catch_all_trusted_proxies_warn(make_config, entry: str) -> None:
-    config = make_config(server_extra={"trusted_proxies": ["10.0.0.0/8", entry]})
+@pytest.mark.parametrize(
+    ("entry", "shown"),
+    [("0.0.0.0/0", "0.0.0.0/0"), ("::/0", "::/0"), ("::ffff:0:0/96", "::ffff:0.0.0.0/96")],
+)
+def test_catch_all_trusted_proxies_warn(make_config, entry: str, shown: str) -> None:
+    config = make_config(server_extra={"trusted_proxies": ["10.0.0.0/8", "::ffff:10.0.0.0/104", entry]})
     warnings = check_http_preconditions(config, insecure_dev=False).warnings
-    assert len(warnings) == 1 and entry in warnings[0] and "X-Forwarded-For" in warnings[0]
+    assert len(warnings) == 1 and shown in warnings[0] and "X-Forwarded-For" in warnings[0]
+
+
+def test_loopback_hosts_come_from_the_config_models() -> None:
+    from ratatoskr.config import models
+    from ratatoskr.transport import preconditions
+
+    assert preconditions.LOOPBACK_HOSTS is models.LOOPBACK_HOSTS
 
 
 def test_wrong_transport_is_refused(make_config) -> None:

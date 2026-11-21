@@ -76,6 +76,7 @@ def test_security_headers_on_login_page() -> None:
     assert "base-uri 'none'" in csp
     assert headers["x-content-type-options"] == "nosniff"
     assert headers["x-frame-options"] == "DENY"
+    assert headers["cross-origin-opener-policy"] == "same-origin"
     assert headers["referrer-policy"] == "no-referrer"
     assert headers["cache-control"] == "no-store"
     assert headers["content-type"].startswith("text/html")
@@ -105,6 +106,8 @@ def test_message_page_and_redirect_headers() -> None:
     assert "form-action 'self';" in page.headers["content-security-policy"]
     redirect = apply_security_headers(RedirectResponse("https://claude.ai/cb", status_code=302))
     assert redirect.headers["referrer-policy"] == "no-referrer"
+    assert redirect.headers["cross-origin-opener-policy"] == "same-origin"
+    assert page.headers["cross-origin-opener-policy"] == "same-origin"
     assert redirect.headers["cache-control"] == "no-store"
 
 
