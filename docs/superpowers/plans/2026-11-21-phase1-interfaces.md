@@ -339,3 +339,7 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Task 12 (client_ip / preconditions): `0.0.0.0/0` / `::/0` trusted_proxies için uyarı ver; `::ffff:10.0.0.1`
   gibi IPv4-mapped peer adreslerini `ipv4_mapped` ile aç; `secret_key_problem()` (crypto) preconditions'ta çağrılsın.
 - Sealed blob'lar sürüm baytı taşır (`\x01`); store bunları opak bytes olarak saklar.
+- Task 13 (login routes): parola doğrulamasından ÖNCE `RateLimiter.reserve([ip_key, user_key])` çağrılır (atomik
+  kontrol+kayıt); başarılı girişte `refund(reservation)`. `retry_after()`→verify→`hit()` sırası paralel isteklerle
+  limiti aşar, kullanılmaz.
+- Q2 review: rate-limit oku-değiştir-yaz atomikliği süreç içi (RateLimiter kilidi); tek replika için yeterli.
