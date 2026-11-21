@@ -379,3 +379,9 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Task 18 (Q5 re-review): `server.secret_key` değiştirmek bütün local oturumları kapatır (acil durum anahtarı);
   refresh'ten sonraki 5 sn içinde eski refresh token ile `/revoke` oturumu kapatmaz (nadir istemci deseni); parola
   parmak izi login anında değil kod değişiminde alınır.
+- Task 18 (Task 13 review): Caddy arkasında `trusted_proxies` Caddy'nin IP'si/ağı olmalı — boşsa tüm istemciler proxy
+  IP'sini paylaşır, 5 hatalı login herkesi kilitler ve /authorize bütçesi globalleşir. `/healthz`, `/readyz` Caddy
+  üzerinden dışarı açılmasın. Bilinen bir kullanıcı adı herkesçe kilitlenebilir (kullanıcı bazlı limitin bilinen
+  bedeli). `/token` ve `/revoke` hacimsel DoS'u reverse proxy'de sınırlanır.
+- Plan metninde Task 13 Step 6'daki `scope["method"] == "POST"` filtresi yanlıştı (metot değiştirerek limit aşılıyordu);
+  gerçek kod tüm metotları sayar, yalnız gerçek CORS preflight hariç.
