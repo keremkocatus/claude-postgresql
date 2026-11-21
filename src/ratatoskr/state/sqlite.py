@@ -9,8 +9,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import sqlite3
+import stat
+import sys
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -32,7 +35,11 @@ from ratatoskr.state.records import (
     TokenRecord,
 )
 
+logger = logging.getLogger("ratatoskr.state.sqlite")
+
 _RATE_LIMIT_IDLE_SECONDS = 86400.0
+_AUDIT_DELETE_CHUNK = 5000
+_BUSY_TIMEOUT_SECONDS = 5.0
 _SOURCES: dict[str, Literal["stdio", "local", "oidc"]] = {"stdio": "stdio", "local": "local", "oidc": "oidc"}
 
 
@@ -40,10 +47,72 @@ class StateStoreError(Exception):
     """The state database is unusable (not open, or newer than this server)."""
 
 
-def _create_private_file(path: Path) -> None:
-    """Create a missing database file as owner-only (0600); SQLite gives its -wal/-shm files the same mode."""
-    with contextlib.suppress(FileExistsError):
+def _secure_database_file(path: Path) -> None:
+    """Create a missing database file as owner-only (0600); SQLite gives new -wal/-shm files the same mode.
+
+    On POSIX an existing file (or -wal/-shm) with group/other bits is tightened to 0600 when this process owns it,
+    otherwise a warning is logged. The path stays out of the log message.
+    """
+    try:
         os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        return
+    except FileExistsError:
+        pass
+    if sys.platform == "win32":
+        return
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            info = candidate.stat()
+        except FileNotFoundError:
+            continue
+        if stat.S_IMODE(info.st_mode) & 0o077 == 0:
+            continue
+        if info.st_uid == os.geteuid():
+            try:
+                candidate.chmod(0o600)
+                continue
+            except OSError:
+                pass
+        logger.warning(
+            "the state database file is readable by group or other users and could not be restricted;"
+            " set its mode to 0600"
+        )
+
+
+async def _enable_wal(db: aiosqlite.Connection) -> str:
+    """Switch to WAL and return the resulting journal mode.
+
+    While another connection converts the same new file, SQLite can answer SQLITE_BUSY at once without consulting
+    the busy handler, so the switch is retried until the busy timeout has passed.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _BUSY_TIMEOUT_SECONDS
+    while True:
+        try:
+            rows = list(await db.execute_fetchall("PRAGMA journal_mode=WAL"))
+            return str(rows[0][0]).lower()
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_BUSY or loop.time() >= deadline:
+                raise
+        await asyncio.sleep(0.01)
+
+
+def _statements(script: str) -> list[str]:
+    """Split a migration script into single statements.
+
+    ``execute`` runs one statement at a time, and ``executescript`` would commit the surrounding transaction.
+    """
+    statements: list[str] = []
+    buffer = ""
+    for piece in script.split(";"):
+        buffer += piece + ";"
+        if sqlite3.complete_statement(buffer):
+            if buffer.strip(" \t\r\n;"):
+                statements.append(buffer.strip())
+            buffer = ""
+    if buffer.strip(" \t\r\n;"):
+        statements.append(buffer.strip())  # incomplete: let SQLite report the error
+    return statements
 
 
 def _principal(row: sqlite3.Row) -> Principal:
@@ -111,8 +180,9 @@ _UPSERT_UPSTREAM = (
 
 
 class SqliteStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, audit_delete_chunk: int = _AUDIT_DELETE_CHUNK) -> None:
         self._path = path
+        self._audit_delete_chunk = audit_delete_chunk
         self._db: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
 
@@ -121,16 +191,17 @@ class SqliteStore:
     async def open(self) -> None:
         if self._db is not None:
             return
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        _create_private_file(self._path)
+        self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _secure_database_file(self._path)
         db = await aiosqlite.connect(self._path, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            mode_rows = list(await db.execute_fetchall("PRAGMA journal_mode=WAL"))
-            if str(mode_rows[0][0]).lower() != "wal":
+            # busy_timeout first: switching to WAL and migrating need locks that a concurrent opener may hold
+            await db.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_SECONDS * 1000)}")
+            mode = await _enable_wal(db)
+            if mode != "wal":
                 raise StateStoreError(f"could not enable WAL mode on {self._path}")
             await db.execute("PRAGMA synchronous=NORMAL")
-            await db.execute("PRAGMA busy_timeout=5000")
             self._db = db
             await self._migrate()
         except BaseException:
@@ -142,6 +213,8 @@ class SqliteStore:
         if self._db is None:
             return
         async with self._lock:
+            if self._db is None:  # another close won the lock first
+                return
             db, self._db = self._db, None
             await db.close()
 
@@ -157,29 +230,24 @@ class SqliteStore:
         return int(rows[0]["version"]) if rows else 0
 
     async def _migrate(self) -> None:
-        async with self._lock:
-            db = self._conn
+        # Reading the version and applying the migrations share one BEGIN IMMEDIATE, so concurrent openers of a new
+        # file wait for each other instead of applying the same migration twice; a failure leaves nothing behind.
+        target = len(MIGRATIONS)
+        async with self._tx() as db:
             await db.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
             rows = list(await db.execute_fetchall("SELECT version FROM schema_version"))
             current = int(rows[0]["version"]) if rows else 0
-            if current > len(MIGRATIONS):
+            if current > target:
                 raise StateStoreError(
-                    f"state database schema version {current} is newer than this server supports ({len(MIGRATIONS)})"
+                    f"state database schema version {current} is newer than this server supports ({target})"
                 )
-            for version in range(current + 1, len(MIGRATIONS) + 1):
-                script = (
-                    "BEGIN IMMEDIATE;\n"
-                    f"{MIGRATIONS[version - 1]}\n"
-                    "DELETE FROM schema_version;\n"
-                    f"INSERT INTO schema_version (version) VALUES ({version});\n"
-                    "COMMIT;"
-                )
-                try:
-                    await db.executescript(script)
-                except sqlite3.Error:
-                    if db.in_transaction:
-                        await db.execute("ROLLBACK")
-                    raise
+            if current == target:
+                return
+            for script in MIGRATIONS[current:]:
+                for statement in _statements(script):
+                    await db.execute(statement)
+            await db.execute("DELETE FROM schema_version")
+            await db.execute("INSERT INTO schema_version (version) VALUES (?)", (target,))
 
     @asynccontextmanager
     async def _tx(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -350,6 +418,7 @@ class SqliteStore:
                 await db.execute(
                     "UPDATE tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL", (now, old.family_id)
                 )
+                await db.execute("DELETE FROM upstream_sessions WHERE family_id = ?", (old.family_id,))
                 return "reused"
             await db.execute("UPDATE tokens SET used_at = ? WHERE token_hash = ?", (now, old_hash))
             await db.execute(
@@ -446,12 +515,24 @@ class SqliteStore:
                 "DELETE FROM rate_limits WHERE updated_at <= ? AND blocked_until <= ?",
                 (now - _RATE_LIMIT_IDLE_SECONDS, now),
             )
-            audit = await db.execute("DELETE FROM audit_events WHERE ts < ?", (audit_cutoff,))
-            return CleanupStats(
-                pending=pending.rowcount,
-                codes=codes.rowcount,
-                tokens=tokens.rowcount,
-                upstream_sessions=upstream.rowcount,
-                rate_limits=limits.rowcount,
-                audit_events=audit.rowcount,
-            )
+        return CleanupStats(
+            pending=pending.rowcount,
+            codes=codes.rowcount,
+            tokens=tokens.rowcount,
+            upstream_sessions=upstream.rowcount,
+            rate_limits=limits.rowcount,
+            audit_events=await self._delete_old_audit_events(audit_cutoff),
+        )
+
+    async def _delete_old_audit_events(self, cutoff: float) -> int:
+        """Delete in chunks, one transaction each, so other writers get the lock between chunks."""
+        deleted = 0
+        while True:
+            async with self._tx() as db:
+                cursor = await db.execute(
+                    "DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events WHERE ts < ? LIMIT ?)",
+                    (cutoff, self._audit_delete_chunk),
+                )
+            deleted += cursor.rowcount
+            if cursor.rowcount < self._audit_delete_chunk:
+                return deleted

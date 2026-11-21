@@ -88,6 +88,35 @@ async def test_write_failure_is_logged_not_raised(store: SqliteStore, caplog) ->
     assert "failed to persist 1 audit events" in caplog.text
 
 
+async def test_close_after_the_writer_was_cancelled_keeps_queued_events(store: SqliteStore, caplog) -> None:
+    sink = SqliteAuditSink(store, flush_interval=60.0)
+    sink.start()
+    assert sink._task is not None
+    sink._task.cancel()  # e.g. the event loop cancelled it at shutdown before it ever ran
+    await asyncio.sleep(0)
+    for i in range(3):
+        sink.record(event(i))
+    await sink.aclose()  # must not re-raise the writer's CancelledError
+    assert await store.count_audit_events() == 3
+    assert "audit writer" in caplog.text
+
+
+async def test_close_logs_a_writer_that_died_and_writes_what_is_left(store: SqliteStore, caplog) -> None:
+    sink = SqliteAuditSink(store, flush_interval=60.0)
+
+    async def broken_run() -> None:
+        raise RuntimeError("writer bug")
+
+    sink._run = broken_run  # type: ignore[method-assign]
+    sink.start()
+    sink.record(event(1))
+    await asyncio.sleep(0)
+    sink.record(event(2))
+    await sink.aclose()
+    assert await store.count_audit_events() == 2
+    assert "writer bug" in caplog.text
+
+
 async def test_cleanup_task_applies_retention(store: SqliteStore, clock) -> None:
     old = datetime.fromtimestamp(clock() - 91 * 86400, UTC)
     await store.insert_audit_events([event(1, old), event(2)])

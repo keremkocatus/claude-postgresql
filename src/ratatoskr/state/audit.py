@@ -49,10 +49,15 @@ class SqliteAuditSink:
         if self._closed:
             return
         self._closed = True
-        if self._task is not None:
-            self._queue.put_nowait(None)
-            await self._task
-            return
+        task = self._task
+        if task is not None:
+            if not task.done():
+                self._queue.put_nowait(None)
+            # A writer that was cancelled or died must not make shutdown raise; it is logged instead.
+            for result in await asyncio.gather(task, return_exceptions=True):
+                if result is not None:
+                    logger.error("audit writer stopped unexpectedly", exc_info=result)
+        # Whatever the writer did not take (it never ran, was cancelled or died) is written here.
         leftovers: list[AuditEvent] = []
         while not self._queue.empty():
             item = self._queue.get_nowait()

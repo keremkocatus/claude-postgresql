@@ -1,4 +1,8 @@
-"""Ordered SQLite schema migrations. Append new entries; never edit an applied one."""
+"""Ordered SQLite schema migrations. Append new entries; never edit an applied one.
+
+Each entry is plain SQL statements separated by ``;`` with no ``BEGIN``/``COMMIT``: ``SqliteStore`` reads the schema
+version and applies every pending entry inside one ``BEGIN IMMEDIATE`` transaction.
+"""
 
 from __future__ import annotations
 

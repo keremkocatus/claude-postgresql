@@ -4,9 +4,11 @@ import asyncio
 import os
 import sqlite3
 import stat
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from pathlib import Path
 
+import anyio
 import pytest
 
 from ratatoskr.auth.principal import Principal
@@ -313,3 +315,190 @@ async def test_new_database_file_is_private(tmp_path: Path) -> None:
     finally:
         await store.close()
     assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
+
+
+# ── review follow-ups ──
+
+
+async def test_reused_refresh_token_drops_the_upstream_session(store: SqliteStore) -> None:
+    await store.create_family(token("a1", "access"), token("r1"), upstream_blob=b"up")
+    assert await store.rotate_refresh("r1", token("a2", "access"), token("r2"), b"up2", now=1500.0) == "rotated"
+    assert await store.rotate_refresh("r1", token("a3", "access"), token("r3"), None, now=1600.0) == "reused"
+    assert await store.get_upstream("fam") is None
+
+
+async def test_concurrent_first_open_of_a_new_file(tmp_path: Path) -> None:
+    for round_no in range(5):
+        path = tmp_path / f"round-{round_no}" / "state.db"
+        stores = [SqliteStore(path) for _ in range(3)]
+        try:
+            await asyncio.gather(*(s.open() for s in stores))
+            for s in stores:
+                assert await s.schema_version() == len(MIGRATIONS)
+        finally:
+            for s in stores:
+                await s.close()
+
+
+async def test_concurrent_close_is_safe(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "state.db")
+    await store.open()
+    # the read holds the lock, so both closes see an open store and then queue on the lock
+    await asyncio.gather(store.get_client("c"), store.close(), store.close())
+    with pytest.raises(StateStoreError, match="not open"):
+        await store.get_client("c")
+
+
+async def test_audit_retention_deletes_in_chunks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SqliteStore(tmp_path / "state.db", audit_delete_chunk=10)
+    await store.open()
+    try:
+        await store.insert_audit_events([audit_event(datetime.fromtimestamp(5.0, UTC)) for _ in range(35)])
+        await store.insert_audit_events([audit_event(datetime.fromtimestamp(4000.0, UTC)) for _ in range(2)])
+        original = store._tx
+        transactions = 0
+
+        def counting_tx() -> AbstractAsyncContextManager[object]:
+            nonlocal transactions
+            transactions += 1
+            return original()
+
+        monkeypatch.setattr(store, "_tx", counting_tx)
+        stats = await store.cleanup(now=1000.0, audit_cutoff=1000.0)
+        assert stats.audit_events == 35
+        assert transactions == 1 + 4  # expired credentials, then audit chunks of 10, 10, 10, 5
+        assert await store.count_audit_events() == 2
+    finally:
+        await store.close()
+
+
+async def test_code_can_be_taken_once_under_concurrency(store: SqliteStore) -> None:
+    await store.save_code(AuthCodeRecord("h1", "c1", "{}", ALICE, None, expires_at=300.0))
+    results = await asyncio.gather(*(store.take_code("h1", now=10.0) for _ in range(5)))
+    assert sum(r is not None for r in results) == 1
+
+
+async def test_pending_can_be_taken_once_under_concurrency(store: SqliteStore) -> None:
+    await store.save_pending(PendingAuthorization("p1", "c1", "{}", expires_at=100.0))
+    results = await asyncio.gather(*(store.take_pending("p1", now=50.0) for _ in range(5)))
+    assert sum(r is not None for r in results) == 1
+
+
+async def test_code_and_pending_single_use_across_two_connections(tmp_path: Path) -> None:
+    first, second = SqliteStore(tmp_path / "state.db"), SqliteStore(tmp_path / "state.db")
+    await first.open()
+    await second.open()
+    try:
+        await first.save_code(AuthCodeRecord("h1", "c1", "{}", ALICE, None, expires_at=300.0))
+        await first.save_pending(PendingAuthorization("p1", "c1", "{}", expires_at=100.0))
+        codes = await asyncio.gather(first.take_code("h1", now=10.0), second.take_code("h1", now=10.0))
+        pendings = await asyncio.gather(first.take_pending("p1", now=10.0), second.take_pending("p1", now=10.0))
+        assert sum(r is not None for r in codes) == 1
+        assert sum(r is not None for r in pendings) == 1
+    finally:
+        await first.close()
+        await second.close()
+
+
+def _tables(path: Path) -> set[str]:
+    with sqlite3.connect(path) as raw:
+        return {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+
+async def test_new_migration_upgrades_an_existing_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "state.db"
+    store = SqliteStore(path)
+    await store.open()
+    await store.save_client(StoredClient("c1", "{}", None, 1.0))
+    await store.close()
+
+    monkeypatch.setattr("ratatoskr.state.sqlite.MIGRATIONS", (*MIGRATIONS, "CREATE TABLE extra (x INTEGER);"))
+    store = SqliteStore(path)
+    await store.open()
+    try:
+        assert await store.schema_version() == len(MIGRATIONS) + 1
+        assert await store.get_client("c1") is not None
+    finally:
+        await store.close()
+    assert "extra" in _tables(path)
+
+
+async def test_failing_migration_is_rolled_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "state.db"
+    store = SqliteStore(path)
+    await store.open()
+    await store.close()
+
+    broken = "CREATE TABLE half_done (x INTEGER);\nCREATE TABLE broken (;"
+    monkeypatch.setattr("ratatoskr.state.sqlite.MIGRATIONS", (*MIGRATIONS, broken))
+    with pytest.raises(sqlite3.Error):
+        await SqliteStore(path).open()
+    assert "half_done" not in _tables(path)
+    with sqlite3.connect(path) as raw:
+        assert raw.execute("SELECT version FROM schema_version").fetchone()[0] == len(MIGRATIONS)
+
+
+async def test_anyio_cancellation_mid_write_leaves_no_partial_rows(
+    store: SqliteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ratatoskr.state.sqlite as sqlite_module
+
+    original = sqlite_module._token_params
+    calls = 0
+
+    with anyio.CancelScope() as scope:
+
+        def cancel_on_second_insert(record: TokenRecord) -> tuple[object, ...]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:  # the access-token INSERT has already run inside the transaction
+                scope.cancel()
+            return original(record)
+
+        monkeypatch.setattr(sqlite_module, "_token_params", cancel_on_second_insert)
+        await store.create_family(token("a1", "access"), token("r1"), upstream_blob=b"up")
+    assert scope.cancelled_caught
+    monkeypatch.setattr(sqlite_module, "_token_params", original)
+
+    assert await store.get_token("a1") is None
+    assert await store.get_token("r1") is None
+    assert await store.get_upstream("fam") is None
+    await store.create_family(token("a2", "access"), token("r2"), upstream_blob=None)
+    assert await store.get_token("r2") is not None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+async def test_new_parent_directory_is_private(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "state.db"
+    store = SqliteStore(path)
+    await store.open()
+    await store.close()
+    assert stat.S_IMODE(path.parent.stat().st_mode) & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+async def test_existing_loose_database_file_is_tightened(tmp_path: Path) -> None:
+    path = tmp_path / "state.db"
+    path.touch()
+    path.chmod(0o644)
+    store = SqliteStore(path)
+    await store.open()
+    await store.close()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+async def test_loose_file_owned_by_someone_else_is_only_warned_about(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "state.db"
+    path.touch()
+    path.chmod(0o644)
+    owner = path.stat().st_uid
+    monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+    store = SqliteStore(path)
+    await store.open()
+    await store.close()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert "group or other" in caplog.text
+    assert str(tmp_path) not in caplog.text
