@@ -113,3 +113,51 @@ async def test_unreadable_encodings_are_refused_without_details(
     assert str(caught.value) == (
         "Connection 'prom' answered with a compressed body Ratatoskr cannot read; details are in the server log."
     )
+
+
+async def _drain(chunks: list[bytes], encoding: str) -> bytes:
+    from ratatoskr.backends.http.body import _inflate
+
+    async def raw() -> AsyncIterator[bytes]:
+        for chunk in chunks:
+            yield chunk
+
+    return b"".join([piece async for piece in _inflate(raw(), encoding)])
+
+
+def _raw_deflate(data: bytes) -> bytes:
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush()
+
+
+async def test_raw_deflate_keeps_its_last_bytes_at_a_piece_boundary() -> None:
+    data = b"a" * (3 * 256 * 1024 + 2)
+    assert await _drain([_raw_deflate(data)], "deflate") == data
+
+
+async def test_raw_deflate_in_one_byte_chunks_is_read() -> None:
+    data = b'{"status":"success","data":[]}' * 50
+    compressed = _raw_deflate(data)
+    assert await _drain([compressed[i : i + 1] for i in range(len(compressed))], "deflate") == data
+
+
+async def test_zlib_deflate_in_one_byte_chunks_is_read() -> None:
+    data = b'{"status":"success"}' * 50
+    compressed = zlib.compress(data)
+    assert await _drain([compressed[i : i + 1] for i in range(len(compressed))], "deflate") == data
+
+
+async def test_a_truncated_gzip_body_is_refused() -> None:
+    from ratatoskr.backends.http.body import UnreadableBodyError
+
+    compressed = _compress(b"x" * 100_000, wbits=zlib.MAX_WBITS | 16)
+    with pytest.raises(UnreadableBodyError):
+        await _drain([compressed[:-20]], "gzip")
+
+
+async def test_data_after_the_compressed_stream_is_refused() -> None:
+    from ratatoskr.backends.http.body import UnreadableBodyError
+
+    member = _compress(b"x" * 1000, wbits=zlib.MAX_WBITS | 16)
+    with pytest.raises(UnreadableBodyError):
+        await _drain([member + member], "gzip")

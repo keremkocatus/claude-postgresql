@@ -230,7 +230,7 @@ connections:
 | `limits.max_range` | `31d` | Longest window for range queries and for name/value listings (at least `1m`). |
 | `limits.max_query_length` | `20000` | Characters of PromQL or of a `match` selector. |
 | `limits.max_response_bytes` | `65536` | Text returned to Claude (at least 1024). |
-| `limits.max_body_bytes` | `8388608` | Bytes read from Prometheus per request (8 MiB; at least 65536); a larger answer is refused with a hint to narrow the query. Memory: while an answer is decoded the call holds about 10 times this (about 80 MiB at the default, for each call running at the same time); decoding runs off the event loop. Lower it on small hosts. |
+| `limits.max_body_bytes` | `8388608` | Bytes read from Prometheus per request (8 MiB; at least 65536); a larger answer is refused with a hint to narrow the query. Memory: while an answer is decoded the call holds about 10 times this (about 80 MiB at the default, for each call running at the same time); decoding the JSON briefly holds up the server (about 20 ms per MiB, so up to about 170 ms at the default). Lower it on small or busy hosts. |
 
 Requests ask for an uncompressed answer (`Accept-Encoding: identity`) so `max_body_bytes` counts what is decoded. A
 server that compresses anyway (`gzip`, `deflate`) is decoded step by step within the cap; other encodings are refused.

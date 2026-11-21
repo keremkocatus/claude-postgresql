@@ -86,7 +86,7 @@ class PrometheusApi:
         hint: str = "",
     ) -> ApiResult:
         reply = await self._client.request(method, path, params=params, form=form, too_large_hint=hint)
-        payload = await asyncio.to_thread(parse_json, reply.body)  # up to max_body_bytes: off the event loop
+        payload = await asyncio.to_thread(parse_json, reply.body)  # the C decoder holds the GIL (~20 ms/MiB loop stall)
         if reply.status == 200 and isinstance(payload, dict) and payload.get("status") == "success":
             notes, omitted = self._notes(payload)
             return ApiResult(data=payload.get("data"), notes=notes, omitted_notes=omitted)

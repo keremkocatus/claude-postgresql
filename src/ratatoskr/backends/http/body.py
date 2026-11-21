@@ -41,20 +41,46 @@ async def read_capped(response: httpx.Response, limit: int, too_large: Callable[
     return b"".join(chunks)
 
 
+def _has_zlib_header(head: bytes) -> bool:
+    """RFC 1950: CM 8 (deflate) and the two header bytes are a multiple of 31."""
+    return len(head) >= 2 and head[0] & 0x0F == 8 and (head[0] << 8 | head[1]) % 31 == 0
+
+
 async def _inflate(raw: AsyncIterator[bytes], encoding: str) -> AsyncIterator[bytes]:
-    """Decoded pieces of at most _PIECE_BYTES each; the rest of the input waits in ``unconsumed_tail``."""
-    inflater = zlib.decompressobj(_WBITS[encoding])
-    started = False
-    async for chunk in raw:
-        data = chunk
-        while data:
-            try:
-                piece = inflater.decompress(data, _PIECE_BYTES)
-            except zlib.error as exc:
-                if encoding == "deflate" and not started:  # "deflate" without the zlib header, as some servers send
-                    inflater, started = zlib.decompressobj(-zlib.MAX_WBITS), True
+    """Decoded pieces of at most _PIECE_BYTES each; the rest of the input waits in ``unconsumed_tail``.
+
+    ``deflate`` with or without the zlib header (some servers send it raw) is told apart by the first two bytes.
+    The stream must end exactly: a truncated body or data after the end is corrupt.
+    """
+    inflater: zlib._Decompress | None = None
+    head = b""
+    try:
+        async for chunk in raw:
+            if inflater is None:
+                head += chunk
+                if encoding == "deflate" and len(head) < 2:
                     continue
-                raise UnreadableBodyError(f"corrupt {encoding} data ({exc})") from None
-            started = True
-            yield piece
-            data = inflater.unconsumed_tail
+                raw_deflate = encoding == "deflate" and not _has_zlib_header(head)
+                inflater = zlib.decompressobj(-zlib.MAX_WBITS if raw_deflate else _WBITS[encoding])
+                chunk, head = head, b""
+            if inflater.eof:
+                if chunk:
+                    raise UnreadableBodyError(f"data after the end of the {encoding} stream")
+                continue
+            data = chunk
+            while data:
+                yield inflater.decompress(data, _PIECE_BYTES)
+                data = inflater.unconsumed_tail
+                if inflater.eof and (data or inflater.unused_data):
+                    raise UnreadableBodyError(f"data after the end of the {encoding} stream")
+        if inflater is None:
+            if head:
+                raise UnreadableBodyError(f"truncated {encoding} data")
+            return
+        tail = inflater.flush()
+        if tail:
+            yield tail
+        if not inflater.eof:
+            raise UnreadableBodyError(f"truncated {encoding} data")
+    except zlib.error as exc:
+        raise UnreadableBodyError(f"corrupt {encoding} data ({exc})") from None

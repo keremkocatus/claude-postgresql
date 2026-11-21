@@ -112,7 +112,8 @@ Prometheus image from Docker Hub); never connect to a remote or production datab
   `truncation_hint=` to `ToolRuntime.run`, and every call runs under one `PrometheusBackend.deadline()`.
 - Server text can echo user input of any length: every pattern in `scrub.py` must stay linear (match only at the
   start of a run of its characters, possessive quantifiers) and keep its timing test in `test_http_scrub.py`.
-  Decoding (`json.loads`) and result parsing of up to `max_body_bytes` run in `asyncio.to_thread`; parse only the
+  Decoding (`json.loads`) and result parsing of up to `max_body_bytes` run in `asyncio.to_thread` (parsing then
+  really runs off the loop; the C JSON decoder holds the GIL, so `max_body_bytes` also bounds that stall); parse only the
   series that can be shown (`parse_result(..., max_series=)`). Server notes go through `with_notes` (bounded) and
   errors shown inside a successful answer through `error_note` (redacted, bounded).
 - Time arguments are parsed only by `backends/timeparse.py` (errors are `InvalidRequestError`); HTTP backends talk to
