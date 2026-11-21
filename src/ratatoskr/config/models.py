@@ -72,12 +72,25 @@ class ServerSettings(BaseModel):
     def _parse_audit_retention(cls, value: Any) -> timedelta:
         return _duration(value)
 
+    @field_validator("audit_retention")
+    @classmethod
+    def _check_audit_retention(cls, value: timedelta) -> timedelta:
+        if value < timedelta(days=1):
+            raise ValueError("audit_retention must be at least 1 day")
+        return value
+
     @field_validator("trusted_proxies")
     @classmethod
     def _check_trusted_proxies(cls, value: list[str]) -> list[str]:
-        for entry in value:
-            ipaddress.ip_network(entry, strict=False)
-        return value
+        # The message never echoes the entry: a misplaced ${SECRET} must not end up in a log line.
+        normalized: list[str] = []
+        for i, entry in enumerate(value):
+            try:
+                network = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                raise ValueError(f"entry {i} is not an IP address or CIDR network") from None
+            normalized.append(str(network))
+        return normalized
 
 
 class LocalUser(BaseModel):

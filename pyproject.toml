@@ -27,11 +27,13 @@ dependencies = [
     "aiosqlite>=0.22",
     "argon2-cffi>=25.1",
     "cryptography>=45",
-    "httpx>=0.28",
-    "joserfc>=1.8",
-    "python-multipart>=0.0.20",
-    "starlette>=1.0",
-    "uvicorn>=0.30",
+    "httpx>=0.28,<1",
+    "joserfc>=1.8,<2",
+    "python-multipart>=0.0.22",
+    "starlette>=1.0,<2",
+    "uvicorn>=0.35",
+    # Not imported directly: uvicorn's HTTP/1.1 parser. 0.16 fixes request smuggling (CVE-2025-43859).
+    "h11>=0.16",
 ]
 
 [project.urls]

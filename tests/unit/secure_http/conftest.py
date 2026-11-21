@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from ratatoskr.state.sqlite import SqliteStore
 
 PASSWORD = "correct horse battery staple"
-SECRET_KEY = "k" * 48
+SECRET_KEY = "Vq7Rz-2LmX9vB4nKpT0wYc6HdJ1sFe8Ga_3UoVi5NjQt8hWx"
 ISSUER = "https://idp.example.com/application/o/mcp/"
 IDP_BASE = "https://idp.example.com/application/o/"
 OIDC_CLIENT_ID = "ratatoskr"
