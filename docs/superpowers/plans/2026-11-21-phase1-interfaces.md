@@ -368,3 +368,4 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
   preconditions'ta bir kez kurar — tekrar kurmak yerine aynı örneği kullan (çift argon2 maliyeti ve çift uyarı logu).
 - Task 16/18/19: `config.example.yaml` ve README'ye `auth.session_max_age` (varsayılan 30d) eklenmeli; saatlik temizlik
   log satırı `CleanupStats.clients` ve `.families` sayılarını da göstermeli (`state/maintenance.py`).
+- Task 16: `ratatoskr hash-password --help` metni `password_cli.DESCRIPTION` (PowerShell 5.1 notu dahil) olmalı.
