@@ -250,3 +250,10 @@ def test_redaction_is_fast_on_one_megabyte(text: str) -> None:
     started = time.perf_counter()
     redact(text)
     assert time.perf_counter() - started < 2.0
+
+
+def test_overlong_quoted_password_leaves_no_tail() -> None:
+    spaced = 'password="' + "a" * 600 + ' SECRETTAIL"'
+    escaped = 'password="' + "a" * 300 + '\\"SECRETTAIL' + "b" * 300 + '"'
+    assert "SECRETTAIL" not in redact(spaced)
+    assert "SECRETTAIL" not in redact(escaped)

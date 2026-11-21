@@ -12,7 +12,7 @@ _SECRET_KEYS = r"password|passwd|pwd|token|secret|api[_-]?key"
 # Quoted values honour backslash escapes (libpq ``'a\'b'``, JSON ``"a\"b"``) and are length-bounded so a
 # run of unterminated quotes cannot make the scan quadratic; an over-long or unterminated quoted value falls
 # back to masking up to the next quote or whitespace.
-_QUOTED_VALUE = r"\"(?:[^\"\\]|\\.){0,512}\"|'(?:[^'\\]|\\.){0,512}'|[\"'][^\s\"']*"
+_QUOTED_VALUE = r"\"(?:[^\"\\]|\\.){0,512}\"|'(?:[^'\\]|\\.){0,512}'|[\"'][^\n]*"
 
 _URL_RE = re.compile(r"\b(postgres(?:ql)?(?:\+\w+)?)://[^\s'\"<>\\]+", re.IGNORECASE)
 _AUTH_HEADER_RE = re.compile(
