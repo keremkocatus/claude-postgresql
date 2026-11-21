@@ -181,6 +181,8 @@ _UPSERT_UPSTREAM = (
 
 class SqliteStore:
     def __init__(self, path: Path, *, audit_delete_chunk: int = _AUDIT_DELETE_CHUNK) -> None:
+        if audit_delete_chunk < 1:
+            raise ValueError("audit_delete_chunk must be at least 1")
         self._path = path
         self._audit_delete_chunk = audit_delete_chunk
         self._db: aiosqlite.Connection | None = None

@@ -502,3 +502,9 @@ async def test_loose_file_owned_by_someone_else_is_only_warned_about(
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
     assert "group or other" in caplog.text
     assert str(tmp_path) not in caplog.text
+
+
+@pytest.mark.parametrize("chunk", [0, -1])
+def test_audit_delete_chunk_must_be_positive(tmp_path: Path, chunk: int) -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        SqliteStore(tmp_path / "state.db", audit_delete_chunk=chunk)
