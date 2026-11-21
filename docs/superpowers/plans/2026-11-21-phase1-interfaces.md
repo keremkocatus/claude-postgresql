@@ -386,3 +386,34 @@ Planlar sözleşmeyi bozmadan şunları ekledi (ayrıntı ilgili planda):
 - Plan metninde Task 13 Step 6'daki `scope["method"] == "POST"` filtresi yanlıştı (metot değiştirerek limit aşılıyordu);
   gerçek kod tüm metotları sayar, yalnız gerçek CORS preflight hariç.
 - Task 17 (Q7 review): uvicorn `timeout_graceful_shutdown=5`; Docker `stop_grace_period` ≥ 10 s olmalı ki audit kuyruğu boşaltılsın.
+
+## Aşama 2 (Prometheus) ekleri
+
+Plan: `docs/superpowers/plans/2026-11-22-phase2-prometheus.md`. Sözleşmeyi bozmadan eklenenler; Loki (aşama 3) bunları
+aynen kullanır:
+
+- `config/shared.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `duration_value` (`models.py`'den taşındı; mypy strict yeniden
+  dışa aktarmadığı için diğer modüller sabiti `config.shared`'dan alır).
+- `config/http_models.py`: `HttpAuth = NoAuth | BasicAuth | BearerAuth` (`type` ile ayrılır),
+  `HttpTlsSettings(verify=True, ca_file=None)` (`ca_file` var olmalı ve `verify: false` ile birlikte verilemez),
+  `check_base_url`, `check_headers`, `stringify_header_values`, `RESERVED_HEADERS`. Header değerleri
+  `SecretStr`; doğrulama mesajları değeri tekrarlamaz.
+- `config/prometheus_models.py`: `PrometheusLimits`, `PrometheusConnection(kind="prometheus", description,
+  mode: Literal["read"], url, auth, headers, tls, timeout, limits)`; `config/models.py`'de `ConnectionConfig =
+  Annotated[PostgresConnection | PrometheusConnection, Field(discriminator="kind")]`. Loader `union_tag_invalid`
+  mesajını etiketi tekrarlamadan yazar ("unknown value; expected one of …"). `config/notices.py` kimlik bilgisi düz
+  `http` ile loopback olmayan bir host'a giderse uyarır.
+- `backends/timeparse.py`: `parse_time(text, *, now, argument)`, `parse_duration_text(text, *, argument)`,
+  `resolve_range(start, end, *, now, max_range, default_span=1h) -> TimeRange`, `auto_step(span, *,
+  target_points=120)`, `resolve_step(step, span, *, max_points)`, `point_count`, `format_time`, `format_duration`,
+  `unix_seconds`, `step_seconds`, `utc_now`. Hatalar `InvalidRequestError`.
+- `backends/http/`: `HttpClient(connection, *, base_url, auth, headers, tls, timeout, max_body_bytes)` —
+  `open()` (istek atmaz), `aclose()` (kalıcı), `is_open`, `timeout`, `request(method, path, *, params, form,
+  too_large_hint) -> HttpReply(status, body)`; `ResponseTooLargeError`, `EndpointNotFoundError`, `status_error`,
+  `parse_json`, `is_certificate_error`; `options.build_auth/build_verify/default_ssl_context`;
+  `scrub.scrub_upstream_text(text, *, hosts=())`.
+- `backends/limits.py`: `clip_input(text, limit=64)`.
+- `ToolRuntime.run(..., kind: str | None = None, truncation_hint: str = TRUNCATION_HINT)`: `kind` yetkilendirmeden
+  sonra, backend açılmadan önce kontrol edilir (yasak bağlantı yine "not found").
+- `observability/logging.py`: `httpx` logger'ı `log_level: INFO` iken WARNING (istek satırları iç host ve
+  `match[]` seçicilerini taşır; PromQL POST gövdesinde gider).

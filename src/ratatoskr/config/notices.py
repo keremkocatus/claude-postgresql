@@ -1,4 +1,5 @@
-"""Warnings about settings that are accepted but do nothing yet; ``serve`` and ``check-config`` report them."""
+"""Start-up warnings ``serve`` and ``check-config`` report: settings accepted but not implemented yet, and risky but
+allowed choices such as credentials sent over plain http."""
 
 from __future__ import annotations
 

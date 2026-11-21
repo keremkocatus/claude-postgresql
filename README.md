@@ -1,8 +1,8 @@
 # Ratatoskr
 
 Ratatoskr is an MCP server that gives Claude (claude.ai, Claude Desktop, Claude Code) controlled access to
-**several PostgreSQL databases at once**, with per-group access levels and an audit trail. Prometheus and Loki
-backends are planned.
+**several PostgreSQL databases and Prometheus servers at once**, with per-group access levels and an audit trail.
+A Loki backend is planned.
 
 > **Status: 1.0.0.dev0.** Runs locally over **stdio**, or remotely over **streamable HTTP** as a claude.ai custom
 > connector: Ratatoskr is its own OAuth 2.1 authorization server, and people sign in with local users or through an
@@ -12,16 +12,16 @@ backends are planned.
 
 ## Features
 
-- Any number of named PostgreSQL connections (PostgreSQL 12 or newer) in one server; the tool set stays the same
-  (11 tools).
+- Any number of named PostgreSQL (12 or newer) and Prometheus connections in one server; the tool set stays the
+  same (16 tools). Prometheus connections also work with Mimir, Thanos Query and VictoriaMetrics.
 - Access per group: `read` or `write`, capped by each connection's `mode`. Unknown and forbidden connections look
   identical ("Connection 'x' not found.").
 - Read-only enforcement by PostgreSQL itself rather than by SQL pattern matching (see [Security model](#security-model)).
-- Every tool call is audited: one JSON log line with `event: audit` (SQL with secrets masked and truncated to 4096
+- Every tool call is audited: one JSON log line with `event: audit` (the SQL or PromQL with secrets masked and truncated to 4096
   characters, plus the SHA-256 of the full text) and a `result` of `ok` (the tool answered; a health report that
   shows a connection down is still `ok`), `denied` (no identity, unknown or forbidden connection, insufficient
-  access), `error` (PostgreSQL or backend error, guard rejection, unexpected failure, client cancellation) or
-  `timeout` (deadline or `statement_timeout`). Arguments that do not match a tool's schema are rejected by the
+  access), `error` (PostgreSQL, Prometheus or backend error, guard rejection, unexpected failure, client cancellation) or
+  `timeout` (deadline, `statement_timeout` or Prometheus' query timeout). Arguments that do not match a tool's schema are rejected by the
   MCP layer before the call reaches Ratatoskr, so they are not audited.
 - Failed calls return an `Error: ...` text with MCP `isError: true`, so the host sees them as failures.
 - Responses are clamped (rows and bytes) with an explicit note on how to narrow the request. Rows that do not fit
@@ -187,16 +187,16 @@ One YAML file; [`config.example.yaml`](config.example.yaml) is the annotated ref
 | `auth.local.users[]` | - | `username`, `password_hash` (argon2id from `ratatoskr hash-password`), `groups`. |
 | `auth.oidc` | - | `issuer` (https), `client_id`, `client_secret`, `scopes` (default `openid email profile groups offline_access`), `groups_claim` (`groups`), `subject_claim` (`email`). |
 | `roles.<group>` | `{}` | `{ <connection> or "*": read \| write }`. |
-| `connections.<name>.kind` | required | `postgres`. Names: `^[a-z0-9][a-z0-9_-]{0,62}$`. |
-| `connections.<name>.dsn` | required | `postgresql://user:password@host:port/db`, via `${VAR}` / `${file:...}`. |
-| `connections.<name>.mode` | `read` | `write` enables `pg_execute` and write-level `pg_explain(analyze=true)`. |
-| `connections.<name>.write_dsn` | unset | `mode: write` only: login for the write pool (`pg_execute`, write-level `pg_explain`). Unset: the write pool uses `dsn`. Recommended (see below). |
-| `connections.<name>.description` | `""` | Shown to Claude in `list_connections`. |
-| `connections.<name>.statement_timeout` | `30s` | Server-side timeout of every statement. |
-| `connections.<name>.pool` | `min_size: 1, max_size: 5, write_max_size: 2` | Read pool; the write pool opens lazily. |
-| `connections.<name>.allowed_schemas` | `[]` (all) | Filters the discovery tools only (see below). |
-| `connections.<name>.limits` | `max_rows: 500, max_response_bytes: 65536, max_query_length: 20000` | Response and input limits. |
-| `connections.<name>.tls` | unset | `mode` (`disable`, `require`, `verify-ca`, `verify-full` = default), `ca_file`, `cert_file` + `key_file`. Unset: the DSN's `sslmode`. |
+| `connections.<name>.kind` | required | `postgres` or `prometheus`. Names: `^[a-z0-9][a-z0-9_-]{0,62}$`. |
+| `connections.<name>.dsn` | required | PostgreSQL: `postgresql://user:password@host:port/db`, via `${VAR}` / `${file:...}`. |
+| `connections.<name>.mode` | `read` | PostgreSQL: `write` enables `pg_execute` and write-level `pg_explain(analyze=true)`. |
+| `connections.<name>.write_dsn` | unset | PostgreSQL, `mode: write` only: login for the write pool (`pg_execute`, write-level `pg_explain`). Unset: the write pool uses `dsn`. Recommended (see below). |
+| `connections.<name>.description` | `""` | Both kinds: shown to Claude in `list_connections`. |
+| `connections.<name>.statement_timeout` | `30s` | PostgreSQL: server-side timeout of every statement. |
+| `connections.<name>.pool` | `min_size: 1, max_size: 5, write_max_size: 2` | PostgreSQL: read pool; the write pool opens lazily. |
+| `connections.<name>.allowed_schemas` | `[]` (all) | PostgreSQL: filters the discovery tools only (see below). |
+| `connections.<name>.limits` | `max_rows: 500, max_response_bytes: 65536, max_query_length: 20000` | PostgreSQL: response and input limits. |
+| `connections.<name>.tls` | unset | PostgreSQL: `mode` (`disable`, `require`, `verify-ca`, `verify-full` = default), `ca_file`, `cert_file` + `key_file`. Unset: the DSN's `sslmode`. |
 
 TLS notes:
 
@@ -204,6 +204,44 @@ TLS notes:
   file as `verify-ca`). Use `verify-ca` or `verify-full` to check the certificate.
 - Python 3.13+ enables `VERIFY_X509_STRICT` by default, which rejects internal CA certificates without a
   `keyUsage` extension (libpq accepts them). Reissue the CA, or run on Python 3.12.
+
+### Prometheus connections
+
+```yaml
+connections:
+  metrics:
+    kind: prometheus
+    description: "Production metrics"
+    url: https://prometheus.example.com
+    auth: { type: bearer, token: ${PROM_TOKEN} }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `url` | required | API root (`http` or `https`); requests go to `<url>/api/v1/...`. For Mimir include its prefix (`https://mimir.example.com/prometheus`). No credentials, query string or fragment. Redirects are not followed. |
+| `mode` | `read` | Always `read`: every Prometheus tool is a read, and `mode: write` is rejected. |
+| `auth` | `{type: none}` | `none`, `basic` (`username`, `password`) or `bearer` (`token`); secrets via `${VAR}` / `${file:...}`, never empty. |
+| `headers` | `{}` | Extra request headers, e.g. `X-Scope-OrgID` for a Mimir/Cortex tenant. Values are treated as secrets. `Authorization`, `Proxy-Authorization`, `Host`, `Content-Length`, `Content-Type`, `Transfer-Encoding` and `Connection` are refused. |
+| `timeout` | `30s` | Per request (1s to 10m); also sent to Prometheus as the query evaluation timeout. |
+| `tls` | `verify: true` | `verify: false` turns verification off; `ca_file` (must exist, needs `verify: true`) trusts only that CA. Default trust: certifi, or `SSL_CERT_FILE` / `SSL_CERT_DIR`. No client certificates. |
+| `limits.max_series` | `100` | Series (and alerts) shown per response (1 to 10000). |
+| `limits.max_values` | `500` | Metric names and label values shown per response. |
+| `limits.max_points` | `1000` | Points per series in `prom_query_range` (10 to 11000); a step that needs more is refused with the smallest step that fits. |
+| `limits.max_range` | `31d` | Longest window for range queries and for name/value listings (at least `1m`). |
+| `limits.max_query_length` | `20000` | Characters of PromQL or of a `match` selector. |
+| `limits.max_response_bytes` | `65536` | Text returned to Claude (at least 1024). |
+| `limits.max_body_bytes` | `16777216` | Bytes read from Prometheus per request (at least 65536); a larger answer is refused with a hint to narrow the query. |
+
+Outgoing HTTP (OIDC issuer, Prometheus) honours `HTTPS_PROXY` / `HTTP_PROXY`; put in-cluster hosts in `NO_PROXY`.
+`check-config` shows each Prometheus connection's auth type and number of extra headers, never the URL, token or
+header values.
+
+**Compatible servers.** Mimir/Cortex: `url: https://mimir.example.com/prometheus`, tenant in
+`headers: {X-Scope-OrgID: ...}`. Thanos Query: `prom_alerts` needs the rules API (Ruler or sidecar); metadata may be
+partial. VictoriaMetrics: metadata may be empty (names are still listed) and alerts/rule groups need
+`-vmalert.proxyURL`; without them `prom_alerts` reports the rule groups as unavailable or fails.
+`connection_health` uses `/api/v1/status/buildinfo` and falls back to a trivial query when the server answers 404
+there.
 
 ## Tools
 
@@ -220,6 +258,17 @@ TLS notes:
 | `pg_activity` | read | Active sessions and waiting locks. |
 | `pg_table_stats` | read | Size, scans, live/dead tuples, vacuum and analyze times. |
 | `pg_server_info` | read | Version, current database and size, uptime, database list. |
+| `prom_query` | read | PromQL at one instant (default now): each series with its value, or a scalar. A range selector (`up[5m]`) returns the raw samples. |
+| `prom_query_range` | read | PromQL over a window (default the last hour): per series points, min/max/avg/last and sampled points. |
+| `prom_list_metrics` | read | Metric names with data in a window, with type and help; `name_contains` and `match` filters. |
+| `prom_label_values` | read | Values of one label, optionally only on series matching a selector. |
+| `prom_alerts` | read | Firing and pending alerts, and the state of every rule group (unhealthy rules with their last error). |
+
+Prometheus tools take `connection` from `list_connections` and refuse a PostgreSQL connection (and the `pg_*` tools a
+Prometheus one). Times accept RFC3339 (`2026-11-22T10:00:00Z`), unix seconds, or `now`, `now-15m`, `now-2h`; windows
+(`start`/`end` of `prom_query_range`, `prom_list_metrics` and `prom_label_values`) default to the last hour. Without
+`step`, `prom_query_range` picks a round one that gives up to about 120 points. Label names for `prom_label_values`
+are plain Prometheus names (`^[A-Za-z_][A-Za-z0-9_]*$`).
 
 ## Security model
 
@@ -260,6 +309,22 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
   one server with one user. TLS settings apply to both pools.
 - `allowed_schemas` filters the discovery tools only; it does not restrict SQL sent to `pg_query`. Use `GRANT`s.
 - Error messages never contain the DSN, host or password.
+
+### Prometheus connections
+
+- Read-only by design: Ratatoskr calls only the query, query_range, label values, metadata, alerts, rules and
+  buildinfo endpoints, never the admin or write APIs, whatever flags the server runs with.
+- **PromQL is not restricted.** Anyone with read access to the connection can run any query, including expensive
+  ones. Ratatoskr limits the window (`max_range`), the points per series (`max_points`), sends the evaluation
+  `timeout` to Prometheus and enforces its own deadline, caps what it reads (`max_body_bytes`) and what it returns.
+  Keep Prometheus' own `--query.timeout`, `--query.max-samples` and `--query.max-concurrency` (or the Mimir/Thanos
+  per-tenant limits) in place, and give each connection a credential or tenant that only sees what its users may see.
+- Credentials (`auth`, header values) never appear in errors, logs or `check-config` output. Error texts and warnings
+  from the server are passed on with URLs, IP addresses, `host:port` pairs and internal host names removed (best
+  effort); query results are returned unchanged. Answers that are not the Prometheus API (401/403, 404, 429,
+  redirects, 5xx, HTML login pages) get fixed wording; details go to the log. `serve` and `check-config` warn when
+  `auth` credentials would go over plain `http` to a host other than loopback.
+- At `log_level: INFO` httpx's request lines (which carry internal hosts and label matchers) are not logged.
 
 ### HTTP transport
 
@@ -344,7 +409,7 @@ connections:
 ```bash
 pip install --index-url https://pypi.org/simple -e ".[dev]"
 python -m pytest -q                     # unit tests, no network
-python -m pytest -m integration -q      # needs Docker: starts PostgreSQL with testcontainers
+python -m pytest -m integration -q      # needs Docker: starts PostgreSQL and Prometheus with testcontainers
 python -m ruff check src tests
 python -m ruff format --check src tests
 python -m mypy src

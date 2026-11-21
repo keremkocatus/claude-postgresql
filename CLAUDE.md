@@ -4,12 +4,14 @@ Multi-connection MCP server (`src/ratatoskr`, PyPI `ratatoskr-mcp`, CLI `ratatos
 `docs/superpowers/specs/2026-11-21-multi-backend-redesign-design.md`; shared interfaces for stage 1:
 `docs/superpowers/plans/2026-11-21-phase1-interfaces.md` (read its notes sections at the end too).
 Current state: stdio (Plan 1a) and secure streamable-HTTP (Plan 1b: OAuth AS, local + OIDC identity, SQLite state,
-`Dockerfile`). `docker-compose.yml` is still the old 0.1 one (compose, Caddy and CI are stage 4).
+`Dockerfile`). Stage 2 adds Prometheus connections (`docs/superpowers/plans/2026-11-22-phase2-prometheus.md`).
+`docker-compose.yml` is still the old 0.1 one (compose, Caddy and CI are stage 4).
 
 ## Commands (Windows, repo root)
 
 - Unit tests (no network, no Docker): `.venv/Scripts/python -m pytest -q`
-- Integration tests (Docker Desktop running; testcontainers starts `postgres:17`):
+- Integration tests (Docker Desktop running; testcontainers starts `postgres:17-alpine` and
+  `prom/prometheus:v3.16.0`):
   `.venv/Scripts/python -m pytest -m integration -q`
 - Lint: `.venv/Scripts/python -m ruff check src tests`
 - Types: `.venv/Scripts/python -m mypy src`
@@ -34,12 +36,13 @@ metadata, sse-starlette shutdown) and the shims that rely on them (`transport/oa
 the `Dockerfile`; the comment there shows how to move it.
 
 Plain `pytest` skips integration tests (`addopts = -m 'not integration'`); `-m integration` selects them.
-Integration tests only ever use the local testcontainers PostgreSQL; never connect to a remote or production
-database.
+Integration tests only ever use the local testcontainers PostgreSQL and Prometheus (the first run pulls the
+Prometheus image from Docker Hub); never connect to a remote or production database or Prometheus.
 
 ## Layout (`src/ratatoskr/`)
 
-- `config/` YAML loading (`loader.py`: `${VAR}`, `${file:/path}`), pydantic models (`models.py`), durations.
+- `config/` YAML loading (`loader.py`: `${VAR}`, `${file:/path}`), pydantic models (`models.py`), durations,
+  `http_models.py` (auth/headers/TLS of HTTP kinds), `prometheus_models.py`, `shared.py`.
 - `auth/` `Principal`, `Policy` (effective access), principal resolvers (`TokenPrincipalResolver` for HTTP);
   OAuth AS provider (`oauth_server.py`), crypto/keys from `server.secret_key`, CSRF, rate limiter, login pages and
   routes (`web.py`), `identity/` (local argon2id, OIDC RP), `password_cli.py` (`hash-password`).
@@ -48,15 +51,22 @@ database.
 - `transport/` HTTP composition root (`app.py`), preconditions (same checks for `serve` and `check-config`), client
   IP / trusted proxies, Host check, body and endpoint limits, client compatibility rewrites for `/revoke` and
   `/register` (`oauth_compat.py`), clean end of `/mcp` streams on shutdown (`stream_end.py`), uvicorn (`serve.py`).
-- `backends/` `Backend` protocol, `BackendRegistry` (lazy open, 10 s retry), user-safe errors, `clamp_text`.
+- `backends/` `Backend` protocol, `BackendRegistry` (lazy open, 10 s retry), user-safe errors, `clamp_text`,
+  `timeparse.py` (RFC3339 / unix / `now-15m`, ranges, steps; shared with Loki).
 - `backends/postgres/` pools and execution (`backend.py`), guard pre-checks (`guard.py`), TLS (`tls.py`), catalog
   SQL (`introspection.py`), query/execute/explain (`querying.py`), tool registration (`tools.py`) and tool texts
   (`descriptions.py`).
+- `backends/http/` shared by HTTP backends: `client.py` (lazy httpx client, deadline, capped read, safe errors),
+  `options.py` (auth headers, TLS trust), `scrub.py` (addresses out of server messages).
+- `backends/prometheus/` endpoints and error envelope (`api.py`), backend (`backend.py`), result parsing (`series.py`),
+  text (`formatting.py`, `summarize.py`), tool logic (`querying.py`, `discovery.py`, `alerts.py`), registration
+  (`tools.py`) and tool texts (`descriptions.py`).
 - `tools/runtime.py` the one wrapper every tool goes through; `tools/common.py` backend-independent tools.
 - `observability/` audit events and sinks, JSON logging, secret redaction.
 - `app.py` builds the FastMCP app; `cli.py` is the entry point.
-- Tests: `tests/fakes.py` (fake config, backends, clock, audit sink), `tests/unit/`, `tests/integration/`. HTTP
-  tests live in `tests/unit/secure_http/` (fixtures in its `conftest.py`); end-to-end OAuth flows run in process
+- Tests: `tests/fakes.py` (fake config, backends, clock, audit sink), `tests/unit/`, `tests/integration/`;
+  `tests/unit/prom_helpers.py` with the `prom_api` (respx) and `prom_backend` fixtures in `tests/unit/conftest.py`.
+  HTTP tests live in `tests/unit/secure_http/` (fixtures in its `conftest.py`); end-to-end OAuth flows run in process
   against the real Starlette app via `httpx.ASGITransport` in `tests/unit/secure_http/e2e/` (fake OIDC issuer via
   respx): they are unit tests, no network, no Docker.
 - `config.example.yaml` is the annotated config reference; `tests/unit/test_example_config.py` keeps it valid.
@@ -94,6 +104,12 @@ database.
   `pg_explain(analyze=true)` (always rolled back). It logs in with `write_dsn` when set (else `dsn`); the read
   pool always uses `dsn`. Never use the write pool (or `write_dsn`) for a read-level call. `guard.py` is an early, readable check, not the security
   boundary: the DB role's GRANTs are.
+- Prometheus: only the read endpoints in `backends/prometheus/api.py` (query, query_range, label values, metadata,
+  alerts, rules, buildinfo); never admin or write APIs; `mode` is always `read`. Server messages (errors, warnings,
+  rule errors) go through `scrub_upstream_text`; successful output is not scrubbed. Never put the URL, a header value
+  or a credential into a message. Prometheus tools pass `kind=` and `truncation_hint=` to `ToolRuntime.run`.
+- Time arguments are parsed only by `backends/timeparse.py` (errors are `InvalidRequestError`); HTTP backends talk to
+  their servers only through `backends/http/client.py`.
 - Minimum supported PostgreSQL is 12; catalog SQL must work there.
 - Tool descriptions in `descriptions.py` / `tools/common.py` are product UX for the LLM: short, say what comes
   back, when to use the tool, the limits, and that `connection` comes from `list_connections`.
