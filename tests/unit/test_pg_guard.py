@@ -77,6 +77,41 @@ def test_explain_behind_nested_comment_rejected() -> None:
         check_explain_target("/* /* */ */ EXPLAIN SELECT 1", max_length=1000)
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "PREPARE/**/TRANSACTION 'x'",
+        "prepare /* a /* b */ */ transaction 'x'",
+        "PREPARE\n-- c\nTRANSACTION 'x'",
+        "PREPARE\tTRANSACTION 'x'",
+        "START/**/TRANSACTION",
+        "COMMIT PREPARED 'x'",
+        "ROLLBACK/**/PREPARED 'x'",
+        "/* x */ commit\nprepared 'x'",
+    ],
+)
+def test_two_word_transaction_control_with_comments_between(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match="Transaction control"):
+        check_write_sql(sql, max_length=1000)
+
+
+def test_prepare_of_a_statement_is_not_transaction_control() -> None:
+    check_write_sql("PREPARE ins (int) AS INSERT INTO t VALUES ($1)", max_length=1000)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["COPY t FROM STDIN", "copy t to stdout", "/* x */ COPY (SELECT 1) TO STDOUT", "  -- c\nCOPY t FROM STDIN"],
+)
+def test_copy_is_rejected_for_writes(sql: str) -> None:
+    with pytest.raises(InvalidRequestError, match=r"COPY is not supported; use INSERT \.\.\. SELECT or pg_query"):
+        check_write_sql(sql, max_length=1000)
+
+
+def test_copy_inside_a_string_is_not_rejected() -> None:
+    check_write_sql("INSERT INTO notes VALUES ('COPY t FROM STDIN')", max_length=1000)
+
+
 def test_normal_write_passes() -> None:
     check_write_sql("UPDATE accounts SET note = 'copy program' WHERE id = $1", max_length=1000)
     check_write_sql("-- comment\nINSERT INTO t VALUES (1)", max_length=1000)

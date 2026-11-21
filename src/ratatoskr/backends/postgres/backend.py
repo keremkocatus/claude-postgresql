@@ -40,7 +40,7 @@ CONNECT_TIMEOUT_SECONDS = 10.0
 CLIENT_TIMEOUT_GRACE_SECONDS = 5.0
 CLOSE_TIMEOUT_SECONDS = 5.0
 READ_ONLY_SQLSTATE = "25006"
-FIRST_CHUNK_ROWS = 10
+MAX_CHUNK_ROWS = 32
 # DISCARD ALL is not usable: the multi-statement reset runs as an implicit transaction block.
 SESSION_RESET_SQL = (
     "SET SESSION AUTHORIZATION DEFAULT;\nRESET ROLE;\nDEALLOCATE ALL;\nDISCARD TEMP;\nDISCARD SEQUENCES;\n"
@@ -49,6 +49,9 @@ SESSION_RESET_SQL = (
 _UNAVAILABLE_SQLSTATE_PREFIXES = ("08", "28", "3D", "53300", "57P0")
 _TAGGED_VERBS = frozenset({"SELECT", "UPDATE", "DELETE", "MERGE", "FETCH", "MOVE", "COPY"})
 _DML_VERBS = frozenset({"INSERT", "UPDATE", "DELETE", "MERGE"})
+# Truncated results of these are counted to the end with MOVE: DML ... RETURNING (and data-modifying CTEs in
+# WITH) has already run to completion, so the count is the number of rows the statement changed.
+_COUNTED_TO_END_VERBS = _DML_VERBS | {"WITH"}
 _MOVE_ALL = 2**31 - 1  # MOVE takes a 32-bit count
 
 logger = logging.getLogger("ratatoskr.backends.postgres")
@@ -337,11 +340,12 @@ async def _run_statement(
         return StatementResult(status=statement.get_statusmsg() or "", columns=[], rows=[])
     cursor = await statement.cursor(*args)
     rows, consumed, truncated = await _read_capped(cursor, max_rows, max_bytes)
-    # A cursor does not expose the command tag, so build one. DML ... RETURNING has already run to
-    # completion: count the rows left with MOVE (no transfer). A SELECT is not read to the end.
+    # A cursor does not expose the command tag, so build one. DML ... RETURNING and WITH ... have already run
+    # their data changes to completion: count the rows left with MOVE (no transfer). A SELECT is not read to
+    # the end.
     verb = leading_keyword(sql)
     count = len(rows)
-    if truncated and verb in _DML_VERBS:
+    if truncated and verb in _COUNTED_TO_END_VERBS:
         count = consumed + await cursor.forward(_MOVE_ALL)
     return StatementResult(status=_command_tag(verb, count), columns=columns, rows=rows, truncated=truncated)
 
@@ -361,9 +365,12 @@ def _approximate_size(row: tuple[Any, ...]) -> int:
 async def _read_capped(cursor: Any, max_rows: int, max_bytes: int | None) -> tuple[list[tuple[Any, ...]], int, bool]:
     """Read at most *max_rows* rows (and, with *max_bytes*, about that many bytes) from *cursor*.
 
-    Returns the rows kept, the number of rows taken from the cursor and whether rows were left out. With a
-    byte budget the cursor is read in chunks sized from the rows seen so far, so a result of huge rows never
-    sits in memory as a whole.
+    Returns the rows kept, the number of rows taken from the cursor and whether rows were left out.
+
+    With a byte budget the first fetch takes one row; each later chunk doubles (at most ``MAX_CHUNK_ROWS``) and
+    never asks for more rows than the remaining budget holds at the size of the largest row seen so far. A
+    chunk can still overshoot when rows grow beyond anything seen before, and a single huge value cannot be
+    bounded on the client side at all: asyncpg receives each row whole.
     """
     if max_bytes is None:
         records = await cursor.fetch(max_rows + 1)
@@ -371,7 +378,9 @@ async def _read_capped(cursor: Any, max_rows: int, max_bytes: int | None) -> tup
     rows: list[tuple[Any, ...]] = []
     consumed = 0
     size = 0
-    want = min(FIRST_CHUNK_ROWS, max_rows + 1)
+    largest = 1
+    chunk = 1
+    want = 1
     while True:
         records = await cursor.fetch(want)
         consumed += len(records)
@@ -380,13 +389,15 @@ async def _read_capped(cursor: Any, max_rows: int, max_bytes: int | None) -> tup
                 return rows, consumed, True
             row = tuple(record)
             rows.append(row)
-            size += _approximate_size(row)
+            row_size = _approximate_size(row)
+            largest = max(largest, row_size)
+            size += row_size
             if size > max_bytes:
                 return rows, consumed, True
         if len(records) < want:
             return rows, consumed, False
-        average = max(1, size // max(1, len(rows)))
-        want = max(1, min(max_rows + 1 - len(rows), (max_bytes - size) // average + 1))
+        chunk = min(chunk * 2, MAX_CHUNK_ROWS)
+        want = max(1, min(chunk, max_rows + 1 - len(rows), (max_bytes - size) // largest))
 
 
 async def _close_pool(pool: Any) -> None:

@@ -19,10 +19,11 @@ _DANGEROUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("CREATE EXTENSION", re.compile(r"\bCREATE\s+EXTENSION\b", re.IGNORECASE)),
 )
 
-_TRANSACTION_CONTROL_RE = re.compile(
-    r"\A(?:BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE\s+TRANSACTION)\b",
-    re.IGNORECASE,
-)
+# First words that always end or split the surrounding transaction (COMMIT/ROLLBACK PREPARED included) ...
+_TRANSACTION_CONTROL_WORDS = frozenset({"BEGIN", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE"})
+# ... and two-word forms: START TRANSACTION, PREPARE TRANSACTION (PREPARE name AS ... is allowed).
+_TRANSACTION_CONTROL_PAIRS = frozenset({("START", "TRANSACTION"), ("PREPARE", "TRANSACTION")})
+_WORD_RE = re.compile(r"[A-Za-z_]+")
 _EXPLAIN_RE = re.compile(r"\AEXPLAIN\b", re.IGNORECASE)
 
 
@@ -44,9 +45,8 @@ def _skip_block_comment(sql: str, start: int) -> int:
     raise InvalidRequestError("The SQL statement has an unterminated /* comment.")
 
 
-def _body(sql: str) -> str:
-    """The statement without leading whitespace, comments (nested block comments included) and empty ``;``."""
-    index = 0
+def _skip_noise(sql: str, index: int) -> int:
+    """Index of the next token: skips whitespace, comments (nested block comments included) and ``;``."""
     while index < len(sql):
         if sql[index].isspace() or sql[index] == ";":
             index += 1
@@ -57,13 +57,38 @@ def _body(sql: str) -> str:
             index = _skip_block_comment(sql, index)
         else:
             break
-    return sql[index:]
+    return index
+
+
+def _body(sql: str) -> str:
+    """The statement without leading whitespace, comments and empty ``;``."""
+    return sql[_skip_noise(sql, 0) :]
+
+
+def _leading_words(sql: str, count: int) -> list[str]:
+    """Up to *count* leading words in upper case; comments and whitespace between them are skipped."""
+    words: list[str] = []
+    index = 0
+    while len(words) < count:
+        match = _WORD_RE.match(sql, _skip_noise(sql, index))
+        if match is None:
+            break
+        words.append(match.group(0).upper())
+        index = match.end()
+    return words
 
 
 def leading_keyword(sql: str) -> str:
     """The first word of the statement in upper case (``""`` if there is none), comments skipped."""
-    match = re.match(r"[A-Za-z_]+", _body(sql))
-    return match.group(0).upper() if match else ""
+    words = _leading_words(sql, 1)
+    return words[0] if words else ""
+
+
+def _is_transaction_control(sql: str) -> bool:
+    words = _leading_words(sql, 2)
+    if not words:
+        return False
+    return words[0] in _TRANSACTION_CONTROL_WORDS or tuple(words) in _TRANSACTION_CONTROL_PAIRS
 
 
 def check_sql(sql: str, *, max_length: int) -> None:
@@ -80,11 +105,14 @@ def check_write_sql(sql: str, *, max_length: int) -> None:
     for label, pattern in _DANGEROUS_PATTERNS:
         if pattern.search(sql):
             raise InvalidRequestError(f"Blocked operation: {label} is not allowed through this server.")
-    if _TRANSACTION_CONTROL_RE.match(_body(sql)):
+    if _is_transaction_control(sql):
         raise InvalidRequestError(
             "Transaction control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, ...) are not allowed: "
             "pg_execute already runs all statements in one transaction."
         )
+    if leading_keyword(sql) == "COPY":
+        # COPY FROM STDIN would leave the connection waiting for client data forever.
+        raise InvalidRequestError("COPY is not supported; use INSERT ... SELECT or pg_query.")
 
 
 def check_explain_target(sql: str, *, max_length: int) -> None:

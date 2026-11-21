@@ -270,15 +270,42 @@ async def test_fetch_limited_stops_at_the_byte_budget() -> None:
     session = ReadSession(_FakeConnection({"SELECT big": statement}))
     result = await session.fetch_limited("SELECT big", [], 5000, max_bytes=2500)
     assert (len(result.rows), result.truncated) == (3, True)
-    assert sum(statement.cursor_obj.requests) <= 20  # read in small chunks, not 5001 rows at once
+    assert statement.cursor_obj.requests == [1, 1, 1]  # the budget left never fits more than one such row
 
 
-async def test_fetch_limited_byte_budget_with_small_rows_uses_few_round_trips() -> None:
-    statement = _FakeStatement(["n"], _numbers(300))
-    session = ReadSession(_FakeConnection({"SELECT n": statement}))
-    result = await session.fetch_limited("SELECT n", [], 500, max_bytes=65536)
-    assert (len(result.rows), result.truncated) == (300, False)
-    assert len(statement.cursor_obj.requests) <= 3
+async def _capped_requests(
+    rows: list[tuple[object, ...]], max_rows: int, max_bytes: int
+) -> tuple[int, bool, list[int]]:
+    statement = _FakeStatement(["v"], rows)
+    result = await ReadSession(_FakeConnection({"SELECT v": statement})).fetch_limited(
+        "SELECT v", [], max_rows, max_bytes=max_bytes
+    )
+    return len(result.rows), result.truncated, statement.cursor_obj.requests
+
+
+async def test_byte_budget_chunks_start_at_one_and_double_up_to_32() -> None:
+    assert await _capped_requests(_numbers(100), 500, 65536) == (100, False, [1, 2, 4, 8, 16, 32, 32, 32])
+
+
+async def test_byte_budget_chunks_also_stop_at_the_row_limit() -> None:
+    assert await _capped_requests(_numbers(100), 5, 65536) == (5, True, [1, 2, 3])
+
+
+async def test_byte_budget_uniform_huge_rows_fetch_one_row() -> None:
+    rows: list[tuple[object, ...]] = [("x" * 100_000,) for _ in range(10)]
+    assert await _capped_requests(rows, 500, 65536) == (1, True, [1])
+
+
+async def test_byte_budget_chunk_is_sized_by_the_largest_row_seen() -> None:
+    rows: list[tuple[object, ...]] = [("x" * 1000,) for _ in range(100)]
+    # 1 row (1000 B), then room for 4 but doubling allows 2, then room for 2, then never less than 1
+    assert await _capped_requests(rows, 500, 5500) == (6, True, [1, 2, 2, 1])
+
+
+async def test_byte_budget_small_then_large_rows_overshoot_at_most_one_chunk() -> None:
+    rows: list[tuple[object, ...]] = [("x",) for _ in range(10)] + [("x" * 1000,) for _ in range(1000)]
+    # the 4th chunk (8 rows) was sized while only tiny rows had been seen: it is the most that can overshoot
+    assert await _capped_requests(rows, 5000, 2500) == (13, True, [1, 2, 4, 8])
 
 
 async def test_fetch_rows_passes_the_byte_budget() -> None:
@@ -342,6 +369,14 @@ async def test_execute_status_of_row_returning_statements(sql: str, status: str)
     connection = _FakeConnection({sql: _FakeStatement(["n"], _numbers(3))})
     [result] = await _write_backend(connection).execute([(sql, [])], max_rows=10)
     assert (result.status, result.truncated) == (status, False)
+
+
+async def test_execute_truncated_with_statement_counts_every_row() -> None:
+    sql = "/* c */ WITH s AS (SELECT 1) INSERT INTO t SELECT n FROM s RETURNING n"
+    statement = _FakeStatement(["n"], _numbers(1000))
+    [result] = await _write_backend(_FakeConnection({sql: statement})).execute([(sql, [])], max_rows=10)
+    assert (result.status, len(result.rows), result.truncated) == ("ROWS 1000", 10, True)
+    assert len(statement.cursor_obj.forwards) == 1
 
 
 async def test_execute_byte_budget_marks_truncated() -> None:
