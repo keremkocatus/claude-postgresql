@@ -8,7 +8,7 @@ Ratatoskr is an MCP server that gives Claude (claude.ai, Claude Desktop, Claude 
 **several PostgreSQL databases, Prometheus servers and Loki log stores at once**, with per-group access levels and
 an audit trail. MIT licensed.
 
-> **Status: 1.0.0, not released yet** (the package says `1.0.0.dev0`). Runs locally over **stdio**, or as a team
+> **Status: 1.0.0.** Runs locally over **stdio**, or as a team
 > server over **streamable HTTP** behind a TLS proxy, as a claude.ai custom connector: Ratatoskr is its own OAuth 2.1
 > authorization server, and people sign in with local users or through an OIDC provider such as Authentik.
 > Coming from `claude-postgresql` 0.1? See [`MIGRATION.md`](MIGRATION.md): there is no backward compatibility.

@@ -6,11 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### 1.0.0 (to be released)
+## [1.0.0] - 2026-11-22
 
 Ratatoskr 1.0.0 replaces `claude-postgresql` 0.1. It is not backward compatible: see [`MIGRATION.md`](MIGRATION.md).
 
-#### Added
+### Added
 
 - Any number of named PostgreSQL, Prometheus and Loki connections in one server, with one tool set of 19 tools
   (`list_connections`, `connection_health`, nine `pg_*`, five `prom_*`, three `loki_*`).
@@ -30,14 +30,14 @@ Ratatoskr 1.0.0 replaces `claude-postgresql` 0.1. It is not backward compatible:
 - CI: lint, types, unit and integration tests, image build and Trivy scan; Dependabot.
 - Documentation: configuration reference, connectors, PostgreSQL roles, security model, security policy.
 
-#### Changed
+### Changed
 
 - Name: package `ratatoskr-mcp`, command `ratatoskr`, module `ratatoskr` (was `claude-postgresql`).
 - PostgreSQL tools renamed and merged (`execute_select` is now `pg_query`, and so on; see `MIGRATION.md`).
 - Read-only enforcement by PostgreSQL (read-only sessions and transactions that are always rolled back, extended
   protocol) instead of SQL pattern matching.
 
-#### Removed
+### Removed
 
 - `PG_MCP_*` environment variables and `.env` loading.
 - The `sse` transport, the shared admin password and in-memory tokens.
