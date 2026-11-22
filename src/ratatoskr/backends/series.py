@@ -11,7 +11,8 @@ from typing import Any
 from ratatoskr.backends.errors import BackendQueryError
 
 # Label names in the Prometheus data model; UTF-8 names (Prometheus 3, quoted) are out of scope.
-LABEL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# \Z, not $ (which also matches before a final "\n"); callers use fullmatch.
+LABEL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 Sample = tuple[float, str]  # (unix time, value exactly as Prometheus wrote it: "1", "0.25", "NaN", "+Inf")
 HistogramSample = tuple[float, dict[str, Any]]  # native histogram: count, sum, buckets
@@ -85,15 +86,39 @@ def _unreadable() -> BackendQueryError:
 
 def series_name(labels: Mapping[str, str]) -> str:
     """``up{instance="a:9100", job="node"}``; ``{}`` for a series without name and labels."""
-    name = labels.get("__name__", "")
-    pairs = ", ".join(f'{key}="{escape_label_value(value)}"' for key, value in labels.items() if key != "__name__")
+    name = labels.get("__name__", "").translate(_LINE_BREAKS)
+    pairs = ", ".join(
+        f'{key.translate(_LINE_BREAKS)}="{escape_label_value(value)}"'
+        for key, value in labels.items()
+        if key != "__name__"
+    )
     if not pairs and name:
         return name
     return f"{name}{{{pairs}}}"
 
 
+# Every character str.splitlines() breaks at, written as an escape: label values can come from log content
+# (Loki's | json), and a raw break would let them start a line that looks like a header of its own.
+_LINE_BREAKS = {
+    ord(character): escaped
+    for character, escaped in {
+        "\n": "\\n",
+        "\r": "\\r",
+        "\v": "\\x0b",
+        "\f": "\\x0c",
+        "\x1c": "\\x1c",
+        "\x1d": "\\x1d",
+        "\x1e": "\\x1e",
+        "\x85": "\\x85",
+        "\u2028": "\\u2028",
+        "\u2029": "\\u2029",
+    }.items()
+}
+_LABEL_VALUE_ESCAPES = {ord("\\"): "\\\\", ord('"'): '\\"', **_LINE_BREAKS}
+
+
 def escape_label_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return value.translate(_LABEL_VALUE_ESCAPES)
 
 
 def histogram_text(histogram: Mapping[str, Any]) -> str:

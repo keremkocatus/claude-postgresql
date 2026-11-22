@@ -1,9 +1,13 @@
+import asyncio
+import time
 from urllib.parse import parse_qs
 
 import httpx
+import pytest
 import respx
 
 from ratatoskr.backends.base import ConnectionInfo
+from ratatoskr.backends.http import client as http_client
 from ratatoskr.backends.loki.backend import LokiBackend
 from tests.unit.loki_helpers import NOW, make_backend, success, text_error
 
@@ -54,3 +58,28 @@ async def test_health_failure_hides_the_address(loki_api: respx.Router, loki_bac
         False,
         "Connection 'logs' is unavailable (ConnectError); details are in the server log.",
     )
+
+
+async def test_health_runs_under_one_deadline_for_both_requests(
+    loki_api: respx.Router, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each request answers within the 1s timeout; together they do not (the grace is zeroed for the test)."""
+    monkeypatch.setattr(http_client, "TIMEOUT_GRACE_SECONDS", 0.0)
+
+    async def slow_labels(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.6)
+        return success(["app"])
+
+    async def slow_buildinfo(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.6)
+        return httpx.Response(200, json={"version": "3.7.9"})
+
+    loki_api.get("/loki/api/v1/labels").mock(side_effect=slow_labels)
+    loki_api.get("/loki/api/v1/status/buildinfo").mock(side_effect=slow_buildinfo)
+    backend = make_backend(timeout="1s")
+    await backend.open()
+    started = time.perf_counter()
+    health = await backend.health()
+    await backend.close()
+    assert time.perf_counter() - started < 1.15
+    assert (health.ok, health.error) == (False, "Connection 'logs' did not answer within 1s.")

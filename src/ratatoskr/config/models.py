@@ -25,7 +25,8 @@ from ratatoskr.config.prometheus_models import PrometheusConnection
 from ratatoskr.config.shared import DEFAULT_MAX_RESPONSE_BYTES
 from ratatoskr.config.shared import duration_value as _duration
 
-CONNECTION_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+# \Z, not $: `$` also matches before a final "\n". Callers use fullmatch.
+CONNECTION_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
@@ -276,7 +277,7 @@ class RatatoskrConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_connection_names(self) -> Self:
-        bad = [name for name in self.connections if not CONNECTION_NAME_RE.match(name)]
+        bad = [name for name in self.connections if not CONNECTION_NAME_RE.fullmatch(name)]
         if bad:
             raise ValueError(
                 f"invalid connection name(s) {bad}: use lowercase letters, digits, '_' or '-' "

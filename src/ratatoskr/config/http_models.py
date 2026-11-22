@@ -14,8 +14,14 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr, field_
 
 from ratatoskr.config.shared import duration_value
 
+# Whole-value checks use fullmatch: `$` would also match before a final "\n" (a ${VAR} read from a secret).
 # RFC 9110 token characters.
-_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# What h11 sends (visible characters, spaces and tabs only between them) and httpx can encode (ASCII). h11 refuses
+# anything else with an error that quotes the whole value, so it is refused here, before any request.
+_HEADER_VALUE_RE = re.compile(r"[\x21-\x7e]+(?:[ \t]+[\x21-\x7e]+)*")
+_TOKEN_RE = re.compile(r"[\x21-\x7e]+")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Set by Ratatoskr or httpx; a configured value would conflict with them or bypass `auth`.
 RESERVED_HEADERS = frozenset(
     {
@@ -36,6 +42,13 @@ def _not_empty(value: SecretStr, label: str) -> SecretStr:
     return value
 
 
+def _no_control_characters(value: str, label: str) -> None:
+    """Basic credentials are base64-encoded, so they cannot break a header; a stray line break would only send
+    wrong credentials (HTTP 401 later), so it is refused at load time."""
+    if _CONTROL_RE.search(value):
+        raise ValueError(f"{label} must not contain line breaks, NUL or other control characters")
+
+
 class NoAuth(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,11 +67,13 @@ class BasicAuth(BaseModel):
     def _check_username(cls, value: str) -> str:
         if ":" in value:
             raise ValueError("auth.username must not contain ':'")
+        _no_control_characters(value, "auth.username")
         return value
 
     @field_validator("password")
     @classmethod
     def _check_password(cls, value: SecretStr) -> SecretStr:
+        _no_control_characters(value.get_secret_value(), "auth.password")
         return _not_empty(value, "auth.password")
 
 
@@ -71,7 +86,10 @@ class BearerAuth(BaseModel):
     @field_validator("token")
     @classmethod
     def _check_token(cls, value: SecretStr) -> SecretStr:
-        return _not_empty(value, "auth.token")
+        token = _not_empty(value, "auth.token").get_secret_value()
+        if not _TOKEN_RE.fullmatch(token):  # sent as it is in the Authorization header
+            raise ValueError("auth.token must be printable ASCII without spaces or line breaks")
+        return value
 
 
 HttpAuth = Annotated[NoAuth | BasicAuth | BearerAuth, Field(discriminator="type")]
@@ -115,12 +133,16 @@ def stringify_header_values(value: Any) -> Any:
 
 def check_headers(headers: dict[str, SecretStr]) -> dict[str, SecretStr]:
     for index, (name, value) in enumerate(headers.items()):
-        if not _HEADER_NAME_RE.match(name):
+        if not _HEADER_NAME_RE.fullmatch(name):
             raise ValueError(f"headers: entry {index} is not a valid header name")
         if name.lower() in RESERVED_HEADERS:
             raise ValueError(f"headers: {name} cannot be set here (credentials go under auth)")
-        if any(character in value.get_secret_value() for character in "\r\n\0"):
-            raise ValueError(f"headers: the value of {name} contains a line break or NUL")
+        text = value.get_secret_value()
+        if text and not _HEADER_VALUE_RE.fullmatch(text):
+            raise ValueError(
+                f"headers: the value of {name} must be printable ASCII (spaces only between words), without line "
+                "breaks, NUL or control characters"
+            )
     return headers
 
 

@@ -149,6 +149,42 @@ async def test_transport_error_hides_the_address(
     assert "request to connection prom failed (ConnectError)" in caplog.text
 
 
+async def test_a_request_construction_failure_never_logs_header_values_or_credentials(
+    router: respx.Router, caplog: pytest.LogCaptureFixture
+) -> None:
+    """h11 refuses a bad header value with an error that quotes it (``Illegal header value b'team-a\\n'``); httpcore
+    and httpx wrap it. Neither the message nor a traceback of that chain may reach the log."""
+    tenant = "team-SECRET-42"
+    client = _client(BearerAuth(type="bearer", token=SecretStr(SECRET)), X_Scope_OrgID=tenant)
+    await client.open()
+    router.get("/x").mock(side_effect=httpx.LocalProtocolError(f"Illegal header value b'{tenant}\\n' {SECRET}"))
+    with (
+        caplog.at_level(logging.WARNING, logger="ratatoskr.backends.http"),
+        pytest.raises(BackendUnavailableError) as caught,
+    ):
+        await client.request("GET", "/x")
+    await client.aclose()
+    assert str(caught.value) == "Connection 'prom' is unavailable (LocalProtocolError); details are in the server log."
+    assert "request to connection prom failed (LocalProtocolError)" in caplog.text
+    assert tenant not in caplog.text
+    assert SECRET not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+async def test_transport_failure_text_is_logged_without_configured_secrets(
+    router: respx.Router, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _client(BasicAuth(type="basic", username="reader", password=SecretStr(SECRET)), X_Api_Key="key-VALUE-9")
+    await client.open()
+    router.get("/x").mock(side_effect=httpx.ConnectError(f"[Errno 111] refused; proxy saw {SECRET} and key-VALUE-9"))
+    with caplog.at_level(logging.WARNING, logger="ratatoskr.backends.http"), pytest.raises(BackendUnavailableError):
+        await client.request("GET", "/x")
+    await client.aclose()
+    assert "ConnectError: [Errno 111] refused" in caplog.text  # operators keep the useful part
+    assert SECRET not in caplog.text
+    assert "key-VALUE-9" not in caplog.text
+
+
 def test_certificate_errors_are_found_in_the_cause_chain() -> None:
     try:
         try:

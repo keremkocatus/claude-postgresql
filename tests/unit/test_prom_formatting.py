@@ -38,8 +38,10 @@ def test_unreadable_results(data: object) -> None:
 
 
 def test_label_names() -> None:
-    names = ("job", "__name__", "_x1", "1x", "a-b", "")
-    assert [bool(LABEL_NAME_RE.match(name)) for name in names] == [True, True, True, False, False, False]
+    names = ("job", "__name__", "_x1", "1x", "a-b", "", "job\n", "job\r\n")
+    expected = [True, True, True, False, False, False, False, False]
+    assert [bool(LABEL_NAME_RE.fullmatch(name)) for name in names] == expected
+    assert [bool(LABEL_NAME_RE.match(name)) for name in names] == expected  # anchored with \Z: .match is safe too
 
 
 def test_series_name() -> None:
@@ -47,6 +49,15 @@ def test_series_name() -> None:
     assert series_name({"__name__": "up"}) == "up"
     assert series_name({"job": 'say "hi"\\n'}) == '{job="say \\"hi\\"\\\\n"}'
     assert series_name({}) == "{}"
+
+
+def test_series_name_escapes_every_line_break() -> None:
+    """Label values can come from log content (``| json``): none may break the header line."""
+    value = "a\nb\rc\vd\fe\x1cf\x85g\u2028h\u2029i"
+    name = series_name({"field": value, "odd\rkey": "x"})
+    assert name == '{field="a\\nb\\rc\\x0bd\\x0ce\\x1cf\\x85g\\u2028h\\u2029i", odd\\rkey="x"}'
+    assert len(name.splitlines()) == 1
+    assert len(series_name({"__name__": "m\u2028x"}).splitlines()) == 1
 
 
 def test_block_writer_keeps_the_first_block_and_stops_at_the_budget() -> None:

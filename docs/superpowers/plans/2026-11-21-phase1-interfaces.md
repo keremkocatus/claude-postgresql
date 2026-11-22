@@ -440,3 +440,10 @@ Plan: `docs/superpowers/plans/2026-11-22-phase3-loki.md`. Sözleşmeyi bozmadan 
   `formatting.py`, `querying.py`, `discovery.py`, `descriptions.py`, `tools.py` (`register_loki_tools`). Araçlar:
   `loki_query(connection, logql, start?, end?, limit?, direction?, step?)`, `loki_labels(connection, selector?, start?,
   end?)`, `loki_label_values(connection, label, selector?, start?, end?)`; toplam 19 araç.
+- Aşama 3 review düzeltmeleri: `timed_health(connection, probe, *, deadline=)` (sağlık denetimi de çağrı başına tek
+  deadline altında; iki backend `deadline=self.deadline` verir). `backends/http/failure.py`: `describe_failure(exc,
+  secrets=)` (başarısız isteğin log metni: traceback yok, `LocalProtocolError` / `UnicodeError` metni yazılmaz, diğer
+  metinlerde yapılandırılmış sırlar maskelenir). `LokiApi(..., tenants=)` (sunucu metninde tenant `<tenant>` olur).
+  `LokiLimits`: `max_line_bytes * 4 <= max_response_bytes`. `LABEL_NAME_RE` ve `CONNECTION_NAME_RE` `\Z` ile biter ve
+  `fullmatch` ile kullanılır; `src/` içinde hiçbir regex `$` kullanmaz (`tests/unit/test_regex_anchors.py`).
+  `streams.MAX_NS` (Go int64); `ignored_limit_note` (sunucu `limit`'i aşarsa).

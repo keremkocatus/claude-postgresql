@@ -10,6 +10,7 @@ the details go to the log.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 from typing import Any, Literal
 from urllib.parse import quote
@@ -34,13 +35,19 @@ logger = logging.getLogger("ratatoskr.backends.loki")
 
 
 class LokiApi:
-    def __init__(self, connection: str, client: HttpClient, *, hosts: Iterable[str]) -> None:
+    def __init__(
+        self, connection: str, client: HttpClient, *, hosts: Iterable[str], tenants: Iterable[str] = ()
+    ) -> None:
         self._connection = connection
         self._client = client
         self._hosts = frozenset(hosts)
+        self._tenants = _tenant_pattern(tenants)
 
     def scrub(self, text: str) -> str:
-        """Server text (errors, warnings) as it may be shown: no addresses, no secrets."""
+        """Server text (errors, warnings) as it may be shown: no addresses, no secrets, no configured tenant IDs
+        (the tenant is configured as a secret)."""
+        if self._tenants is not None:
+            text = self._tenants.sub("<tenant>", text)
         return scrub_server_text(text, hosts=self._hosts)
 
     async def query_range(
@@ -112,6 +119,15 @@ class LokiApi:
                 "root (requests go to <url>/loki/api/v1/...). Details are in the server log."
             )
         return status_error(self._connection, status)
+
+
+def _tenant_pattern(tenants: Iterable[str]) -> re.Pattern[str] | None:
+    """Whole tenant IDs only (not inside a longer ID or word): ``team-a`` but not ``team-ab``."""
+    names = sorted({tenant for tenant in tenants if tenant}, key=len, reverse=True)
+    if not names:
+        return None
+    alternatives = "|".join(re.escape(name) for name in names)
+    return re.compile(rf"(?<![\w!.*'()-])(?:{alternatives})(?![\w!.*'()-])")
 
 
 def _window(selector: str | None, start: str, end: str) -> dict[str, str]:

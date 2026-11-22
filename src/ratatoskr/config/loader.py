@@ -19,7 +19,7 @@ from pydantic import ValidationError
 from ratatoskr.config.models import RatatoskrConfig
 
 _REFERENCE_RE = re.compile(r"\$\{([^}]*)\}")
-_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")  # fullmatch: `$` would also match before a final "\n"
 _KIND_TAGS = frozenset({"postgres", "prometheus", "loki"})
 
 
@@ -102,7 +102,7 @@ def _resolve(reference: str, env: Mapping[str, str], where: str) -> str:
     if reference.startswith("file:"):
         file_path = Path(reference[len("file:") :])
         return _read_text(file_path, f"{where}: cannot read secret file {file_path}").rstrip("\r\n")
-    if not _ENV_NAME_RE.match(reference):
+    if not _ENV_NAME_RE.fullmatch(reference):
         raise ConfigError(f"{where}: invalid reference '${{{reference}}}'; use ${{VAR_NAME}} or ${{file:/path}}")
     if reference not in env:
         raise ConfigError(f"{where}: environment variable '{reference}' is not defined")

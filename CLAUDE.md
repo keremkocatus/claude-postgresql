@@ -64,7 +64,8 @@ remote or production database, Prometheus or Loki.
 - `backends/http/` shared by HTTP backends: `client.py` (lazy httpx client, per-request and per-call deadline, safe
   errors), `body.py` (capped body read, bounded gzip/deflate decoding), `options.py` (auth headers, TLS trust),
   `scrub.py` (addresses out of server messages), `envelope.py` (success envelope, notes, `scrub_server_text`, JSON
-  decoding off the loop), `health.py` (`timed_health`).
+  decoding off the loop), `health.py` (`timed_health`, under the backend's per-call deadline), `failure.py` (what the
+  log may say about a failed request).
 - `backends/prometheus/` endpoints and error envelope (`api.py`), backend (`backend.py`), result parsing (`series.py`),
   text (`formatting.py`, `summarize.py`), tool logic (`querying.py`, `discovery.py`, `alerts.py`), registration
   (`tools.py`) and tool texts (`descriptions.py`).
@@ -101,7 +102,12 @@ remote or production database, Prometheus or Loki.
 - Logs go to **stderr** as JSON (stdout is the MCP stdio channel). Do not move them to stdout. HTTP keeps them there
   too: uvicorn runs with `log_config=None` and `access_log=False` (request lines carry codes), and `aiosqlite` stays
   above DEBUG (it logs statement parameters). Counts whose names look like secrets (`tokens`) go in the message,
-  not in `extra=` (the formatter masks such keys).
+  not in `extra=` (the formatter masks such keys). A failed HTTP backend request is logged through
+  `describe_failure` without `exc_info`: h11 quotes a refused header value in its error, so a traceback would log
+  the tenant or token.
+- Whole-value regex checks use `fullmatch` (or `\Z`), never `$`, which also matches before a final `"\n"` (a
+  `${VAR}` from a secret); `tests/unit/test_regex_anchors.py` refuses `$` anywhere in `src/`. Header values, bearer
+  tokens, basic credentials and the tenant are checked at config load, with messages that never echo the value.
 - HTTP: OAuth, session and rate-limit state lives in the SQLite store (single replica); tokens are
   stored as SHA-256 hashes, client and upstream secrets sealed with keys derived from `server.secret_key`. Text shown
   in browser pages and OAuth errors is fixed wording; details go to the log. No private SDK attribute access.
@@ -122,7 +128,9 @@ remote or production database, Prometheus or Loki.
   `truncation_hint=` to `ToolRuntime.run`, and every call runs under one `PrometheusBackend.deadline()`.
 - Loki: only the read endpoints in `backends/loki/api.py` (query_range, labels, label values, buildinfo); `mode` is
   always `read`. `tenant` is the only source of `X-Scope-OrgID` (refused under `headers`). Error texts and warnings go
-  through `LokiApi.scrub`; log lines are user data: cut to `max_line_bytes` (marked), never scrubbed or redacted.
+  through `LokiApi.scrub` (which also masks the tenant IDs); log lines are user data: cut to `max_line_bytes`
+  (marked, at most a quarter of `max_response_bytes`), never scrubbed or redacted, but every `str.splitlines` break
+  in them is indented (and escaped in label values) so a line cannot forge a stream header.
   Window (`max_range`), `limit` (`max_lines`) and step (`max_points`) are checked before any request. Loki tools pass
   `kind=` and `truncation_hint=` and run under one `LokiBackend.deadline()`; stream parsing runs in
   `asyncio.to_thread` and builds at most `limit` lines.

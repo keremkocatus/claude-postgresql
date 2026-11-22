@@ -220,9 +220,9 @@ connections:
 |---|---|---|
 | `url` | required | API root (`http` or `https`); requests go to `<url>/api/v1/...`. For Mimir include its prefix (`https://mimir.example.com/prometheus`). No credentials, query string or fragment. Redirects are not followed. |
 | `mode` | `read` | Always `read`: every Prometheus tool is a read, and `mode: write` is rejected. |
-| `auth` | `{type: none}` | `none`, `basic` (`username`, `password`) or `bearer` (`token`); secrets via `${VAR}` / `${file:...}`, never empty. |
-| `headers` | `{}` | Extra request headers, e.g. `X-Scope-OrgID` for a Mimir/Cortex tenant. Values are treated as secrets. `Authorization`, `Proxy-Authorization`, `Host`, `Content-Length`, `Content-Type`, `Transfer-Encoding` and `Connection` are refused. |
-| `timeout` | `30s` | Per request (1s to 10m); also sent to Prometheus as the query evaluation timeout. Each tool call has one deadline for all its requests, `timeout` + 5s (`prom_list_metrics` and `prom_alerts` send two). |
+| `auth` | `{type: none}` | `none`, `basic` (`username`, `password`) or `bearer` (`token`); secrets via `${VAR}` / `${file:...}`, never empty. A token must be printable ASCII without spaces; a username or password must not contain line breaks, NUL or other control characters (a `${VAR}` with a trailing newline is refused at load time). |
+| `headers` | `{}` | Extra request headers, e.g. `X-Scope-OrgID` for a Mimir/Cortex tenant. Values are treated as secrets and must be printable ASCII (spaces only between words; no line breaks, NUL or control characters, so a trailing newline from a secret is refused at load time). `Authorization`, `Proxy-Authorization`, `Host`, `Content-Length`, `Content-Type`, `Transfer-Encoding` and `Connection` are refused. |
+| `timeout` | `30s` | Per request (1s to 10m); also sent to Prometheus as the query evaluation timeout. Each tool call has one deadline for all its requests, `timeout` + 5s (`prom_list_metrics` and `prom_alerts` send two, `connection_health` up to two). |
 | `tls` | `verify: true` | `verify: false` turns verification off; `ca_file` (must exist, needs `verify: true`) trusts only that CA. Default trust: certifi, or `SSL_CERT_FILE` / `SSL_CERT_DIR`. No client certificates. |
 | `limits.max_series` | `100` | Series (and alerts) shown per response (1 to 10000); only these series are parsed, the others are counted. |
 | `limits.max_values` | `500` | Metric names and label values shown per response. |
@@ -263,13 +263,13 @@ connections:
 |---|---|---|
 | `url` | required | Loki root or its gateway (`http` or `https`); requests go to `<url>/loki/api/v1/...`. No credentials, query string or fragment. Redirects are not followed. |
 | `mode` | `read` | Always `read`: every Loki tool is a read, and `mode: write` is rejected. |
-| `tenant` | unset | Sent as `X-Scope-OrgID` on every request (multi-tenant Loki, Grafana Enterprise Logs); several tenants for a cross-tenant query: `a\|b` (the server must allow it). Letters, digits and `!-_.*'()`, at most 150 per tenant. `X-Scope-OrgID` under `headers` is refused, so the tenant has one source. |
-| `auth` | `{type: none}` | `none`, `basic` (`username`, `password`; Grafana Cloud: the user ID and an access token) or `bearer` (`token`); secrets via `${VAR}` / `${file:...}`, never empty. |
-| `headers` | `{}` | Extra request headers; values are treated as secrets. The same headers as for Prometheus are refused, plus `X-Scope-OrgID`. |
-| `timeout` | `30s` | 1s to 10m. Each tool call has one deadline for all its requests, `timeout` + 5s (`connection_health` sends two). Loki's own `query_timeout` still applies on the server. |
+| `tenant` | unset | Sent as `X-Scope-OrgID` on every request (multi-tenant Loki, Grafana Enterprise Logs); several tenants for a cross-tenant query: `a\|b` (the server must allow it). Letters, digits and `!-_.*'()`, at most 150 per tenant; the whole value is checked, so a trailing newline (a `${VAR}` from a secret) is refused at load time. `X-Scope-OrgID` under `headers` is refused, so the tenant has one source. The tenant is treated as a secret: it is masked as `<tenant>` in Loki's error texts and warnings. |
+| `auth` | `{type: none}` | `none`, `basic` (`username`, `password`; Grafana Cloud: the user ID and an access token) or `bearer` (`token`); secrets via `${VAR}` / `${file:...}`, never empty; the same character rules as for Prometheus. |
+| `headers` | `{}` | Extra request headers; values are treated as secrets and follow the same character rules as for Prometheus. The same headers as for Prometheus are refused, plus `X-Scope-OrgID`. |
+| `timeout` | `30s` | 1s to 10m. Each tool call, `connection_health` included (it sends two requests), has one deadline for all its requests, `timeout` + 5s. Loki's own `query_timeout` still applies on the server. |
 | `tls` | `verify: true` | As for Prometheus: `verify: false`, or `ca_file` to trust only that CA. No client certificates. |
 | `limits.max_lines` | `500` | Highest `limit` a `loki_query` may ask for (1 to 5000, Loki's own default ceiling); the default `limit` is 100 (or `max_lines` if lower). A higher `limit` is refused. |
-| `limits.max_line_bytes` | `2048` | Each log line is cut to this many bytes (64 to 65536) and marked `… [cut: N bytes]`. |
+| `limits.max_line_bytes` | `2048` | Each log line is cut to this many bytes (64 to 65536) and marked `… [cut: N bytes]`. At most a quarter of `max_response_bytes` (16384 at the default), so several lines fit in one answer; a first line that still does not fit (a multi-line entry is indented under its timestamp, which makes it larger) is cut to the room left, so an answer always shows at least one line. |
 | `limits.max_range` | `24h` | Longest window for `loki_query`, `loki_labels` and `loki_label_values` (at least `1m`); a longer one is refused before any request. |
 | `limits.max_series` | `100` | Series shown for a metric query (1 to 10000). |
 | `limits.max_points` | `1000` | Points per series in a metric query (10 to 11000); a `step` that needs more is refused with the smallest step that fits. |
@@ -372,7 +372,10 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
   `timeout` to Prometheus and enforces its own deadline, caps what it reads (`max_body_bytes`) and what it returns.
   Keep Prometheus' own `--query.timeout`, `--query.max-samples` and `--query.max-concurrency` (or the Mimir/Thanos
   per-tenant limits) in place, and give each connection a credential or tenant that only sees what its users may see.
-- Credentials (`auth`, header values) never appear in errors, logs or `check-config` output. Error texts, warnings and
+- Credentials (`auth`, header values) never appear in errors, logs or `check-config` output. A failed request is
+  logged without a traceback: by exception class and message, with every configured credential and header value
+  masked, and by class only when the HTTP library refused the request before sending it (its message quotes header
+  values). Error texts, warnings and
   rule errors from the server are passed on with URLs, IP addresses (IPv4, IPv6 with or without brackets),
   `host:port` pairs (also single-label hosts such as `prometheus-0:10901`), names under `svc`, `cluster.local`,
   `internal`, `local`, `lan` or `corp`, and other names of three or more labels (`ingester-7.ingester.mimir`; a
@@ -394,11 +397,17 @@ own connections (`dblink`, `postgres_fdw`), and they cannot take away privileges
   `max_entries_limit_per_query`) in place, and give each connection a tenant and credential that only see what its
   users may see.
 - Log lines are the user's data: they are cut to `max_line_bytes` but never masked, so a secret written into a log
-  line is shown as it is. Loki's error texts (which can echo the query) and warnings go through the same address
-  removal and secret masking as Prometheus messages; 401/403, 404, 429, redirects, 5xx and HTML pages get fixed
-  wording, a multi-tenant server without a tenant gets a hint to set `tenant`, and HTTP 504 is reported as a timeout.
-- `tenant`, credentials and header values never appear in errors, logs or `check-config` output; `serve` and
-  `check-config` warn when `auth` credentials would go over plain `http` to a host other than loopback.
+  line is shown as it is. Every line break inside a log line (`\n`, `\r`, `\v`, `\f`, U+0085, U+2028, U+2029 and
+  the other breaks Python's `str.splitlines` knows) becomes an indented continuation line, and label values show
+  them escaped, so a log line cannot pose as a stream header or a timestamp of its own. When a server sends more
+  lines than the requested `limit`, only the first `limit` are read and the answer says how many it sent. Loki's
+  error texts (which can echo the query) and warnings go through the same address removal and secret masking as
+  Prometheus messages, and the configured tenant IDs are shown as `<tenant>`; 401/403, 404, 429, redirects, 5xx and
+  HTML pages get fixed wording, a multi-tenant server without a tenant gets a hint to set `tenant`, and HTTP 504 is
+  reported as a timeout.
+- `tenant`, credentials and header values never appear in errors, logs or `check-config` output (failed requests are
+  logged as for Prometheus); `serve` and `check-config` warn when `auth` credentials would go over plain `http` to a
+  host other than loopback.
 
 ### HTTP transport
 

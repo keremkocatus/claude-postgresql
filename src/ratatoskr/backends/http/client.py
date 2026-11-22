@@ -21,8 +21,9 @@ from pydantic import SecretStr
 from ratatoskr import __version__
 from ratatoskr.backends.errors import BackendError, BackendQueryError, BackendTimeoutError, BackendUnavailableError
 from ratatoskr.backends.http.body import UnreadableBodyError, read_capped
+from ratatoskr.backends.http.failure import describe_failure
 from ratatoskr.backends.http.options import build_auth, build_verify
-from ratatoskr.config.http_models import HttpAuth, HttpTlsSettings
+from ratatoskr.config.http_models import BasicAuth, BearerAuth, HttpAuth, HttpTlsSettings
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 # The server's own timeout (sent as a parameter) should answer first, with a clearer message.
@@ -68,6 +69,7 @@ class HttpClient:
         self._tls = tls
         self.timeout = timeout
         self._max_body_bytes = max_body_bytes
+        self._secrets = _secret_values(auth, headers)  # masked in logged failure text
         self._client: httpx.AsyncClient | None = None
         self._closed = False
 
@@ -167,7 +169,13 @@ class HttpClient:
         return ResponseTooLargeError(message.strip())
 
     def _unavailable(self, exc: httpx.HTTPError) -> BackendUnavailableError:
-        logger.warning("request to connection %s failed (%s)", self._connection, type(exc).__name__, exc_info=exc)
+        # No traceback: h11's text for a refused header quotes its value (see describe_failure).
+        logger.warning(
+            "request to connection %s failed (%s): %s",
+            self._connection,
+            type(exc).__name__,
+            describe_failure(exc, secrets=self._secrets),
+        )
         if is_certificate_error(exc):
             return BackendUnavailableError(
                 f"Connection '{self._connection}' is unavailable: its TLS certificate could not be verified. "
@@ -176,6 +184,16 @@ class HttpClient:
         return BackendUnavailableError(
             f"Connection '{self._connection}' is unavailable ({type(exc).__name__}); details are in the server log."
         )
+
+
+def _secret_values(auth: HttpAuth, headers: Mapping[str, SecretStr]) -> tuple[str, ...]:
+    """Every configured header value (tenants, API keys) and the credential of *auth*."""
+    values = [value.get_secret_value() for value in headers.values()]
+    if isinstance(auth, BearerAuth):
+        values.append(auth.token.get_secret_value())
+    elif isinstance(auth, BasicAuth):
+        values.append(auth.password.get_secret_value())
+    return tuple(values)
 
 
 def is_certificate_error(exc: BaseException) -> bool:

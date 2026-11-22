@@ -11,7 +11,7 @@ from ratatoskr.backends.prometheus.api import SERIES_HINT
 from ratatoskr.backends.series import QueryResult, Series, histogram_text, series_name
 from ratatoskr.backends.timeparse import format_time
 
-_FRACTION_RE = re.compile(r"\.\d+(?=Z$|[+-]\d{2}:\d{2}$)")
+_FRACTION_RE = re.compile(r"\.\d+(?=Z\Z|[+-]\d{2}:\d{2}\Z)")
 _NEVER = "0001-01-01T00:00:00Z"
 
 

@@ -18,6 +18,10 @@ from ratatoskr.config.http_models import (
 )
 
 SECRET = "s3cr3t-VALUE-never-shown"
+HEADER_VALUE_RULE = "the value of X-Tenant must be printable ASCII"
+TOKEN_RULE = "auth.token must be printable ASCII without spaces or line breaks"
+USERNAME_RULE = "auth.username must not contain line breaks, NUL or other control characters"
+PASSWORD_RULE = "auth.password must not contain line breaks, NUL or other control characters"
 
 
 class _Holder(BaseModel):
@@ -38,6 +42,13 @@ def test_auth_variants() -> None:
     assert SECRET not in repr(bearer)
 
 
+def test_unusual_but_valid_credentials_pass() -> None:
+    auth = {"type": "basic", "username": "jos\u00e9", "password": "p \u00e4ss word"}
+    assert isinstance(_Holder.model_validate({"auth": auth}).auth, BasicAuth)  # base64: any printable text works
+    bearer = _Holder.model_validate({"auth": {"type": "bearer", "token": "glsa_AbC.-~+/=="}}).auth
+    assert isinstance(bearer, BearerAuth)
+
+
 @pytest.mark.parametrize(
     ("auth", "expected"),
     [
@@ -45,6 +56,20 @@ def test_auth_variants() -> None:
         ({"type": "basic", "username": "u", "password": ""}, "auth.password must not be empty"),
         ({"type": "basic", "username": "a:b", "password": "p"}, "auth.username must not contain ':'"),
         ({"type": "bearer", "token": SECRET, "extra": SECRET}, "Extra inputs are not permitted"),
+        # The token goes into the Authorization header as it is: h11 refuses these and its error names the value.
+        ({"type": "bearer", "token": f"{SECRET}\n"}, TOKEN_RULE),
+        ({"type": "bearer", "token": f"{SECRET}\r\nX-Evil: 1"}, TOKEN_RULE),
+        ({"type": "bearer", "token": f"{SECRET}\x00"}, TOKEN_RULE),
+        ({"type": "bearer", "token": f"{SECRET} x"}, TOKEN_RULE),
+        ({"type": "bearer", "token": f"{SECRET}\u00e9"}, TOKEN_RULE),
+        # Basic credentials are base64-encoded, so they cannot break the header; a stray "\n" (a ${VAR} from a
+        # secret) would only send wrong credentials, so it is refused at load time instead of failing as HTTP 401.
+        ({"type": "basic", "username": "u\n", "password": "p"}, USERNAME_RULE),
+        ({"type": "basic", "username": "u\x00", "password": "p"}, USERNAME_RULE),
+        ({"type": "basic", "username": "u", "password": f"{SECRET}\n"}, PASSWORD_RULE),
+        ({"type": "basic", "username": "u", "password": f"{SECRET}\r"}, PASSWORD_RULE),
+        ({"type": "basic", "username": "u", "password": f"{SECRET}\x00"}, PASSWORD_RULE),
+        ({"type": "basic", "username": "u", "password": f"{SECRET}\x1b"}, PASSWORD_RULE),
     ],
 )
 def test_auth_errors_never_echo_values(auth: dict[str, Any], expected: str) -> None:
@@ -98,7 +123,16 @@ def test_header_values_are_stringified_before_validation() -> None:
         ({"Bad Name": SECRET}, "entry 0 is not a valid header name"),
         ({"Authorization": SECRET}, "Authorization cannot be set here"),
         ({"host": SECRET}, "host cannot be set here"),
-        ({"X-Tenant": f"a\r\nX-Injected: {SECRET}"}, "the value of X-Tenant contains a line break"),
+        ({"X-Tenant\n": SECRET}, "entry 0 is not a valid header name"),
+        ({"X-A": "a", "X-Tenant\r\n": SECRET}, "entry 1 is not a valid header name"),
+        ({"X-Tenant": f"a\r\nX-Injected: {SECRET}"}, HEADER_VALUE_RULE),
+        ({"X-Tenant": f"{SECRET}\n"}, HEADER_VALUE_RULE),
+        ({"X-Tenant": f"{SECRET}\x00"}, HEADER_VALUE_RULE),
+        ({"X-Tenant": f"{SECRET} "}, HEADER_VALUE_RULE),
+        ({"X-Tenant": f"\t{SECRET}"}, HEADER_VALUE_RULE),
+        ({"X-Tenant": f"{SECRET}\x0b"}, HEADER_VALUE_RULE),
+        ({"X-Tenant": f"{SECRET}\x7f"}, HEADER_VALUE_RULE),
+        ({"X-Tenant": f"{SECRET}\u00e9"}, HEADER_VALUE_RULE),
     ],
 )
 def test_header_rules_never_echo_values(headers: dict[str, str], expected: str) -> None:
@@ -108,7 +142,12 @@ def test_header_rules_never_echo_values(headers: dict[str, str], expected: str) 
 
 
 def test_valid_headers_pass() -> None:
-    headers = {"X-Scope-OrgID": SecretStr("team-a"), "X-Api-Key": SecretStr(SECRET)}
+    headers = {
+        "X-Scope-OrgID": SecretStr("team-a"),
+        "X-Api-Key": SecretStr(SECRET),
+        "X-Words": SecretStr("a b\tc"),
+        "X-Empty": SecretStr(""),
+    }
     assert check_headers(headers) == headers
 
 

@@ -1,7 +1,12 @@
+import asyncio
+import time
+
 import httpx
+import pytest
 import respx
 
 from ratatoskr.backends.base import ConnectionInfo
+from ratatoskr.backends.http import client as http_client
 from ratatoskr.backends.prometheus.backend import PrometheusBackend
 from tests.unit.prom_helpers import api_error, make_backend, success, vector
 
@@ -57,3 +62,29 @@ async def test_health_reports_api_errors(prom_api: respx.Router, prom_backend: P
 async def test_query_result_round_trip(prom_api: respx.Router, prom_backend: PrometheusBackend) -> None:
     prom_api.post("/api/v1/query").mock(return_value=success(vector(({"__name__": "up"}, "1"))))
     assert (await prom_backend.api.query("up", "1")).data["result"][0]["value"][1] == "1"
+
+
+async def test_health_runs_under_one_deadline_for_both_requests(
+    prom_api: respx.Router, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """buildinfo (404) and the fallback query each answer within the 1s timeout; together they do not."""
+    monkeypatch.setattr(http_client, "TIMEOUT_GRACE_SECONDS", 0.0)
+
+    async def slow_missing(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.6)
+        return httpx.Response(404, text="404 page not found")
+
+    async def slow_query(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.6)
+        return success(vector(({}, "1")))
+
+    prom_api.get("/api/v1/status/buildinfo").mock(side_effect=slow_missing)
+    prom_api.post("/api/v1/query").mock(side_effect=slow_query)
+    prom_api.get("/api/v1/query").mock(side_effect=slow_query)
+    backend = make_backend(timeout="1s")
+    await backend.open()
+    started = time.perf_counter()
+    health = await backend.health()
+    await backend.close()
+    assert time.perf_counter() - started < 1.15
+    assert (health.ok, health.error) == (False, "Connection 'prom' did not answer within 1s.")

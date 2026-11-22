@@ -48,7 +48,7 @@ def test_duration_strings_are_parsed() -> None:
     assert config.connections["main"].statement_timeout == timedelta(minutes=5)
 
 
-@pytest.mark.parametrize("name", ["Prod", "-x", "has space", "a" * 64, "dot.name"])
+@pytest.mark.parametrize("name", ["Prod", "-x", "has space", "a" * 64, "dot.name", "logs\n", "logs\r\n", "\nlogs"])
 def test_rejects_bad_connection_names(name: str) -> None:
     data = _config(connections={name: {"kind": "postgres", "dsn": "postgresql://h/db"}})
     with pytest.raises(ValidationError, match="invalid connection name"):

@@ -64,7 +64,7 @@ async def label_values(
 ) -> ToolOutput:
     limits = backend.limits
     name = label.strip()
-    if not LABEL_NAME_RE.match(name):
+    if not LABEL_NAME_RE.fullmatch(name):
         raise InvalidRequestError(
             f"Invalid label name '{clip_input(label)}': use letters, digits and underscores, e.g. job, instance "
             "or __name__."

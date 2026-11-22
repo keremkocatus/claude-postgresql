@@ -74,6 +74,21 @@ async def test_a_bad_query_shows_the_scrubbed_loki_message(loki_api: respx.Route
     )
 
 
+async def test_server_text_never_shows_the_configured_tenants(loki_api: respx.Router) -> None:
+    backend = make_backend(tenant="team-SECRET-a|ops")
+    await backend.open()
+    message = "query for tenant team-SECRET-a|ops failed: tenant ops over limit; team-SECRET-ab and opsx are others"
+    loki_api.get("/loki/api/v1/labels").mock(return_value=text_error(400, message))
+    loki_api.post("/loki/api/v1/query_range").mock(return_value=success(streams(), warnings=[message]))
+    with pytest.raises(BackendQueryError) as caught:
+        await backend.api.labels(selector=None, start="1", end="2")
+    result = await backend.api.query_range('{a="b"}', start="1", end="2", limit=1, direction="forward", step="1")
+    await backend.close()
+    shown = "query for tenant <tenant>|<tenant> failed: tenant <tenant> over limit; team-SECRET-ab and opsx are others"
+    assert str(caught.value) == f"Loki rejected the query: {shown}"
+    assert result.notes == [f"warning: {shown}"]
+
+
 async def test_a_json_error_body_is_read_too(loki_api: respx.Router, loki_backend: LokiBackend) -> None:
     loki_api.get("/loki/api/v1/labels").mock(
         return_value=httpx.Response(400, json={"status": "error", "error": "invalid query at ingester-3.loki:9095"})

@@ -60,7 +60,7 @@ class PrometheusBackend:
         await self._client.aclose()
 
     async def health(self) -> HealthResult:
-        return await timed_health(self.name, self._version)
+        return await timed_health(self.name, self._version, deadline=self.deadline)
 
     async def _version(self) -> str:
         """``Prometheus <version>`` from buildinfo; servers without that endpoint are probed with a query."""

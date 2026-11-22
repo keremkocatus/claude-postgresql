@@ -170,3 +170,19 @@ async def test_many_long_lines_and_notes_stay_within_the_response_limit(loki_api
     assert "[Loki stopped at the limit of 100 lines" in output.text
     assert "were longer than this connection's line limit" in output.text
     assert "- ... and 25 more" in output.text
+
+
+async def test_the_largest_allowed_line_still_shows_with_all_notes(loki_api: respx.Router) -> None:
+    """max_line_bytes at its highest (a quarter of the response) and lines that indentation makes much larger."""
+    backend = make_backend(limits={"max_response_bytes": 65536, "max_line_bytes": 16384})
+    await backend.open()
+    lines = [(NOW_NS - i * SECOND_NS, "ab\n" * 6000) for i in range(50)]
+    warnings = [f"warning {i} " + "x" * 2000 for i in range(30)]
+    loki_api.post(ROUTE).mock(return_value=success(streams(({"app": "api"}, lines)), warnings=warnings))
+    output = await _query(backend)
+    await backend.close()
+    assert len(output.text.encode()) <= 65536
+    assert output.rows == 1
+    assert "[Showing 1 of 50 log lines: the response size limit was reached." in output.text
+    assert "The first line did not fit in this response" in output.text
+    assert "- ... and 25 more" in output.text

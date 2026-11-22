@@ -43,6 +43,12 @@ def test_long_lines_are_cut_with_their_size() -> None:
     assert (line.text, line.size, line.cut) == ("é" * 32, 200, True)
 
 
+def test_the_whole_nanosecond_range_of_loki_is_read() -> None:
+    data = streams(({"pod": "a"}, [(0, "epoch"), (2**63 - 1, "last")]))
+    lines = parse_streams(data, max_lines=10, max_line_bytes=100).streams[0].lines
+    assert [line.ns for line in lines] == [0, 2**63 - 1]
+
+
 def test_clip_line() -> None:
     assert clip_line("short", 64) == ("short", 0)
     assert clip_line("a" * 64, 64) == ("a" * 64, 0)
@@ -59,6 +65,17 @@ def test_clip_line() -> None:
         {"result": [{"values": "x"}]},
         {"result": [{"values": [["not-a-number", "x"]]}]},
         {"result": [{"values": [[1]]}]},
+        {"result": ["x"]},
+        {"result": [None]},
+        {"result": [["values"]]},
+        {"result": [{"stream": ["app"], "values": [["1", "x"]]}]},
+        {"result": [{"stream": "app", "values": [["1", "x"]]}]},
+        {"result": [{"values": ["1x"]}]},
+        {"result": [{"values": [{"0": "1", "1": "x"}]}]},
+        {"result": [{"values": [["9" * 30, "x"]]}]},
+        {"result": [{"values": [[str(2**63), "x"]]}]},
+        {"result": [{"values": [["-5", "x"]]}]},
+        {"result": [{"values": [[1.5e18, "x"]]}]},
     ],
 )
 def test_unreadable_results(data: object) -> None:

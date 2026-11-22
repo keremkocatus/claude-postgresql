@@ -8,6 +8,8 @@ from typing import Any
 
 from ratatoskr.backends.errors import BackendQueryError
 
+MAX_NS = 2**63 - 1  # Loki stores times as Go int64 nanoseconds (up to the year 2262)
+
 
 @dataclass(frozen=True)
 class LogLine:
@@ -56,22 +58,41 @@ def _parse(raw: Any, max_lines: int, max_line_bytes: int) -> StreamsResult:
     streams: list[Stream] = []
     omitted = 0
     for item in raw:
+        if not isinstance(item, dict):
+            raise TypeError("stream item")
         values = item.get("values") or []
-        if not isinstance(values, list):
-            raise TypeError("values")
+        stream = item.get("stream") or {}
+        if not isinstance(values, list) or not isinstance(stream, dict):
+            raise TypeError("values or stream")
         kept = values[:room]
         omitted += len(values) - len(kept)
         room -= len(kept)
         if kept:
-            labels = {str(key): str(value) for key, value in (item.get("stream") or {}).items()}
+            labels = {str(key): str(value) for key, value in stream.items()}
             streams.append(Stream(labels=labels, lines=[_line(value, max_line_bytes) for value in kept]))
     return StreamsResult(streams=streams, omitted=omitted)
 
 
 def _line(value: Any, max_line_bytes: int) -> LogLine:
-    ns, text = int(value[0]), str(value[1])  # a third element (structured metadata) is not shown
+    if not isinstance(value, list | tuple):
+        raise TypeError("line")
+    ns, text = _ns(value[0]), str(value[1])  # a third element (structured metadata) is not shown
     clipped, size = clip_line(text, max_line_bytes)
     return LogLine(ns=ns, text=clipped, size=size)
+
+
+def _ns(raw: Any) -> int:
+    """Loki's timestamp: a string of decimal nanoseconds (an int is accepted too) within Go's int64, which is
+    what Loki stores; anything else (negative, a float, 30 digits) cannot be shown as a time."""
+    if isinstance(raw, str) and raw.isascii() and raw.isdigit() and len(raw) <= len(str(MAX_NS)):
+        ns = int(raw)
+    elif isinstance(raw, int) and not isinstance(raw, bool):
+        ns = raw
+    else:
+        raise ValueError("timestamp")
+    if not 0 <= ns <= MAX_NS:
+        raise ValueError("timestamp")
+    return ns
 
 
 def clip_line(text: str, max_bytes: int) -> tuple[str, int]:

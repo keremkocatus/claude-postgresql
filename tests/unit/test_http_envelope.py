@@ -1,8 +1,10 @@
+import contextlib
 import logging
+from collections.abc import AsyncIterator
 
 import pytest
 
-from ratatoskr.backends.errors import BackendQueryError
+from ratatoskr.backends.errors import BackendQueryError, BackendTimeoutError
 from ratatoskr.backends.http.envelope import ApiResult, decode_json, scrub_server_text, success_result
 from ratatoskr.backends.http.health import timed_health
 from ratatoskr.backends.output import MAX_NOTES
@@ -52,11 +54,26 @@ async def test_timed_health_reports_version_latency_and_safe_errors(caplog: pyte
     async def broken() -> str:
         raise RuntimeError("secret detail at 10.0.0.1")
 
-    ok = await timed_health("logs", version)
+    ok = await timed_health("logs", version, deadline=contextlib.nullcontext)
     assert (ok.ok, ok.version, ok.error) == (True, "Loki 3.7.9", None)
     assert ok.latency_ms is not None
-    assert (await timed_health("logs", refused)).error == "Connection 'logs' refused the request (HTTP 401)."
+    assert (
+        await timed_health("logs", refused, deadline=contextlib.nullcontext)
+    ).error == "Connection 'logs' refused the request (HTTP 401)."
     with caplog.at_level(logging.WARNING, logger="ratatoskr.backends.http"):
-        failed = await timed_health("logs", broken)
+        failed = await timed_health("logs", broken, deadline=contextlib.nullcontext)
     assert (failed.ok, failed.error) == (False, "RuntimeError")
     assert "health check of logs failed" in caplog.text
+
+
+async def test_timed_health_reports_the_deadline() -> None:
+    async def version() -> str:
+        return "Loki 3.7.9"
+
+    @contextlib.asynccontextmanager
+    async def expired() -> AsyncIterator[None]:
+        yield
+        raise BackendTimeoutError("Connection 'logs' did not answer within 1s.")
+
+    health = await timed_health("logs", version, deadline=expired)
+    assert (health.ok, health.error) == (False, "Connection 'logs' did not answer within 1s.")

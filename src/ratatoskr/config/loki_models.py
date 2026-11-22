@@ -4,20 +4,22 @@ from __future__ import annotations
 
 import re
 from datetime import timedelta
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from ratatoskr.config.http_models import HttpConnection
 from ratatoskr.config.shared import DEFAULT_MAX_RESPONSE_BYTES, check_max_range, duration_value
 
 TENANT_HEADER = "X-Scope-OrgID"
 # Loki tenant IDs: letters, digits and !-_.*'() (at most 150 each); '|' joins several for multi-tenant queries.
-_TENANT_RE = re.compile(r"^[A-Za-z0-9!_.*'()-]{1,150}(?:\|[A-Za-z0-9!_.*'()-]{1,150})*$")
+# Checked with fullmatch: `$` also matches before a final "\n", which h11 then refuses (quoting the value).
+_TENANT_RE = re.compile(r"[A-Za-z0-9!_.*'()-]{1,150}(?:\|[A-Za-z0-9!_.*'()-]{1,150})*")
 # Loki refuses more points per series than this, like Prometheus.
 LOKI_MAX_POINTS = 11_000
 # Loki's own default for max_entries_limit_per_query; a higher limit would be refused by the server.
 LOKI_MAX_LINES = 5000
+LINES_PER_RESPONSE = 4  # max_line_bytes may be at most max_response_bytes / 4
 
 
 class LokiLimits(BaseModel):
@@ -43,6 +45,17 @@ class LokiLimits(BaseModel):
     def _check_max_range(cls, value: timedelta) -> timedelta:
         return check_max_range(value)
 
+    @model_validator(mode="after")
+    def _check_line_room(self) -> Self:
+        # A line as large as the response could never be shown whole; a quarter leaves room for several lines,
+        # their timestamps and indentation, and the notes. (A first line that still does not fit is cut to fit.)
+        if self.max_line_bytes * LINES_PER_RESPONSE > self.max_response_bytes:
+            raise ValueError(
+                f"limits.max_line_bytes ({self.max_line_bytes}) must be at most a quarter of "
+                f"limits.max_response_bytes ({self.max_response_bytes})"
+            )
+        return self
+
 
 class LokiConnection(HttpConnection):
     """url, auth, headers, tls, timeout and the read-only mode come from :class:`HttpConnection`.
@@ -65,7 +78,7 @@ class LokiConnection(HttpConnection):
     @field_validator("tenant")
     @classmethod
     def _check_tenant(cls, value: SecretStr | None) -> SecretStr | None:
-        if value is not None and not _TENANT_RE.match(value.get_secret_value()):
+        if value is not None and not _TENANT_RE.fullmatch(value.get_secret_value()):
             raise ValueError(
                 "tenant must be a Loki tenant ID: letters, digits and !-_.*'() (at most 150 characters), "
                 "several joined with |"

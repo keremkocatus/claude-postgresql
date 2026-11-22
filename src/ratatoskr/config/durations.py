@@ -6,7 +6,7 @@ import math
 import re
 from datetime import timedelta
 
-_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
+_DURATION_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([smhd])\s*")  # fullmatch; surrounding whitespace is allowed
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -22,7 +22,7 @@ def parse_duration(value: str | int | float | timedelta) -> timedelta:
     elif isinstance(value, int | float):
         result = _seconds(value)
     elif isinstance(value, str):
-        match = _DURATION_RE.match(value)
+        match = _DURATION_RE.fullmatch(value)
         if match is None:
             raise ValueError("invalid duration: use a number with a unit, e.g. '30s', '5m', '1h', '30d'")
         result = _seconds(float(match.group(1)) * _UNIT_SECONDS[match.group(2)])

@@ -45,7 +45,8 @@ class LokiBackend:
             max_body_bytes=config.limits.max_body_bytes,
         )
         host = config.url.host or ""
-        self.api = LokiApi(name, self._client, hosts={host, f"{host}:{config.url.port}"})
+        tenants = config.tenant.get_secret_value().split("|") if config.tenant is not None else []
+        self.api = LokiApi(name, self._client, hosts={host, f"{host}:{config.url.port}"}, tenants=tenants)
 
     @property
     def limits(self) -> LokiLimits:
@@ -69,7 +70,7 @@ class LokiBackend:
         await self._client.aclose()
 
     async def health(self) -> HealthResult:
-        return await timed_health(self.name, self._version)
+        return await timed_health(self.name, self._version, deadline=self.deadline)
 
     async def _version(self) -> str:
         """The labels of the last minute prove that the credentials and the tenant work (buildinfo needs neither);

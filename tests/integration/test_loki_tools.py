@@ -1,5 +1,7 @@
 """The three Loki tools, list_connections and connection_health against a real, multi-tenant Loki container."""
 
+import re
+
 import pytest
 
 from tests.integration.helpers import (
@@ -57,7 +59,12 @@ async def test_long_lines_are_cut_and_log_lines_are_never_redacted(loki_url: str
     assert "[1 line was longer than this connection's line limit and was cut" in text
     assert "login ok for alice password=hunter2" in text
     assert TRACEBACK.splitlines()[0] in text
-    assert "\n" + " " * 15 + '  File "worker.py", line 7' in text
+    # Continuation lines sit under the text: "  10:00:00.000 " (15), or "  11-22T10:00:00.000 " (21) when the
+    # ten-minute window crosses midnight UTC.
+    span = re.search(r"from (\d{4}-\d{2}-\d{2})T\S+ to (\d{4}-\d{2}-\d{2})T", text)
+    assert span is not None
+    indent = 15 if span.group(1) == span.group(2) else 21
+    assert "\n" + " " * indent + '  File "worker.py", line 7' in text
 
 
 async def test_metric_query_is_summarised_per_series(loki_url: str, make_harness: MakeHarness) -> None:
