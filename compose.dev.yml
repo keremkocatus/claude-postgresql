@@ -42,7 +42,7 @@ services:
       - "127.0.0.1:53100:3100"
 
   loggen:
-    image: alpine:3.22@sha256:d406446bc05b82480756ce8f1287964d28768c23955fa9480d2a74a2eae7a654
+    image: alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
     command: ["/bin/sh", "/loggen.sh"]
     volumes:
       - ./dev/loggen/loggen.sh:/loggen.sh:ro
