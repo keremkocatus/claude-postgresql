@@ -33,7 +33,7 @@ ARG VERSION=dev
 # CI (docker/metadata-action) sets source, version and revision from the repository and tag at build time.
 LABEL org.opencontainers.image.title="ratatoskr" \
       org.opencontainers.image.description="Secure multi-connection MCP server for PostgreSQL, Prometheus and Loki" \
-      org.opencontainers.image.source="https://github.com/keremkocatus/claude-postgresql" \
+      org.opencontainers.image.source="https://github.com/keremkocatus/ratatoskr-mcp" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
 

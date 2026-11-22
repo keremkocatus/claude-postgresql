@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping. Bugs and ideas go into [issues](https://github.com/keremkocatus/claude-postgresql/issues);
+Thanks for helping. Bugs and ideas go into [issues](https://github.com/keremkocatus/ratatoskr-mcp/issues);
 security problems go through [`SECURITY.md`](SECURITY.md), never into a public issue.
 
 ## Setup

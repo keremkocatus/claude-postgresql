@@ -6,7 +6,7 @@ seriously.
 ## Reporting a vulnerability
 
 Report it privately through GitHub: open
-[a new security advisory](https://github.com/keremkocatus/claude-postgresql/security/advisories/new) (the
+[a new security advisory](https://github.com/keremkocatus/ratatoskr-mcp/security/advisories/new) (the
 repository's *Security* tab → *Report a vulnerability*). Please do not open a public issue, pull request or
 discussion for a vulnerability.
 

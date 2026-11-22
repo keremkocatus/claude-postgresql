@@ -1,8 +1,8 @@
 """Every link to the GitHub repository uses one slug, so renaming the repository is one search-and-replace.
 
 After the owner renames the repository on GitHub, replace REPO_SLUG's value everywhere (this file included):
-    git grep -l "keremkocatus/claude-postgresql" -- ":!docs/superpowers" \
-      | xargs sed -i "s#keremkocatus/claude-postgresql#keremkocatus/ratatoskr#g"
+    git grep -l "keremkocatus/OLD" -- ":!docs/superpowers" \
+      | xargs sed -i "s#keremkocatus/OLD#keremkocatus/NEW#g"
 The image name does not depend on the repository name: it is always ghcr.io/<owner>/ratatoskr.
 """
 
@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-REPO_SLUG = "keremkocatus/claude-postgresql"
+REPO_SLUG = "keremkocatus/ratatoskr-mcp"
 IMAGE = "ghcr.io/keremkocatus/ratatoskr"
 SKIP_DIRS = {".git", ".venv", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__", "superpowers"}
 SUFFIXES = {".md", ".toml", ".yml", ".yaml", ".py", ".txt", ".example", ""}

@@ -1,6 +1,8 @@
+<p align="center"><img src="docs/assets/ratatoskr.svg" alt="Ratatoskr: a squirrel carrying a database cylinder" width="128"></p>
+
 # Ratatoskr
 
-[![CI](https://github.com/keremkocatus/claude-postgresql/actions/workflows/ci.yml/badge.svg)](https://github.com/keremkocatus/claude-postgresql/actions/workflows/ci.yml)
+[![CI](https://github.com/keremkocatus/ratatoskr-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/keremkocatus/ratatoskr-mcp/actions/workflows/ci.yml)
 
 Ratatoskr is an MCP server that gives Claude (claude.ai, Claude Desktop, Claude Code) controlled access to
 **several PostgreSQL databases, Prometheus servers and Loki log stores at once**, with per-group access levels and
@@ -36,7 +38,7 @@ an audit trail. MIT licensed.
 You need a host with Docker, a DNS name pointing at it and ports 80 and 443 open.
 
 ```bash
-git clone https://github.com/keremkocatus/claude-postgresql.git ratatoskr && cd ratatoskr
+git clone https://github.com/keremkocatus/ratatoskr-mcp.git ratatoskr && cd ratatoskr
 cp .env.example .env                          # set RATATOSKR_DOMAIN and the secrets
 cp deploy/config.example.yaml config.yaml     # users, roles, connections
 docker compose build
