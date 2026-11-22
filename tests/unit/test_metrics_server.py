@@ -6,7 +6,14 @@ from typing import Any
 import pytest
 
 from ratatoskr.observability import metrics_server
-from ratatoskr.observability.metrics_server import MAX_REQUEST_HEAD_BYTES, MetricsServer, MetricsStartupError
+from ratatoskr.observability.metrics_server import (
+    MAX_CONCURRENT_EXCHANGES,
+    MAX_REQUEST_HEAD_BYTES,
+    MetricsServer,
+    MetricsStartupError,
+)
+
+REQUEST = b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n"
 
 
 class FakeWriter:
@@ -67,6 +74,28 @@ async def test_a_slow_client_is_dropped_after_the_timeout() -> None:
     server = MetricsServer("127.0.0.1", 9100, _render, timeout=0.05)
     await server.serve_connection(_reader(b"GET /metrics HTTP/1.1\r\n", eof=False), writer)  # type: ignore[arg-type]
     assert writer.data == b"" and writer.closed
+
+
+async def test_connections_over_the_limit_are_closed_at_once() -> None:
+    server = MetricsServer("127.0.0.1", 9100, _render, timeout=30)
+    slow = [_reader(b"GET /metrics HTTP/1.1\r\n", eof=False) for _ in range(MAX_CONCURRENT_EXCHANGES)]
+    writers = [FakeWriter() for _ in slow]
+    tasks = [
+        asyncio.create_task(server.serve_connection(reader, writer))  # type: ignore[arg-type]
+        for reader, writer in zip(slow, writers, strict=True)
+    ]
+    await asyncio.sleep(0)
+    extra = FakeWriter()
+    async with asyncio.timeout(1):
+        await server.serve_connection(_reader(REQUEST), extra)  # type: ignore[arg-type]
+    assert extra.data == b"" and extra.closed
+    for reader in slow:
+        reader.feed_data(b"\r\n")
+    await asyncio.gather(*tasks)
+    assert all(writer.data.startswith(b"HTTP/1.1 200 OK\r\n") for writer in writers)
+    after = FakeWriter()
+    await server.serve_connection(_reader(REQUEST), after)  # type: ignore[arg-type]
+    assert after.data.startswith(b"HTTP/1.1 200 OK\r\n")  # finished exchanges free their slots
 
 
 class FakeAsyncioServer:

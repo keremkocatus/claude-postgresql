@@ -33,7 +33,7 @@ One YAML file; [`config.example.yaml`](../config.example.yaml) is the annotated 
 | `server.allowed_redirect_hosts` | `[claude.ai, claude.com, localhost, 127.0.0.1]` | HTTP: exact hosts (any port) an OAuth client may register in a `redirect_uri`; https required except on loopback. |
 | `server.audit_retention` | `90d` | HTTP: audit rows in SQLite older than this are deleted hourly (at least `1d`). |
 | `server.metrics_port` | unset | Port of the separate Prometheus `/metrics` listener (1 to 65535; with HTTP it must differ from `server.port`). Unset: no listener. See [Metrics](#metrics). |
-| `server.metrics_host` | `127.0.0.1` | Address of the metrics listener. It has no authentication: keep it on loopback, or use `0.0.0.0` in a container whose metrics port is reachable only on an internal network. |
+| `server.metrics_host` | `127.0.0.1` | Address of the metrics listener; must not be empty (that would mean every interface). It has no authentication: keep it on loopback, or use `0.0.0.0` in a container whose metrics port is reachable only on an internal network. |
 | `auth.mode` | required for HTTP | `local` (users in the file) or `oidc` (e.g. Authentik). Ignored over stdio. |
 | `auth.access_token_ttl` | `1h` | Access token lifetime; also how often an OIDC user is re-checked at the issuer. |
 | `auth.refresh_token_ttl` | `30d` | Refresh token lifetime (each refresh rotates it). Must not exceed `session_max_age`. |
@@ -165,8 +165,15 @@ Also exported: `process_*` (memory, CPU, open files; Linux only) and `python_inf
   a label value, and forbidden connections are not revealed. No label carries a user, a query or a secret.
 - **`ratatoskr_backend_up`** is checked when Prometheus scrapes, at most every 15 seconds (a faster scrape gets the
   cached values): every configured connection is opened if needed (the same lazy open and 10 s retry pause as tool
-  calls) and asked for its health with a 5 s limit. So with metrics on, every connection is opened within one scrape
-  of the start, even if no tool used it yet. These checks are not tool calls: they are not audited.
+  calls) and asked for its health with a 5 s limit. The limit never cuts an open short: a connection still opening
+  after 5 s (opening a PostgreSQL pool can take 10 s or more) reports 0 for that scrape and finishes opening in the
+  background; if the open fails, the usual 10 s retry pause applies. So with metrics on, every connection is opened
+  within one scrape of the start, even if no tool used it yet. A connection that keeps failing in the same way is
+  logged as a warning once, then at debug level. These checks are not tool calls: they are not audited.
+- **The PostgreSQL check uses a read-pool connection** (one `SELECT` in a read-only session), like a tool call. When
+  every pool connection is busy (`pool.max_size` long-running queries), the check waits for one and may report 0
+  after 5 s although the server is up.
+- **At most 16 scrapes are answered at once**; a connection beyond that is closed without an answer.
 - **No authentication.** Anyone who reaches the port can read the metrics (tool names, connection names, call
   counts). Keep `metrics_host` on loopback, or in a container on `0.0.0.0` without publishing the port: with
   `compose.yml`, a Prometheus on the same compose network scrapes `ratatoskr:9100`, and Caddy answers `/metrics`
@@ -200,10 +207,16 @@ scrape_configs:
 - **`server.trusted_proxies`** must hold the address the container sees the reverse proxy connect from; only from
   there is `X-Forwarded-For` honoured. `compose.yml` gives Caddy a fixed address (`RATATOSKR_PROXY_IP`, default
   `10.203.53.10` on the subnet `RATATOSKR_SUBNET`, default `10.203.53.0/24`) and
-  `deploy/config.example.yaml` trusts exactly that address. With your own proxy on the Docker host and a published
-  port, it is the bridge gateway, not `127.0.0.1`:
+  `deploy/config.example.yaml` trusts exactly that address. Docker assigns the other containers' addresses only
+  from `RATATOSKR_IP_RANGE` (default `10.203.53.128/25`), so none can take Caddy's: keep the range inside the subnet
+  and `RATATOSKR_PROXY_IP` outside the range when you change them. With your own proxy on the Docker host and a
+  published port, it is the bridge gateway, not `127.0.0.1`:
   `docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'` (usually `172.17.0.1`). With a wrong
   value every client shares the proxy's rate-limit bucket.
+- On a dual-stack host, clients that reach a published port over IPv6 may be forwarded by Docker's userland proxy
+  (`docker-proxy`) and then appear (to Caddy, and so to Ratatoskr) with the Docker network's gateway address, all
+  sharing one rate-limit bucket; whether this happens depends on the host's Docker and network setup.
+- Caddy (`deploy/Caddyfile`) cuts request bodies off after 8 MB (`request_body { max_size 8MB }`, answered with 413).
 
 ## Environment variables
 

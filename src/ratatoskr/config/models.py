@@ -88,6 +88,13 @@ class ServerSettings(BaseModel):
             raise ValueError(f"log_level must be one of {sorted(_LOG_LEVELS)}")
         return level
 
+    @field_validator("metrics_host")
+    @classmethod
+    def _check_metrics_host(cls, value: str) -> str:
+        if not value.strip():  # asyncio would listen on every interface
+            raise ValueError("metrics_host must be an address to listen on, e.g. 127.0.0.1 (0.0.0.0 for all IPv4)")
+        return value
+
     @field_validator("audit_retention", mode="before")
     @classmethod
     def _parse_audit_retention(cls, value: Any) -> timedelta:

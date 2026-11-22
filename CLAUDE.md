@@ -58,9 +58,10 @@ remote or production database, Prometheus or Loki.
   routes (`web.py`), `identity/` (local argon2id, OIDC RP), `password_cli.py` (`hash-password`).
 - `state/` SQLite state store (`sqlite.py`, WAL, one connection + lock, `migrations.py`), audit sink, hourly
   cleanup. All OAuth/session state goes through the `Store` protocol; it stores hashes and sealed blobs only.
-- `transport/` stdio composition root (`stdio.py`), HTTP composition root (`app.py`), preconditions (same checks for `serve` and `check-config`), client
-  IP / trusted proxies, Host check, body and endpoint limits, client compatibility rewrites for `/revoke` and
-  `/register` (`oauth_compat.py`), clean end of `/mcp` streams on shutdown (`stream_end.py`), uvicorn (`serve.py`).
+- `transport/` stdio composition root (`stdio.py`), HTTP composition root (`app.py`), preconditions (same checks
+  for `serve` and `check-config`), client IP / trusted proxies, Host check, body and endpoint limits, client
+  compatibility rewrites for `/revoke` and `/register` (`oauth_compat.py`), clean end of `/mcp` streams on shutdown
+  (`stream_end.py`), uvicorn (`serve.py`).
 - `backends/` `Backend` protocol, `BackendRegistry` (lazy open, 10 s retry), user-safe errors, `clamp_text`,
   `timeparse.py` (RFC3339 / unix / `now-15m`, ranges, steps), and what Prometheus and Loki share: `output.py`
   (`BlockWriter`, truncation notes, `with_notes`, `error_note`), `series.py` (results in the Prometheus format, label

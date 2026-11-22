@@ -23,7 +23,7 @@ class MetricsAuditSink:
             if event.tool in AUTH_EVENTS:
                 self._metrics.count_auth_event(event.tool)
                 return
-            connection = self._metrics.connection_label(event.connection, event.error_class)
+            connection = self._metrics.connection_label(event.connection, event.error_class, event.result)
             self._metrics.observe_tool(event.tool, connection, event.result, event.duration_ms / 1000)
         except Exception:  # an audit sink must never break a tool call
             _logger.debug("MetricsAuditSink failed", exc_info=True)

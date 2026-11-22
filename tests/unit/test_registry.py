@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 
@@ -100,6 +101,48 @@ async def test_back_off_rounds_the_wait_up() -> None:
     clock.now += 9.5
     with pytest.raises(BackendUnavailableError, match=r"Try again in 1s\."):
         await registry.get("a")
+
+
+def _open_failure_logs(caplog: pytest.LogCaptureFixture) -> list[tuple[int, bool]]:
+    return [
+        (record.levelno, record.exc_info is not None)
+        for record in caplog.records
+        if record.name == "ratatoskr.backends" and record.getMessage().startswith("opening connection a failed")
+    ]
+
+
+async def test_repeated_open_failures_of_tool_calls_stay_warnings(caplog: pytest.LogCaptureFixture) -> None:
+    registry, factory, clock = _registry()
+    factory.backends["a"].fail_open = OSError(LEAKY_MESSAGE)
+    caplog.set_level(logging.DEBUG, logger="ratatoskr.backends")
+    for _ in range(2):
+        with pytest.raises(BackendUnavailableError):
+            await registry.get("a")
+        clock.now += 10
+    assert _open_failure_logs(caplog) == [(logging.WARNING, True), (logging.WARNING, True)]
+
+
+async def test_quiet_repeats_log_the_same_failure_again_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    registry, factory, clock = _registry()
+    backend = factory.backends["a"]
+    backend.fail_open = OSError(LEAKY_MESSAGE)
+    caplog.set_level(logging.DEBUG, logger="ratatoskr.backends")
+    for _ in range(3):
+        with pytest.raises(BackendUnavailableError):
+            await registry.get("a", quiet_repeats=True)
+        clock.now += 10
+    backend.fail_open = TimeoutError()  # a different failure is news again
+    with pytest.raises(BackendUnavailableError):
+        await registry.get("a", quiet_repeats=True)
+    assert backend.open_calls == 4
+    assert _open_failure_logs(caplog) == [
+        (logging.WARNING, True),
+        (logging.DEBUG, False),
+        (logging.DEBUG, False),
+        (logging.WARNING, True),
+    ]
+    quiet = [record.getMessage() for record in caplog.records if record.levelno == logging.DEBUG]
+    assert quiet == ["opening connection a failed again (OSError)"] * 2  # class only, never the message
 
 
 # -- concurrency ---------------------------------------------------------------

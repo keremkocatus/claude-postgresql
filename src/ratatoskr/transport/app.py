@@ -243,7 +243,7 @@ def build_http_app(
             sqlite_sink.start()
             cleanup.start()
             if metrics is not None:  # stops before the registry closes, so no scrape finds it closing
-                await stack.enter_async_context(metrics.server.running())
+                await stack.enter_async_context(metrics.running())
             await stack.enter_async_context(session_manager_lifespan(starlette_app))
             yield
 

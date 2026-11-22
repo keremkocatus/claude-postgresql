@@ -31,6 +31,11 @@ ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TAB
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 ```
 
+**`REVOKE CREATE ON SCHEMA public FROM PUBLIC` applies to the whole database**, not only to `ratatoskr_read`: on
+PostgreSQL 14 and older, every other role that creates tables, views or functions in `public` without its own
+`CREATE` grant loses that right too (migrations and application roles break). Before running it there, grant
+`CREATE ON SCHEMA public` to the roles that need it (for example `app_owner`), or leave the line out.
+
 Repeat the `USAGE`, `SELECT` and `ALTER DEFAULT PRIVILEGES` lines for every other schema the connection should
 see, and leave out tables it should not read: `allowed_schemas` in the config only filters the discovery tools, it
 does not restrict SQL.

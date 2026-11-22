@@ -4,6 +4,11 @@
 	# HSTS is set here, at the TLS endpoint; Ratatoskr does not send it.
 	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 
+	# Request bodies are cut off after 8 MB (8,000,000 bytes) with 413; MCP requests are small.
+	request_body {
+		max_size 8MB
+	}
+
 	# Probes and metrics are for the compose network only.
 	@internal path /healthz /readyz /metrics
 	respond @internal 404

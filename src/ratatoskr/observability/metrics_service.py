@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from ratatoskr.backends.registry import BackendRegistry
@@ -19,11 +20,22 @@ class MetricsService:
     sink: MetricsAuditSink
     render: Callable[[], Awaitable[bytes]]
     server: MetricsServer
+    probe: BackendProbe
+
+    @asynccontextmanager
+    async def running(self) -> AsyncIterator[None]:
+        """Serve metrics; on exit stop the listener, then cancel the probe's pending opens so that shutdown (and
+        the registry's ``close_all`` after it) never waits for a slow connect."""
+        try:
+            async with self.server.running():
+                yield
+        finally:
+            await self.probe.aclose()
 
 
 def build_metrics(config: RatatoskrConfig, registry: BackendRegistry) -> MetricsService | None:
     """``None`` when ``server.metrics_port`` is unset. The caller adds ``sink`` to its audit sinks and enters
-    ``server.running()`` for as long as the process serves; each scrape refreshes ``backend_up`` first."""
+    ``running()`` for as long as the process serves; each scrape refreshes ``backend_up`` first."""
     port = config.server.metrics_port
     if port is None:
         return None
@@ -35,4 +47,4 @@ def build_metrics(config: RatatoskrConfig, registry: BackendRegistry) -> Metrics
         return metrics.render()
 
     server = MetricsServer(config.server.metrics_host, port, render)
-    return MetricsService(metrics=metrics, sink=MetricsAuditSink(metrics), render=render, server=server)
+    return MetricsService(metrics=metrics, sink=MetricsAuditSink(metrics), render=render, server=server, probe=probe)

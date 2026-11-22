@@ -34,7 +34,9 @@ UNRESOLVED_CONNECTION = "_unresolved"
 
 AUTH_EVENTS: tuple[str, ...] = get_args(AuthEventName)
 DURATION_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0)
-_HIDDEN_ERROR_CLASSES = frozenset({"ConnectionNotFoundError", "PermissionError"})
+# ToolRuntime audits both as "denied": a name that is unknown or forbidden, and a call without an identity (the
+# resolver raised PermissionError). A PermissionError with result "error" is an OS error on a permitted call.
+_HIDDEN_DENIALS = frozenset({"ConnectionNotFoundError", "PermissionError"})
 
 # `_created` series double every counter and histogram for no use here; process-wide, set once on import.
 disable_created_metrics()  # type: ignore[no-untyped-call]  # untyped in prometheus-client 0.26
@@ -76,10 +78,10 @@ class Metrics:
         for event in AUTH_EVENTS:
             self._auth_events.labels(event=event)
 
-    def connection_label(self, connection: str | None, error_class: str | None) -> str:
+    def connection_label(self, connection: str | None, error_class: str | None, result: AuditResult) -> str:
         if connection is None:
             return GLOBAL_CONNECTION
-        if connection not in self._known or error_class in _HIDDEN_ERROR_CLASSES:
+        if connection not in self._known or (result == "denied" and error_class in _HIDDEN_DENIALS):
             return UNRESOLVED_CONNECTION
         return connection
 

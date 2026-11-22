@@ -40,8 +40,13 @@ def test_ratatoskr_service_is_locked_down() -> None:
 def test_caddy_address_is_the_trusted_proxy() -> None:
     compose = _compose()
     caddy_ip = _default(compose["services"]["caddy"]["networks"]["edge"]["ipv4_address"])
-    subnet = _default(compose["networks"]["edge"]["ipam"]["config"][0]["subnet"])
-    assert ipaddress.ip_address(caddy_ip) in ipaddress.ip_network(subnet)
+    ipam = compose["networks"]["edge"]["ipam"]["config"][0]
+    subnet = ipaddress.ip_network(_default(ipam["subnet"]))
+    ip_range = ipaddress.ip_network(_default(ipam["ip_range"]))
+    assert ipaddress.ip_address(caddy_ip) in subnet
+    assert ip_range.subnet_of(subnet)
+    # Docker hands out dynamic addresses only from ip_range, so no other container can take Caddy's.
+    assert ipaddress.ip_address(caddy_ip) not in ip_range
     assert _default(compose["services"]["ratatoskr"]["environment"]["RATATOSKR_PROXY_IP"]) == caddy_ip
 
 
@@ -51,6 +56,7 @@ def test_caddyfile_proxies_to_the_service_and_hides_internal_paths() -> None:
     assert "reverse_proxy ratatoskr:8000" in caddyfile
     assert re.search(r"path /healthz /readyz /metrics\b", caddyfile)
     assert "Strict-Transport-Security" in caddyfile
+    assert re.search(r"request_body \{\s+max_size 8MB\s+\}", caddyfile), "request bodies are capped at the proxy"
 
 
 def test_compose_config_template_is_valid(monkeypatch: pytest.MonkeyPatch) -> None:

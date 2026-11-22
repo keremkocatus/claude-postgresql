@@ -46,19 +46,24 @@ def test_backend_up_is_a_gauge_per_configured_connection() -> None:
 
 def test_unconfigured_names_never_become_label_values() -> None:
     metrics = Metrics(["prod"])
-    assert metrics.connection_label("prod", None) == "prod"
-    assert metrics.connection_label("ghost", "ConnectionNotFoundError") == UNRESOLVED_CONNECTION
-    assert metrics.connection_label("../../etc/passwd", None) == UNRESOLVED_CONNECTION
-    assert metrics.connection_label(None, None) == GLOBAL_CONNECTION
+    assert metrics.connection_label("prod", None, "ok") == "prod"
+    assert metrics.connection_label("ghost", "ConnectionNotFoundError", "denied") == UNRESOLVED_CONNECTION
+    assert metrics.connection_label("../../etc/passwd", None, "ok") == UNRESOLVED_CONNECTION
+    assert metrics.connection_label(None, None, "ok") == GLOBAL_CONNECTION
     metrics.set_backend_up("ghost", True)  # ignored: not a configured connection
     assert "ghost" not in metrics.render().decode("utf-8")
 
 
 def test_forbidden_and_unauthenticated_calls_hide_the_name() -> None:
     metrics = Metrics(["prod"])
-    assert metrics.connection_label("prod", "ConnectionNotFoundError") == UNRESOLVED_CONNECTION
-    assert metrics.connection_label("prod", "PermissionError") == UNRESOLVED_CONNECTION
-    assert metrics.connection_label("prod", "InsufficientAccessError") == "prod"
+    assert metrics.connection_label("prod", "ConnectionNotFoundError", "denied") == UNRESOLVED_CONNECTION
+    assert metrics.connection_label("prod", "PermissionError", "denied") == UNRESOLVED_CONNECTION  # no identity
+    assert metrics.connection_label("prod", "InsufficientAccessError", "denied") == "prod"
+
+
+def test_an_os_permission_error_on_a_permitted_connection_keeps_the_name() -> None:
+    metrics = Metrics(["prod"])
+    assert metrics.connection_label("prod", "PermissionError", "error") == "prod"
 
 
 def test_fixed_labels_cannot_collide_with_connection_names() -> None:

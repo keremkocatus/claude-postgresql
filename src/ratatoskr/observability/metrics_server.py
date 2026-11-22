@@ -2,7 +2,9 @@
 
 It reads one request head (at most :data:`MAX_REQUEST_HEAD_BYTES`), writes one response from
 :func:`ratatoskr.observability.metrics_http.answer` and closes the connection; the whole exchange is bounded by
-``timeout``. There is no authentication: bind it to loopback or an internal network and never publish or proxy it.
+``timeout``. At most :data:`MAX_CONCURRENT_EXCHANGES` exchanges run at once; a connection beyond that is closed at
+once, unanswered. There is no authentication: bind it to loopback or an internal network and never publish or proxy
+it.
 On exit the listener stops accepting, cancels exchanges in flight and waits for them.
 """
 
@@ -18,6 +20,7 @@ from ratatoskr.observability.metrics_http import METRICS_PATH, answer
 
 MAX_REQUEST_HEAD_BYTES = 8192
 REQUEST_TIMEOUT_SECONDS = 10.0
+MAX_CONCURRENT_EXCHANGES = 16
 
 logger = logging.getLogger("ratatoskr.metrics")
 
@@ -62,6 +65,11 @@ class MetricsServer:
             await server.wait_closed()
 
     async def serve_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if len(self._exchanges) >= MAX_CONCURRENT_EXCHANGES:
+            writer.close()  # a scraper needs one connection; more at once is a flood, not monitoring
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
         task = asyncio.current_task()
         if task is not None:
             self._exchanges.add(task)

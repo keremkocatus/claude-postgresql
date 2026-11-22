@@ -66,9 +66,11 @@ networks:
   edge:
     ipam:
       config:
-        # Outside Docker's default address pools; change RATATOSKR_SUBNET and RATATOSKR_PROXY_IP together if it
-        # collides with a network this host routes to.
+        # Outside Docker's default address pools; change RATATOSKR_SUBNET, RATATOSKR_IP_RANGE and RATATOSKR_PROXY_IP
+        # together if it collides with a network this host routes to. Docker assigns addresses only from ip_range,
+        # so no other container can take the proxy's fixed address, which must lie outside it.
         - subnet: ${RATATOSKR_SUBNET:-10.203.53.0/24}
+          ip_range: ${RATATOSKR_IP_RANGE:-10.203.53.128/25}
 
 volumes:
   ratatoskr-data:

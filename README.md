@@ -51,8 +51,8 @@ Give each connection a restricted database role ([PostgreSQL roles](docs/postgre
 follow [Authentik](docs/authentik.md).
 
 The container runs as uid 10001 with a read-only root file system, keeps its state in the `ratatoskr-data` volume
-and is reachable only through Caddy, which also hides `/healthz`, `/readyz` and `/metrics`. Configuration changes
-need `docker compose restart ratatoskr`.
+and is reachable only through Caddy, which also hides `/healthz`, `/readyz` and `/metrics` and cuts request
+bodies off after 8 MB. Configuration changes need `docker compose restart ratatoskr`.
 
 ## Quick start: on your machine (stdio)
 

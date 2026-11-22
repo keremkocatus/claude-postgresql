@@ -64,6 +64,24 @@ def test_checkout_does_not_keep_credentials(path: Path) -> None:
                 assert step["with"]["persist-credentials"] is False
 
 
+@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda path: path.name)
+def test_no_run_step_expands_an_expression(path: Path) -> None:
+    # `${{ }}` in a script is pasted into the shell before it runs (script injection); pass values through `env:`.
+    for name, job in _load(path)["jobs"].items():
+        for step in job.get("steps", []):
+            assert "${{" not in str(step.get("run", "")), f"{path.name}: job {name}, step {step.get('name')}"
+
+
+def test_ci_also_runs_weekly() -> None:
+    workflow = _load(ROOT / ".github" / "workflows" / "ci.yml")
+    triggers = workflow.get("on", workflow.get(True))  # YAML 1.1 reads the bare key `on` as true
+    [schedule] = triggers["schedule"]
+    minute, hour, day, month, weekday = schedule["cron"].split()
+    assert (day, month) == ("*", "*") and weekday.isdigit() and minute.isdigit() and hour.isdigit()
+    # A scheduled run gets the same read-only token as every other run.
+    assert workflow["permissions"] == {"contents": "read"}
+
+
 def test_docker_images_run_by_workflows_are_digest_pinned() -> None:
     for path in WORKFLOWS:
         for image in re.findall(r"TRIVY_IMAGE:\s*(\S+)", path.read_text(encoding="utf-8")):

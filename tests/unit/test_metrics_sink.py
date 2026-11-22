@@ -4,6 +4,7 @@ import pytest
 
 from ratatoskr.auth.events import record_auth_event
 from ratatoskr.auth.policy import Policy
+from ratatoskr.auth.principal import Principal
 from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.backends.base import Backend
 from ratatoskr.backends.registry import BackendRegistry
@@ -50,6 +51,33 @@ async def test_unknown_and_forbidden_connections_share_one_label() -> None:
     text = metrics.render().decode("utf-8")
     assert "ghost" not in text
     assert 'connection="prod"' not in text
+
+
+async def test_unauthenticated_calls_hide_the_name() -> None:
+    metrics = Metrics(["prod"])
+    registry = BackendRegistry(CONFIG, factory=FakeFactory())
+
+    class NoIdentity:
+        def resolve(self) -> Principal:
+            raise PermissionError("Authentication required.")
+
+    runtime = ToolRuntime(Policy(CONFIG), registry, NoIdentity(), MetricsAuditSink(metrics))
+    await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=_ok)
+    await runtime.run(tool="pg_query", connection="ghost", need=Access.READ, call=_ok)
+    labels = {"tool": "pg_query", "connection": UNRESOLVED_CONNECTION, "result": "denied"}
+    assert _value(metrics, "ratatoskr_tool_calls_total", **labels) == 2
+    assert 'connection="prod"' not in metrics.render().decode("utf-8")
+
+
+async def test_an_os_permission_error_on_a_permitted_connection_keeps_the_name() -> None:
+    runtime, metrics = _runtime()
+
+    async def unreadable(backend: Backend, access: Access) -> ToolOutput:
+        raise PermissionError(13, "Permission denied", "/run/secrets/key.pem")
+
+    await runtime.run(tool="pg_query", connection="prod", need=Access.READ, call=unreadable)
+    assert _value(metrics, "ratatoskr_tool_calls_total", tool="pg_query", connection="prod", result="error") == 1
+    assert UNRESOLVED_CONNECTION not in metrics.render().decode("utf-8")
 
 
 async def test_global_tools_use_the_global_label() -> None:

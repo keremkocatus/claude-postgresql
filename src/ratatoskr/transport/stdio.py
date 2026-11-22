@@ -32,5 +32,5 @@ async def serve_stdio(config: RatatoskrConfig) -> None:
     async with AsyncExitStack() as stack:
         stack.push_async_callback(registry.close_all)
         if metrics is not None:
-            await stack.enter_async_context(metrics.server.running())
+            await stack.enter_async_context(metrics.running())
         await app.run_stdio_async()

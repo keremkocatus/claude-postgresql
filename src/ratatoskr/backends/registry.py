@@ -63,12 +63,16 @@ class BackendRegistry:
         config = self._configs.get(name) if name is not None else None
         return config.limits.max_response_bytes if config is not None else DEFAULT_MAX_RESPONSE_BYTES
 
-    async def get(self, name: str) -> Backend:
+    async def get(self, name: str, *, quiet_repeats: bool = False) -> Backend:
         """Return the opened backend, opening it on first use.
 
         A failed open is remembered and not retried for 10 seconds. A cancelled open (the caller's deadline
         expired or the client cancelled) is deliberately *not* a failure: it says nothing about the backend, so
         the next call tries again at once. After ``close_all`` has started, every call is refused.
+
+        A failed open is logged as a warning with its traceback. With ``quiet_repeats`` (the metrics probe, which
+        retries a down connection on every scrape) a failure of the same class as the previous one is logged at
+        debug level, class only.
         """
         backend = self._backends.get(name)
         if backend is None:
@@ -84,8 +88,12 @@ class BackendRegistry:
             try:
                 await backend.open()
             except Exception as exc:
+                previous = self._failed_at.get(name)
                 self._failed_at[name] = (self._clock(), type(exc).__name__)
-                logger.warning("opening connection %s failed", name, exc_info=True)
+                if quiet_repeats and previous is not None and previous[1] == type(exc).__name__:
+                    logger.debug("opening connection %s failed again (%s)", name, type(exc).__name__)
+                else:
+                    logger.warning("opening connection %s failed", name, exc_info=True)
                 raise BackendUnavailableError(
                     f"Connection '{name}' is unavailable: opening it failed ({type(exc).__name__}). "
                     f"Try again in {math.ceil(RETRY_INTERVAL_SECONDS)}s; details are in the server log."

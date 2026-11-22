@@ -126,6 +126,9 @@ unreadable, every session ends and all users must reconnect.
 ```caddyfile
 mcp.example.com {
     header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    request_body {
+        max_size 8MB
+    }
     @internal path /healthz /readyz /metrics
     respond @internal 404
     reverse_proxy ratatoskr:8000
@@ -139,6 +142,8 @@ mcp.example.com {
   `0.0.0.0/0` (Ratatoskr warns): then any client can choose its own IP.
 - **Do not expose `/healthz` and `/readyz` publicly.** They are for the container health check and your monitoring
   on the internal network; the snippet above hides them.
+- **Request bodies** are cut off by the proxy after 8 MB (`request_body { max_size 8MB }`, answered with 413); MCP
+  requests are small JSON documents.
 - **Volumetric DoS** is the proxy's job. Ratatoskr limits sign-in, `/register` and `/authorize` per client IP and
   caps auth request bodies at 64 KiB, but `/token`, `/revoke` and `/mcp` have no per-IP limit; add `rate_limit`
   (a Caddy plugin) or your edge's limits if they are reachable from the internet.

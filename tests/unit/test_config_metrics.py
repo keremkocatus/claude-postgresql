@@ -37,6 +37,17 @@ def test_metrics_port_must_be_a_tcp_port(port: int) -> None:
         _config(metrics_port=port)
 
 
+@pytest.mark.parametrize("host", ["", "   "])
+def test_metrics_host_must_not_be_empty(host: str) -> None:
+    # asyncio treats an empty host as "every interface": refuse it rather than expose the unauthenticated listener.
+    with pytest.raises(ValidationError) as info:
+        _config(metrics_host=host, metrics_port=9100)
+    [error] = info.value.errors()
+    assert error["loc"] == ("server", "metrics_host")
+    assert "metrics_host must be an address to listen on" in error["msg"]
+    assert "0.0.0.0" in error["msg"]  # says how to ask for every interface on purpose
+
+
 def test_metrics_port_must_differ_from_the_http_port() -> None:
     with pytest.raises(ValidationError, match=r"server\.metrics_port must differ from server\.port"):
         RatatoskrConfig.model_validate(_http(port=8000, metrics_port=8000))
