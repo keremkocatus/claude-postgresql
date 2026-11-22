@@ -26,6 +26,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The image runs Python 3.12 (tests/unit/test_dockerfile.py pins it): only digest updates of 3.12-slim come
+      # in here. Moving to a newer Python is a deliberate change: run the suites on it, regenerate constraints.txt.
+      - dependency-name: python
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: docker-compose
     directory: /

@@ -64,7 +64,7 @@ groups:
 # Nothing listens here: tests for an unreachable Prometheus.
 UNREACHABLE_PROMETHEUS = "http://127.0.0.1:1"
 
-LOKI_IMAGE = "grafana/loki:3.7.9"
+LOKI_IMAGE = "grafana/loki:3.7.10"
 # Single binary, multi-tenant (every request needs X-Scope-OrgID), no usage reports to grafana.com.
 LOKI_CONFIG = """
 auth_enabled: true

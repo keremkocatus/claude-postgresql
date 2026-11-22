@@ -13,7 +13,7 @@ Stage 4 (`docs/superpowers/plans/2026-11-22-phase4-packaging.md`) adds `/metrics
 
 - Unit tests (no network, no Docker): `.venv/Scripts/python -m pytest -q`
 - Integration tests (Docker Desktop running; testcontainers starts `postgres:17-alpine`,
-  `prom/prometheus:v3.16.0` and `grafana/loki:3.7.9`):
+  `prom/prometheus:v3.16.0` and `grafana/loki:3.7.10`):
   `.venv/Scripts/python -m pytest -m integration -q`
 - Lint: `.venv/Scripts/python -m ruff check src tests`
 - Types: `.venv/Scripts/python -m mypy src`

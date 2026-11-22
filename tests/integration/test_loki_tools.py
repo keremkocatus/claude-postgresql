@@ -134,7 +134,7 @@ async def test_list_connections_and_health(loki_url: str, make_harness: MakeHarn
     assert "| logs | loki | read | Test logs |" in await harness.call("list_connections")
     health = await harness.call("connection_health", connection="logs")
     assert "| logs | loki | ok |" in health
-    assert "Loki 3.7.9" in health
+    assert "Loki 3.7.10" in health
 
 
 async def test_unreachable_loki_hides_the_address(make_harness: MakeHarness) -> None:
