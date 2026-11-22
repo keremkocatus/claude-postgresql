@@ -5,7 +5,7 @@
 #   docker pull python:3.12-slim && docker inspect --format '{{index .RepoDigests 0}}' python:3.12-slim
 
 # ── build: install the package into a self-contained virtualenv ─────────────
-FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -21,7 +21,7 @@ RUN python -m pip --python /opt/ratatoskr/bin/python install -c constraints.txt 
  && /opt/ratatoskr/bin/python -m compileall -q /opt/ratatoskr
 
 # ── runtime: non-root, read-only friendly; only /data is written ────────────
-FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 # Debian security fixes released after the base image was built: the digest pins the base layers, not their fixes,
 # and the image scan (Trivy in CI) fails on a fixed HIGH or CRITICAL vulnerability.
