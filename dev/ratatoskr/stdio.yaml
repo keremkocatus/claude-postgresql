@@ -1,0 +1,23 @@
+# Ratatoskr over stdio inside the dev stack (compose.dev.yml, service "ratatoskr"). Dev-only credentials.
+server:
+  transport: stdio
+  stdio_role: dev
+  metrics_host: 0.0.0.0     # scraped by the dev Prometheus as ratatoskr:9100 (run with --use-aliases)
+  metrics_port: 9100
+roles:
+  dev: { "*": write }
+connections:
+  shop:
+    kind: postgres
+    description: "Dev shop database: customers, products, orders, order_items"
+    mode: write
+    dsn: postgresql://ratatoskr_read:dev-read@postgres:5432/shop?sslmode=disable
+    write_dsn: postgresql://ratatoskr_write:dev-write@postgres:5432/shop?sslmode=disable
+  metrics:
+    kind: prometheus
+    description: "Dev Prometheus: scrapes itself, Loki and Ratatoskr"
+    url: http://prometheus:9090
+  logs:
+    kind: loki
+    description: "Dev Loki: logs of the made-up shop-api and worker apps (labels app, env, level)"
+    url: http://loki:3100

@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 import ratatoskr
 from ratatoskr import cli
 from ratatoskr.cli import DEFAULT_CONFIG_PATH, main, resolve_config_path
+from ratatoskr.transport import stdio
 
 STDIO_CONFIG = """
 server:
@@ -145,10 +146,10 @@ def test_serve_runs_stdio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
     calls: list[str] = []
 
-    def fake_run(self: FastMCP[Any], transport: str = "stdio", mount_path: str | None = None) -> None:
-        calls.append(transport)
+    async def fake_run(self: FastMCP[Any]) -> None:
+        calls.append("stdio")
 
-    monkeypatch.setattr(FastMCP, "run", fake_run)
+    monkeypatch.setattr(FastMCP, "run_stdio_async", fake_run)
     assert main(["serve", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 0
     assert calls == ["stdio"]
 
@@ -164,7 +165,7 @@ def test_serve_unexpected_error_is_logged_redacted(
     def failing_build_app(*args: Any, **kwargs: Any) -> FastMCP[Any]:
         raise RuntimeError(f"cannot start with {LEAKY_DSN}")
 
-    monkeypatch.setattr(cli, "build_app", failing_build_app)
+    monkeypatch.setattr(stdio, "build_app", failing_build_app)
     assert main(["serve", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 1
     captured = capsys.readouterr()
     assert "leak-pass-4417" not in captured.out + captured.err
@@ -174,11 +175,29 @@ def test_serve_unexpected_error_is_logged_redacted(
 def test_serve_keyboard_interrupt_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
 
-    def interrupted_run(self: FastMCP[Any], transport: str = "stdio", mount_path: str | None = None) -> None:
+    async def interrupted_run(self: FastMCP[Any]) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(FastMCP, "run", interrupted_run)
+    monkeypatch.setattr(FastMCP, "run_stdio_async", interrupted_run)
     assert main(["serve", "--config", str(_write(tmp_path, STDIO_CONFIG))]) == 130
+
+
+def test_serve_stdio_metrics_port_in_use_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ratatoskr.observability.metrics_server import MetricsServer, MetricsStartupError
+
+    monkeypatch.setenv("MAIN_DSN", "postgresql://db/app")
+
+    def busy(self: MetricsServer) -> Any:
+        raise MetricsStartupError("cannot listen for metrics on 127.0.0.1:9100 (Address already in use)")
+
+    monkeypatch.setattr(MetricsServer, "running", busy)
+    text = STDIO_CONFIG.replace("  stdio_role: admins", "  stdio_role: admins\n  metrics_port: 9100")
+    assert main(["serve", "--config", str(_write(tmp_path, text))]) == 1
+    err = capsys.readouterr().err
+    assert "cannot listen for metrics on 127.0.0.1:9100" in err
+    assert "fatal error" not in err
 
 
 def test_check_config_unexpected_error_prints_only_the_class(

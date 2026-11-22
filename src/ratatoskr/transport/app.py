@@ -8,6 +8,8 @@ Request path, outermost first: Host check (every route but ``/mcp`` and the heal
 OAuth and login endpoints, per-IP reservations on ``POST /register`` and ``/authorize``, the client compatibility
 rewrites of ``/revoke`` and ``/register`` bodies, the clean end of ``/mcp`` streams on shutdown, then the SDK's app
 (bearer authentication, OAuth handlers, ``/mcp`` with its DNS-rebinding check) and the custom routes.
+``/metrics`` is not one of them: with ``server.metrics_port`` set it is served by a separate listener
+(``observability.metrics_server``) that runs inside this app's lifespan.
 """
 
 from __future__ import annotations
@@ -33,8 +35,9 @@ from ratatoskr.auth.web import CALLBACK_PATH, LoginRoutes
 from ratatoskr.backends.registry import BackendRegistry
 from ratatoskr.config.loader import ConfigError
 from ratatoskr.config.models import OidcSettings, RatatoskrConfig
-from ratatoskr.observability.audit import CompositeAuditSink, LogAuditSink
+from ratatoskr.observability.audit import AuditSink, CompositeAuditSink, LogAuditSink
 from ratatoskr.observability.health import HealthRoutes
+from ratatoskr.observability.metrics_service import MetricsService, build_metrics
 from ratatoskr.state.audit import SqliteAuditSink
 from ratatoskr.state.maintenance import CleanupTask
 from ratatoskr.state.records import Clock
@@ -66,6 +69,7 @@ class HttpApp:
     store: SqliteStore
     provider: RatatoskrOAuthProvider
     registry: BackendRegistry
+    metrics: MetricsService | None = None
 
 
 class _RunningOidc:
@@ -159,7 +163,11 @@ def build_http_app(
     keyring = Keyring(settings.secret_key)
     store = SqliteStore(server.state_path)
     sqlite_sink = SqliteAuditSink(store)
-    audit = CompositeAuditSink([LogAuditSink(), sqlite_sink])
+    metrics = build_metrics(config, backends)
+    sinks: list[AuditSink] = [LogAuditSink(), sqlite_sink]
+    if metrics is not None:
+        sinks.append(metrics.sink)
+    audit = CompositeAuditSink(sinks)
 
     provider = RatatoskrOAuthProvider(
         config, store=store, keyring=keyring, audit=audit, clock=clock, local=local, oidc=oidc
@@ -234,8 +242,10 @@ def build_http_app(
             await store.open()
             sqlite_sink.start()
             cleanup.start()
+            if metrics is not None:  # stops before the registry closes, so no scrape finds it closing
+                await stack.enter_async_context(metrics.server.running())
             await stack.enter_async_context(session_manager_lifespan(starlette_app))
             yield
 
     app.router.lifespan_context = lifespan
-    return HttpApp(asgi=app, store=store, provider=provider, registry=backends)
+    return HttpApp(asgi=app, store=store, provider=provider, registry=backends, metrics=metrics)

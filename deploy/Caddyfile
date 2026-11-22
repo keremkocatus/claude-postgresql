@@ -1,0 +1,14 @@
+# Caddy in front of Ratatoskr (compose.yml). RATATOSKR_DOMAIN comes from .env; Caddy obtains its certificate from
+# Let's Encrypt on first start (ports 80 and 443 must be reachable) and keeps it in the caddy-data volume.
+{$RATATOSKR_DOMAIN} {
+	# HSTS is set here, at the TLS endpoint; Ratatoskr does not send it.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# Probes and metrics are for the compose network only.
+	@internal path /healthz /readyz /metrics
+	respond @internal 404
+
+	# Caddy replaces any X-Forwarded-For from the client with the client's address; Ratatoskr trusts it from
+	# Caddy only (server.trusted_proxies). Event streams on /mcp are flushed as they arrive.
+	reverse_proxy ratatoskr:8000
+}

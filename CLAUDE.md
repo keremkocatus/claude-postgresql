@@ -6,7 +6,8 @@ Multi-connection MCP server (`src/ratatoskr`, PyPI `ratatoskr-mcp`, CLI `ratatos
 Current state: stdio (Plan 1a) and secure streamable-HTTP (Plan 1b: OAuth AS, local + OIDC identity, SQLite state,
 `Dockerfile`). Stage 2 adds Prometheus connections (`docs/superpowers/plans/2026-11-22-phase2-prometheus.md`),
 stage 3 Loki connections (`docs/superpowers/plans/2026-11-22-phase3-loki.md`).
-`docker-compose.yml` is still the old 0.1 one (compose, Caddy and CI are stage 4).
+Stage 4 (`docs/superpowers/plans/2026-11-22-phase4-packaging.md`) adds `/metrics` on a separate listener,
+`compose.yml` (Ratatoskr + Caddy), `compose.dev.yml` (sample PostgreSQL, Prometheus, Loki), CI and the docs set.
 
 ## Commands (Windows, repo root)
 
@@ -20,6 +21,12 @@ stage 3 Loki connections (`docs/superpowers/plans/2026-11-22-phase3-loki.md`).
 - Validate a config: `.venv/Scripts/ratatoskr check-config --config config.yaml` (`--insecure-dev` validates what
   `serve --insecure-dev` accepts)
 - Image: `docker build -t ratatoskr:dev .` (uid 10001, read-only root, writes only `/data`; local builds only)
+- Dev tools at CI's versions: `.venv/Scripts/python -m pip install -c constraints.txt -c constraints-dev.txt -e ".[dev]"`
+- Compose files: `docker compose -f compose.yml config --quiet` (needs `.env` and `config.yaml`; copy the
+  examples) and `docker compose -f compose.dev.yml config --quiet`; dev stack: `docker compose -f compose.dev.yml up -d`
+  (ports on 127.0.0.1 only), `... down -v` to remove it.
+- Workflows (cannot run locally): `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12`; image scan:
+  see `CONTRIBUTING.md` (Trivy).
 - Installing packages: pip's extra index on this machine is broken and slow; always pass
   `--index-url https://pypi.org/simple`.
 
@@ -51,7 +58,7 @@ remote or production database, Prometheus or Loki.
   routes (`web.py`), `identity/` (local argon2id, OIDC RP), `password_cli.py` (`hash-password`).
 - `state/` SQLite state store (`sqlite.py`, WAL, one connection + lock, `migrations.py`), audit sink, hourly
   cleanup. All OAuth/session state goes through the `Store` protocol; it stores hashes and sealed blobs only.
-- `transport/` HTTP composition root (`app.py`), preconditions (same checks for `serve` and `check-config`), client
+- `transport/` stdio composition root (`stdio.py`), HTTP composition root (`app.py`), preconditions (same checks for `serve` and `check-config`), client
   IP / trusted proxies, Host check, body and endpoint limits, client compatibility rewrites for `/revoke` and
   `/register` (`oauth_compat.py`), clean end of `/mcp` streams on shutdown (`stream_end.py`), uvicorn (`serve.py`).
 - `backends/` `Backend` protocol, `BackendRegistry` (lazy open, 10 s retry), user-safe errors, `clamp_text`,
@@ -73,7 +80,9 @@ remote or production database, Prometheus or Loki.
   (`streams.py`, `formatting.py`), tool logic (`querying.py`, `discovery.py`), registration (`tools.py`) and tool
   texts (`descriptions.py`).
 - `tools/runtime.py` the one wrapper every tool goes through; `tools/common.py` backend-independent tools.
-- `observability/` audit events and sinks, JSON logging, secret redaction.
+- `observability/` audit events and sinks, JSON logging, secret redaction; metrics: `metrics.py` (series and
+  bounded labels), `metrics_sink.py` (audit events -> metrics), `backend_probe.py` (`backend_up`, cached),
+  `metrics_http.py` + `metrics_server.py` (the separate listener), `metrics_service.py` (composition).
 - `app.py` builds the FastMCP app; `cli.py` is the entry point.
 - Tests: `tests/fakes.py` (fake config, backends, clock, audit sink), `tests/unit/`, `tests/integration/`;
   `tests/unit/prom_helpers.py` / `tests/unit/loki_helpers.py` with the `prom_api` / `loki_api` (respx) and
@@ -82,6 +91,10 @@ remote or production database, Prometheus or Loki.
   against the real Starlette app via `httpx.ASGITransport` in `tests/unit/secure_http/e2e/` (fake OIDC issuer via
   respx): they are unit tests, no network, no Docker.
 - `config.example.yaml` is the annotated config reference; `tests/unit/test_example_config.py` keeps it valid.
+- Packaging: `compose.yml`, `deploy/` (Caddyfile, compose config template), `compose.dev.yml`, `dev/` (seed SQL,
+  Prometheus, Loki, log generator, dev configs), `.github/` (CI, release, Dependabot); static checks in
+  `tests/unit/test_deploy_files.py`, `test_dev_stack_files.py`, `test_dockerfile.py`, `test_workflows.py`,
+  `test_docs.py`, `test_repo_links.py`.
 
 ## Rules
 
@@ -147,5 +160,12 @@ remote or production database, Prometheus or Loki.
   back, when to use the tool, the limits, and that `connection` comes from `list_connections`.
 - Tests: unit tests must not touch the network or Docker (use `tests/fakes.py`). Anything that needs a real
   PostgreSQL goes in `tests/integration/` with `pytestmark = pytest.mark.integration`.
-- Docs must describe what the code does now; do not document unimplemented config as working.
+- Docs must describe what the code does now; do not document unimplemented config as working. Settings are
+  documented once, in `docs/configuration.md` (`tests/unit/test_docs.py` checks every model field is there and
+  that links resolve); the README links to it.
+- Metrics: every count comes from the audit event (`MetricsAuditSink`); never call `Metrics` from tools. Labels
+  are bounded: `connection` only through `Metrics.connection_label` (configured names, `_all`, `_unresolved`),
+  never a subject, query, secret or a name a caller typed. `/metrics` never goes on the MCP port.
+- GitHub: actions pinned by commit SHA with a `# vX.Y.Z` comment, `permissions: contents: read` at the top, only
+  `GITHUB_TOKEN`. Repository links use the one slug in `tests/unit/test_repo_links.py`.
 - Commits: imperative subject line; end the message with the agreed `Co-Authored-By` trailer.

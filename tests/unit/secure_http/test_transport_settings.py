@@ -417,6 +417,6 @@ def test_missing_state_dir_under_unwritable_parent_says_where_to_check(make_conf
     assert "does not exist" in message and "where `serve` runs" in message and "chown" not in message
 
 
-def test_metrics_port_warns_that_it_is_not_implemented(make_config) -> None:
+def test_metrics_port_adds_no_warning(make_config) -> None:
     settings = check_http_preconditions(with_server(make_config(), metrics_port=9100), insecure_dev=False)
-    assert any("server.metrics_port" in w and "not implemented" in w for w in settings.warnings)
+    assert not any("metrics" in w for w in settings.warnings)

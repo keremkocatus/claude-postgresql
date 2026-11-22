@@ -68,7 +68,9 @@ class ServerSettings(BaseModel):
     public_url: AnyHttpUrl | None = None
     host: str = "127.0.0.1"
     port: int = 8000
-    metrics_port: int | None = None
+    # Prometheus /metrics on a separate listener without authentication: never the public port or the proxy.
+    metrics_host: str = "127.0.0.1"
+    metrics_port: int | None = Field(default=None, ge=1, le=65535)
     state_path: Path = Path("/data/state.db")
     secret_key: SecretStr | None = None
     allowed_redirect_hosts: list[str] = ["claude.ai", "claude.com", "localhost", "127.0.0.1"]
@@ -314,6 +316,8 @@ class RatatoskrConfig(BaseModel):
             problems.append("server.public_url is required")
         elif server.public_url.scheme != "https" and not insecure_dev:
             problems.append("server.public_url must use https (plain http is allowed only with --insecure-dev)")
+        if server.metrics_port is not None and server.metrics_port == server.port:
+            problems.append("server.metrics_port must differ from server.port")
         if problems:
             raise ValueError("transport streamable-http: " + "; ".join(problems))
         return self

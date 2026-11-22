@@ -1,0 +1,37 @@
+# Ratatoskr on this machine over HTTP against the dev stack's published ports (compose.dev.yml):
+#   ratatoskr serve --insecure-dev --config dev/ratatoskr/local-http.yaml
+# Then connect a client to http://127.0.0.1:8000/mcp and sign in as dev / ratatoskr-dev.
+# Dev-only secrets: the http public_url makes `serve` refuse this file without --insecure-dev, which only binds
+# loopback.
+server:
+  transport: streamable-http
+  public_url: http://127.0.0.1:8000
+  host: 127.0.0.1
+  port: 8000
+  state_path: .dev/state.db
+  secret_key: dev-only-secret-key-not-for-production-0123456789
+  metrics_port: 9100        # http://127.0.0.1:9100/metrics
+auth:
+  mode: local
+  local:
+    users:
+      - username: dev
+        password_hash: $argon2id$v=19$m=65536,t=3,p=4$dQpcHe6FIAuptxYNWJOqgQ$GQEyOX43SFvuU6DUM0QRoSzDk1vzMoDhLOx53zEICeY
+        groups: [dev]
+roles:
+  dev: { "*": write }
+connections:
+  shop:
+    kind: postgres
+    description: "Dev shop database: customers, products, orders, order_items"
+    mode: write
+    dsn: postgresql://ratatoskr_read:dev-read@127.0.0.1:55432/shop?sslmode=disable
+    write_dsn: postgresql://ratatoskr_write:dev-write@127.0.0.1:55432/shop?sslmode=disable
+  metrics:
+    kind: prometheus
+    description: "Dev Prometheus"
+    url: http://127.0.0.1:59090
+  logs:
+    kind: loki
+    description: "Dev Loki: logs of the made-up shop-api and worker apps (labels app, env, level)"
+    url: http://127.0.0.1:53100

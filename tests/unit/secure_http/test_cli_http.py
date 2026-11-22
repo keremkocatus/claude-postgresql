@@ -146,14 +146,14 @@ def test_weak_hash_warning_is_reported_exactly_once(write_config, monkeypatch, c
 
 
 @pytest.mark.parametrize("command", ["serve", "check-config"])
-def test_metrics_port_is_reported_as_not_implemented(write_config, monkeypatch, capsys, command) -> None:
+def test_metrics_port_is_accepted_without_a_warning(write_config, monkeypatch, capsys, command) -> None:
     monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: None)
     path = Path(write_config())
     path.write_text(path.read_text(encoding="utf-8").replace("  host:", "  metrics_port: 9100\n  host:"), "utf-8")
     assert main([command, "--config", str(path)]) == 0
     captured = capsys.readouterr()
-    assert (captured.out + captured.err).count("server.metrics_port") == 1
-    assert "not implemented" in captured.out + captured.err
+    assert "server.metrics_port" not in captured.out + captured.err
+    assert "not implemented" not in captured.out + captured.err
 
 
 def test_check_config_reports_an_unwritable_state_directory(write_config, tmp_path, capsys) -> None:

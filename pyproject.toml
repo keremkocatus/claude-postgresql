@@ -37,11 +37,17 @@ dependencies = [
     "uvicorn>=0.35",
     # Not imported directly: uvicorn's HTTP/1.1 parser. 0.16 fixes request smuggling (CVE-2025-43859).
     "h11>=0.16",
+    # /metrics data model and text exposition (no transitive dependencies); served by our own listener.
+    "prometheus-client>=0.26,<1",
 ]
 
 [project.urls]
+# One slug everywhere (tests/unit/test_repo_links.py): renaming the repository is a single search-and-replace.
 Homepage = "https://github.com/keremkocatus/claude-postgresql"
 Repository = "https://github.com/keremkocatus/claude-postgresql"
+Documentation = "https://github.com/keremkocatus/claude-postgresql/blob/main/docs/configuration.md"
+Issues = "https://github.com/keremkocatus/claude-postgresql/issues"
+Changelog = "https://github.com/keremkocatus/claude-postgresql/blob/main/CHANGELOG.md"
 
 [project.scripts]
 ratatoskr = "ratatoskr.cli:main"

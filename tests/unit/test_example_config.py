@@ -126,3 +126,14 @@ def test_commented_http_example_is_valid(tmp_path: Path, monkeypatch: pytest.Mon
     assert (config.auth.oidc is not None) is oidc
     settings = check_http_preconditions(config, insecure_dev=False)
     assert settings.public_url == "https://mcp.example.com"
+
+
+def test_commented_metrics_example_is_valid(tmp_path: Path) -> None:
+    text = EXAMPLE.read_text(encoding="utf-8")
+    text = text.replace("  # metrics_port: 9100 ", "  metrics_port: 9100 ").replace(
+        "  # metrics_host: 127.0.0.1 ", "  metrics_host: 127.0.0.1 "
+    )
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    server = load_config(path, env={"APP_DB_DSN": "postgresql://reader:pw@localhost/app"}).server
+    assert (server.metrics_host, server.metrics_port) == ("127.0.0.1", 9100)

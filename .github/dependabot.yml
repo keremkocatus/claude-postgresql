@@ -1,0 +1,33 @@
+# Weekly update pull requests. CI must pass on each; for Python packages also refresh constraints.txt as CLAUDE.md
+# ("Runtime constraints") describes, since Dependabot only edits the files it understands.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
+    ignore:
+      # The SDK cap is deliberate (pyproject.toml): raising it needs the re-verification described in CLAUDE.md.
+      - dependency-name: mcp
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly

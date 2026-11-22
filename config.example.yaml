@@ -8,6 +8,8 @@ server:
   transport: stdio            # stdio (local, Claude Desktop / Code) | streamable-http (remote, OAuth; see below)
   stdio_role: admins          # over stdio you act as a member of this group (see roles); unset = no access
   log_level: INFO             # DEBUG | INFO | WARNING | ERROR | CRITICAL; logs go to stderr as redacted JSON
+  # metrics_port: 9100        # Prometheus /metrics on a separate listener without auth (docs/configuration.md)
+  # metrics_host: 127.0.0.1   # keep loopback; 0.0.0.0 only in a container whose port stays internal
   # ── streamable-http only (set transport: streamable-http and uncomment the auth section below) ──
   # public_url: https://mcp.example.com   # origin only, https; the MCP endpoint is <public_url>/mcp
   # host: 0.0.0.0                         # 127.0.0.1 by default; 0.0.0.0 in a container
@@ -49,7 +51,7 @@ connections:
     kind: postgres            # PostgreSQL 12 or newer
     description: "Application database"
     mode: read                # read (default) | write; only write connections accept pg_execute
-    dsn: ${APP_DB_DSN}        # postgresql://user:password@host:5432/dbname -- use a restricted role (see README)
+    dsn: ${APP_DB_DSN}        # postgresql://user:password@host:5432/dbname -- a restricted role: docs/postgres-roles.md
     statement_timeout: 30s
     pool: { min_size: 1, max_size: 5 }   # write_max_size: 2 (lazy write pool, mode: write only)
     # allowed_schemas: [public]   # filters discovery tools only; NOT a security boundary (pg_query is not limited)
@@ -60,7 +62,7 @@ connections:
     #   cert_file: /config/certs/client.pem    # client certificate; set together with key_file
     #   key_file: /config/certs/client.key
 
-  # metrics:                    # Prometheus HTTP API: Prometheus, Mimir, Thanos Query, VictoriaMetrics (see README)
+  # metrics:                    # Prometheus HTTP API: Prometheus, Mimir, Thanos Query, VictoriaMetrics (docs/configuration.md)
   #   kind: prometheus          # always read-only (leave mode out); PromQL itself is not restricted
   #   description: "Production metrics"
   #   url: http://prometheus:9090   # API root (<url>/api/v1/...); for Mimir include its prefix: https://mimir/prometheus
@@ -74,7 +76,7 @@ connections:
   #   limits: { max_series: 100, max_values: 500, max_points: 1000, max_range: 31d, max_response_bytes: 65536 }
   #   # limits.max_body_bytes: 8388608 (8 MiB read per request; a call holds about 10x this while decoding)
 
-  # logs:                       # Loki HTTP API (see README; tested with Loki 3.7)
+  # logs:                       # Loki HTTP API (docs/configuration.md; tested with Loki 3.7)
   #   kind: loki                # always read-only (leave mode out); LogQL itself is not restricted
   #   description: "Production logs"
   #   url: http://loki:3100     # Loki root (<url>/loki/api/v1/...), or the URL of its gateway
@@ -96,4 +98,4 @@ connections:
   #   mode: write
   #   dsn: ${STAGING_DB_DSN}              # read pool login (a read-only role)
   #   write_dsn: ${STAGING_DB_WRITE_DSN}  # optional, mode: write only: write pool login (pg_execute and
-  #                                       # write-level EXPLAIN ANALYZE); recommended, see README "Security model"
+  #                                       # write-level EXPLAIN ANALYZE); recommended, see docs/postgres-roles.md

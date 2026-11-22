@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 
-# Base image: python:3.12-slim, pinned by digest so that rebuilds start from the same layers. To move to a newer one:
+# Base image: python:3.12-slim, pinned by digest so that rebuilds start from the same layers. Both stages name the
+# same digest: Dependabot updates each FROM line, and tests/unit/test_dockerfile.py keeps them equal. By hand:
 #   docker pull python:3.12-slim && docker inspect --format '{{index .RepoDigests 0}}' python:3.12-slim
-ARG PYTHON_IMAGE=python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 # ── build: install the package into a self-contained virtualenv ─────────────
-FROM ${PYTHON_IMAGE} AS builder
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -21,11 +21,18 @@ RUN python -m pip --python /opt/ratatoskr/bin/python install -c constraints.txt 
  && /opt/ratatoskr/bin/python -m compileall -q /opt/ratatoskr
 
 # ── runtime: non-root, read-only friendly; only /data is written ────────────
-FROM ${PYTHON_IMAGE}
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+
+# Debian security fixes released after the base image was built: the digest pins the base layers, not their fixes,
+# and the image scan (Trivy in CI) fails on a fixed HIGH or CRITICAL vulnerability.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/*
 
 ARG VERSION=dev
+# CI (docker/metadata-action) sets source, version and revision from the repository and tag at build time.
 LABEL org.opencontainers.image.title="ratatoskr" \
-      org.opencontainers.image.description="Secure multi-connection MCP server for PostgreSQL" \
+      org.opencontainers.image.description="Secure multi-connection MCP server for PostgreSQL, Prometheus and Loki" \
       org.opencontainers.image.source="https://github.com/keremkocatus/claude-postgresql" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
@@ -50,6 +57,7 @@ USER 10001:10001
 WORKDIR /data
 VOLUME ["/data"]
 # Keep server.port at 8000 and server.host at 0.0.0.0 in containers; the health check below relies on it.
+# server.metrics_port is deliberately not exposed: it has no authentication; reach it only on an internal network.
 EXPOSE 8000
 
 # /healthz is exempt from the Host check, so the loopback address is fine.

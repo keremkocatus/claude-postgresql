@@ -1,0 +1,30 @@
+# Ratatoskr config for compose.yml (Ratatoskr behind Caddy). Copy it to ./config.yaml next to compose.yml and edit
+# users, roles and connections. Every ${NAME} is read from the container environment: compose passes .env (see
+# .env.example) plus RATATOSKR_DOMAIN and RATATOSKR_PROXY_IP. Full reference: docs/configuration.md.
+server:
+  transport: streamable-http
+  public_url: https://${RATATOSKR_DOMAIN}
+  host: 0.0.0.0                       # inside the container; nothing publishes this port
+  port: 8000                          # the image's health check uses 8000
+  state_path: /data/state.db          # the ratatoskr-data volume
+  secret_key: ${SERVER_SECRET_KEY}
+  trusted_proxies: ["${RATATOSKR_PROXY_IP}"]   # Caddy's fixed address on the compose network
+  # metrics_host: 0.0.0.0             # metrics for a Prometheus on the compose network (not published, hidden by Caddy)
+  # metrics_port: 9100
+
+auth:
+  mode: local                         # or oidc: see docs/authentik.md
+  local:
+    users:
+      - username: alice
+        password_hash: ${ALICE_PASSWORD_HASH}   # docker compose run --rm ratatoskr hash-password
+        groups: [admins]
+
+roles:
+  admins: { "*": read }
+
+connections:
+  app-db:
+    kind: postgres
+    description: "Application database"
+    dsn: ${APP_DB_DSN}                # a restricted role: docs/postgres-roles.md

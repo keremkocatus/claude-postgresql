@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
@@ -10,19 +11,18 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from ratatoskr import __version__
-from ratatoskr.app import build_app
 from ratatoskr.auth.password_cli import DESCRIPTION as HASH_PASSWORD_DESCRIPTION
 from ratatoskr.auth.password_cli import run_hash_password
-from ratatoskr.auth.resolver import StdioPrincipalResolver
 from ratatoskr.config.http_models import HttpConnection
 from ratatoskr.config.loader import ConfigError, load_config
 from ratatoskr.config.loki_models import LokiConnection
 from ratatoskr.config.models import PostgresConnection, RatatoskrConfig
 from ratatoskr.config.notices import config_warnings
-from ratatoskr.observability.audit import LogAuditSink
 from ratatoskr.observability.logging import setup_logging
+from ratatoskr.observability.metrics_server import MetricsStartupError
 from ratatoskr.transport.preconditions import check_http_preconditions
 from ratatoskr.transport.serve import HttpServerStartupError, serve_http
+from ratatoskr.transport.stdio import serve_stdio
 
 DEFAULT_CONFIG_PATH = Path("/config/config.yaml")
 CONFIG_ENV_VAR = "RATATOSKR_CONFIG"
@@ -65,10 +65,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _metrics_summary(config: RatatoskrConfig) -> str:
+    server = config.server
+    if server.metrics_port is None:
+        return "off"
+    host = f"[{server.metrics_host}]" if ":" in server.metrics_host else server.metrics_host
+    return f"http://{host}:{server.metrics_port}/metrics"
+
+
 def summarize(config: RatatoskrConfig) -> str:
     """A secret-free overview of the configuration."""
     server = config.server
-    lines = [f"transport: {server.transport}"]
+    lines = [f"transport: {server.transport}", f"metrics: {_metrics_summary(config)}"]
     if server.transport == "stdio":
         lines.append(f"stdio_role: {server.stdio_role or '(not set: the stdio user cannot see any connection)'}")
     lines.append(f"auth: {config.auth.mode if config.auth else 'none'}")
@@ -126,11 +134,13 @@ def _serve(args: argparse.Namespace) -> int:
     for warning in config_warnings(config):
         logger.warning(warning)
     try:
-        app = build_app(config, resolver=StdioPrincipalResolver(config.server.stdio_role), audit=LogAuditSink())
         logger.info("starting ratatoskr %s over stdio with %d connection(s)", __version__, len(config.connections))
-        app.run(transport="stdio")
+        asyncio.run(serve_stdio(config))
     except KeyboardInterrupt:
         return EXIT_INTERRUPTED
+    except MetricsStartupError as exc:
+        logger.error("%s", exc)
+        return EXIT_UNEXPECTED_ERROR
     except Exception:
         # Through the redacting JSON handler: a raw traceback on stderr could carry a DSN or password.
         logger.exception("fatal error")

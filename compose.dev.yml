@@ -1,0 +1,65 @@
+# Local playground: PostgreSQL with a sample shop database, Prometheus, Loki with generated logs, and Ratatoskr over
+# stdio. Everything runs on this machine; published ports bind to 127.0.0.1 only. Passwords here are dev-only.
+#
+#   docker compose -f compose.dev.yml up -d                     # postgres, prometheus, loki, loggen
+#   docker compose -f compose.dev.yml run --rm -T --use-aliases ratatoskr   # an MCP server on stdin/stdout
+#   docker compose -f compose.dev.yml down -v                   # stop and delete the data
+#
+# Host ports: PostgreSQL 55432, Prometheus 59090, Loki 53100 (dev/ratatoskr/local-http.yaml uses them).
+name: ratatoskr-dev
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:526f86d93c6ea08fd3f1fe5605650cacc781b2c6013169a0ad8f42c7d3d84f32
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev-postgres
+      POSTGRES_DB: shop
+    volumes:
+      - ./dev/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shop"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  prometheus:
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    volumes:
+      - ./dev/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./dev/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+    ports:
+      - "127.0.0.1:59090:9090"
+
+  loki:
+    image: grafana/loki:3.7.9@sha256:0db216b630ae1f348a1584c67f3cead8b4c1fc839169a39501db664744158e28
+    command: ["-config.file=/etc/loki/dev.yaml"]
+    volumes:
+      - ./dev/loki/loki.yaml:/etc/loki/dev.yaml:ro
+    ports:
+      - "127.0.0.1:53100:3100"
+
+  loggen:
+    image: alpine:3.22@sha256:d406446bc05b82480756ce8f1287964d28768c23955fa9480d2a74a2eae7a654
+    command: ["/bin/sh", "/loggen.sh"]
+    volumes:
+      - ./dev/loggen/loggen.sh:/loggen.sh:ro
+    depends_on: [loki]
+
+  ratatoskr:
+    # Not started by `up` (profile): run it on demand; it serves MCP over stdin/stdout until stdin closes.
+    profiles: [stdio]
+    image: ratatoskr:dev
+    build: .
+    command: ["serve", "--config", "/config/dev.yaml"]
+    stdin_open: true
+    volumes:
+      - ./dev/ratatoskr/stdio.yaml:/config/dev.yaml:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres:
+        condition: service_healthy

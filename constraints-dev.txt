@@ -1,0 +1,9 @@
+# Exact versions of the dev tools (the `dev` extra) that CI installs next to constraints.txt, so that a new ruff or
+# mypy release cannot change lint, format or type results without a commit. Their own dependencies are not pinned.
+# Refresh: upgrade in .venv, run the full checks, then copy the versions from `pip freeze`.
+mypy==2.4.1
+pytest==9.2.0
+pytest-asyncio==1.5.0
+respx==0.23.1
+ruff==0.17.6
+testcontainers==4.15.0

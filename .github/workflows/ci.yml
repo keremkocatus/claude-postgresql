@@ -1,0 +1,119 @@
+# Lint, types, unit and integration tests, compose file checks, image build and vulnerability scan.
+# Runs on pull requests, on pushes to main and from release.yml (workflow_call) before an image is published.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Trivy 0.76.2, pinned by digest (multi-arch index).
+  TRIVY_IMAGE: aquasec/trivy@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  lint:
+    name: ruff, format, mypy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -c constraints.txt -c constraints-dev.txt -e ".[dev]"
+      - name: ruff check
+        run: python -m ruff check src tests
+      - name: ruff format --check
+        run: python -m ruff format --check src tests
+      - name: mypy --strict
+        run: python -m mypy src
+
+  unit:
+    name: unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -c constraints.txt -c constraints-dev.txt -e ".[dev]"
+      - name: pytest (no network, no Docker)
+        run: python -m pytest -q
+
+  integration:
+    name: integration tests (Docker)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -c constraints.txt -c constraints-dev.txt -e ".[dev]"
+      - name: pytest -m integration (testcontainers starts PostgreSQL, Prometheus and Loki)
+        run: python -m pytest -m integration -q
+
+  compose:
+    name: compose files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: docker compose config
+        run: |
+          cp .env.example .env
+          cp deploy/config.example.yaml config.yaml
+          docker compose -f compose.yml config --quiet
+          docker compose -f compose.dev.yml config --quiet
+
+  image:
+    name: image build and Trivy scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build (linux/amd64, loaded into the local daemon)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ratatoskr:ci
+      - name: Smoke test (read-only root, non-root user)
+        run: |
+          docker run --rm --read-only ratatoskr:ci --version
+          test "$(docker run --rm --entrypoint id ratatoskr:ci -u)" = "10001"
+      - name: Trivy (fails on fixed HIGH or CRITICAL vulnerabilities)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+            --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress ratatoskr:ci

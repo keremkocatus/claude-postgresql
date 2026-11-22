@@ -1,0 +1,76 @@
+# Ratatoskr behind Caddy, which gets and renews the TLS certificate from Let's Encrypt.
+#
+# You provide, next to this file:
+#   .env         RATATOSKR_DOMAIN (a DNS name that points at this host) and the secrets config.yaml refers to;
+#                start from .env.example
+#   config.yaml  start from deploy/config.example.yaml
+# Ports 80 and 443 must be reachable from the internet for the certificate. Then:
+#   docker compose build            # or set RATATOSKR_IMAGE to a released image and `docker compose pull`
+#   docker compose run --rm ratatoskr check-config
+#   docker compose up -d
+# The MCP endpoint is https://<RATATOSKR_DOMAIN>/mcp. See README.md and docs/configuration.md.
+name: ratatoskr
+
+services:
+  ratatoskr:
+    image: ${RATATOSKR_IMAGE:-ratatoskr:local}
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Always set, so config.yaml can use them even when .env leaves them out.
+      RATATOSKR_DOMAIN: ${RATATOSKR_DOMAIN:?set RATATOSKR_DOMAIN in .env}
+      RATATOSKR_PROXY_IP: ${RATATOSKR_PROXY_IP:-10.203.53.10}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      # A new named volume starts as a copy of the image's /data, which is owned by uid 10001.
+      - ratatoskr-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # SIGTERM lets in-flight requests finish and flushes queued audit events; keep this at 10 s or more.
+    stop_grace_period: 15s
+    networks:
+      - edge
+    # No ports: Caddy reaches 8000 on the compose network; a metrics port (server.metrics_port) stays internal too.
+
+  caddy:
+    image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    restart: unless-stopped
+    environment:
+      RATATOSKR_DOMAIN: ${RATATOSKR_DOMAIN:?set RATATOSKR_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      ratatoskr:
+        condition: service_healthy
+    networks:
+      edge:
+        # Fixed, so that server.trusted_proxies can name it (deploy/config.example.yaml uses RATATOSKR_PROXY_IP).
+        ipv4_address: ${RATATOSKR_PROXY_IP:-10.203.53.10}
+
+networks:
+  edge:
+    ipam:
+      config:
+        # Outside Docker's default address pools; change RATATOSKR_SUBNET and RATATOSKR_PROXY_IP together if it
+        # collides with a network this host routes to.
+        - subnet: ${RATATOSKR_SUBNET:-10.203.53.0/24}
+
+volumes:
+  ratatoskr-data:
+  caddy-data:
+  caddy-config:

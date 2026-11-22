@@ -100,7 +100,10 @@ connections:
     dsn: ${PROD_PG_DSN}
 ```
 
-Run it with the image (state lives in `/data`, the config is read from `/config/config.yaml`):
+With [`compose.yml`](../compose.yml), put this `auth` section into `config.yaml` (keep the `server` section of
+[`deploy/config.example.yaml`](../deploy/config.example.yaml), whose `trusted_proxies` already names Caddy), add
+`OIDC_CLIENT_ID` and `OIDC_CLIENT_SECRET` to `.env` and run `docker compose up -d`. Without compose, run the image
+(state lives in `/data`, the config is read from `/config/config.yaml`):
 
 ```bash
 docker run -d --name ratatoskr --read-only --restart unless-stopped \
@@ -118,11 +121,13 @@ unreadable, every session ends and all users must reconnect.
 
 ## 5. Reverse proxy (Caddy)
 
+[`deploy/Caddyfile`](../deploy/Caddyfile), used by `compose.yml`, does this already. For a Caddy of your own:
+
 ```caddyfile
 mcp.example.com {
     header Strict-Transport-Security "max-age=31536000; includeSubDomains"
-    @probes path /healthz /readyz
-    respond @probes 404
+    @internal path /healthz /readyz /metrics
+    respond @internal 404
     reverse_proxy ratatoskr:8000
 }
 ```
