@@ -22,7 +22,12 @@ _WITHHELD = " (message withheld: it can quote request headers)"
 def describe_failure(exc: BaseException, *, secrets: Iterable[str]) -> str:
     """``ConnectError: [Errno 111] ... <- OSError: ...`` for *exc* and up to four exceptions it came from."""
     masks = _masks(secrets)
-    return " <- ".join(_describe(current, masks) for current in _chain(exc))
+    parts: list[str] = []
+    for current in _chain(exc):
+        part = _describe(current, masks)
+        if not parts or part != parts[-1]:  # httpx and httpcore repeat the same text
+            parts.append(part)
+    return " <- ".join(parts)
 
 
 def _chain(exc: BaseException) -> list[BaseException]:
@@ -30,7 +35,9 @@ def _chain(exc: BaseException) -> list[BaseException]:
     current: BaseException | None = exc
     while current is not None and len(chain) < _MAX_CHAIN and all(current is not seen for seen in chain):
         chain.append(current)
-        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+        # Follow a suppressed context too: httpx re-raises httpcore's error ``from None``, which would hide the OS
+        # error (connection refused, DNS failure) that explains the failure.
+        current = current.__cause__ or current.__context__
     return chain
 
 

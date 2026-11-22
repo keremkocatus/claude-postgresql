@@ -47,7 +47,8 @@ class LokiApi:
         """Server text (errors, warnings) as it may be shown: no addresses, no secrets, no configured tenant IDs
         (the tenant is configured as a secret)."""
         if self._tenants is not None:
-            text = self._tenants.sub("<tenant>", text)
+            # Cut before any pattern runs (one character over, so the scrubber still marks the cut).
+            text = self._tenants.sub("<tenant>", text[: SCRUB_INPUT_CHARS + 1])
         return scrub_server_text(text, hosts=self._hosts)
 
     async def query_range(
@@ -121,9 +122,14 @@ class LokiApi:
         return status_error(self._connection, status)
 
 
+_MIN_MASKED_TENANT = 3
+
+
 def _tenant_pattern(tenants: Iterable[str]) -> re.Pattern[str] | None:
     """Whole tenant IDs only (not inside a longer ID or word): ``team-a`` but not ``team-ab``."""
-    names = sorted({tenant for tenant in tenants if tenant}, key=len, reverse=True)
+    # Very short IDs (``1``, ``a``) would mangle ordinary words and line numbers in messages; like the failure log,
+    # mask only IDs of at least _MIN_MASKED_TENANT characters.
+    names = sorted({tenant for tenant in tenants if len(tenant) >= _MIN_MASKED_TENANT}, key=len, reverse=True)
     if not names:
         return None
     alternatives = "|".join(re.escape(name) for name in names)

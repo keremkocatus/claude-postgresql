@@ -275,7 +275,7 @@ connections:
 | `limits.max_points` | `1000` | Points per series in a metric query (10 to 11000); a `step` that needs more is refused with the smallest step that fits. |
 | `limits.max_values` | `500` | Label names and values shown per response. |
 | `limits.max_query_length` | `20000` | Characters of LogQL or of a `selector`. |
-| `limits.max_response_bytes` | `65536` | Text returned to Claude (at least 1024). |
+| `limits.max_response_bytes` | `65536` | Text returned to Claude (at least 1024). Below 8192, also lower `max_line_bytes` (at most a quarter of this). |
 | `limits.max_body_bytes` | `8388608` | Bytes read from Loki per request (8 MiB; at least 65536); a larger answer is refused with a hint to lower `limit` or narrow the query. Memory and decoding cost as for Prometheus. |
 
 `check-config` shows each Loki connection's auth type, whether a tenant is set and the number of extra headers, never

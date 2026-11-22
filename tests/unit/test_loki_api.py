@@ -157,3 +157,22 @@ async def test_streams_round_trip(loki_api: respx.Router, loki_backend: LokiBack
         '{app="a"}', start="1", end="2", limit=1, direction="backward", step="1"
     )
     assert result.data["result"][0]["values"] == [[str(NOW_NS), "x"]]
+
+
+def test_tenant_masking_runs_on_cut_text_only() -> None:
+    from ratatoskr.backends.loki.api import LokiApi
+
+    api = LokiApi("logs", object(), hosts=(), tenants=["team-a", "team-b"])  # type: ignore[arg-type]
+    huge = "x " * 4_000_000 + "team-a"
+    started = time.perf_counter()
+    text = api.scrub(huge)
+    assert time.perf_counter() - started < 0.1
+    assert len(text) <= 1100
+    assert api.scrub("tenant team-a is unknown") == "tenant <tenant> is unknown"
+
+
+def test_very_short_tenant_ids_are_not_masked_in_messages() -> None:
+    from ratatoskr.backends.loki.api import LokiApi
+
+    api = LokiApi("logs", object(), hosts=(), tenants=["1", "ab", "team-a"])  # type: ignore[arg-type]
+    assert api.scrub('parse error at line 1: {app="ab"} team-a') == 'parse error at line 1: {app="ab"} <tenant>'

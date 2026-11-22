@@ -16,10 +16,7 @@ def _chain() -> httpx.LocalProtocolError:
 
 def test_local_protocol_errors_are_named_but_their_text_is_withheld() -> None:
     text = describe_failure(_chain(), secrets=[TENANT])
-    assert text == (
-        "LocalProtocolError (message withheld: it can quote request headers) <- "
-        "LocalProtocolError (message withheld: it can quote request headers)"
-    )
+    assert text == "LocalProtocolError (message withheld: it can quote request headers)"  # repeats folded
 
 
 def test_other_messages_are_kept_without_configured_secrets() -> None:
@@ -34,7 +31,7 @@ def test_unicode_errors_are_withheld() -> None:
     assert describe_failure(error, secrets=[]) == "UnicodeEncodeError (message withheld: it can quote request headers)"
 
 
-def test_the_chain_follows_cause_then_context_and_stops() -> None:
+def test_the_chain_follows_cause_and_context_and_stops() -> None:
     try:
         try:
             raise KeyError("inner")
@@ -43,7 +40,8 @@ def test_the_chain_follows_cause_then_context_and_stops() -> None:
     except ValueError as middle:
         outer = RuntimeError("outer")
         outer.__context__ = middle
-    assert describe_failure(outer, secrets=[]) == "RuntimeError: outer <- ValueError: middle"  # context suppressed
+    # A suppressed context is still followed: httpx raises ``from None`` over the OS error that explains it.
+    assert describe_failure(outer, secrets=[]) == "RuntimeError: outer <- ValueError: middle <- KeyError: 'inner'"
     loop = RuntimeError("loop")
     loop.__cause__ = loop
     assert describe_failure(loop, secrets=[]) == "RuntimeError: loop"
@@ -53,3 +51,20 @@ def test_long_messages_are_cut() -> None:
     text = describe_failure(httpx.ConnectError("x" * 5000), secrets=[])
     assert len(text) < 400
     assert text.endswith("…")
+
+
+def test_a_refused_connection_keeps_the_os_error() -> None:
+    try:
+        try:
+            raise ConnectionRefusedError(111, "Connection refused")
+        except ConnectionRefusedError as os_error:
+            raise httpx.ConnectError("All connection attempts failed") from os_error
+    except httpx.ConnectError as inner:
+        try:
+            raise httpx.ConnectError("All connection attempts failed") from None
+        except httpx.ConnectError as outer:
+            assert outer.__context__ is inner
+            text = describe_failure(outer, secrets=[])
+    assert (
+        text == "ConnectError: All connection attempts failed <- ConnectionRefusedError: [Errno 111] Connection refused"
+    )
